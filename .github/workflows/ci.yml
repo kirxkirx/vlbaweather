@@ -1,0 +1,47 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    # Pinned, not ubuntu-latest: actions/setup-python has Python 3.9 builds for Ubuntu 22.04
+    # and 24.04 only, so 3.9 would fail once ubuntu-latest moves to 26.04.
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        # 3.9 is the production floor (RHEL 9 / Debian 11 system python); a current
+        # release catches deprecations early.
+        python-version: ["3.9", "3.12"]
+    steps:
+      # Node 24 releases (checkout v4 and setup-python v5 run on the retired Node 20).
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      # Pillow is the only runtime dependency; numpy and h5py are the optional GLM lightning
+      # layer, installed so its granule-parser tests run (they are skipped without them). The
+      # tests block urllib outright and feed every module through the fake_http fixture, so
+      # this is the real environment the suite must pass in: no network, no fonts beyond
+      # Pillow's default. shellcheck-py puts a shellcheck binary on PATH, which turns on the
+      # suite's shellcheck test for the deploy scripts (skipped where shellcheck is missing).
+      - name: Install dependencies
+        run: pip install pillow pytest flake8 shellcheck-py numpy h5py
+
+      # weather/ is local-weather-awareness's library, copied: linted like the rest.
+      - name: Lint (flake8)
+        run: flake8 vlba make_vlba_page.py weather
+
+      - name: Tests (network mocked)
+        run: pytest vlba/tests -q
+
+      - name: Shell script syntax
+        run: |
+          sh -n deploy/vlbaweather-cron.sh
+          for f in deploy/install-cron.sh deploy/install.sh run_local.sh; do
+            bash -n "$f"
+          done

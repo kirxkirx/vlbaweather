@@ -1,0 +1,71 @@
+# vlbaweather page generator: ONE run = fetch alerts, radar, GLM lightning and forecasts for
+# the ten VLBA antennas, render the maps, write index.html + status.json into the output
+# directory. vlbaweather.timer starts it every 5 minutes; nothing stays resident between runs.
+#
+# Template file: deploy/install.sh fills in the placeholders (the vlbaweather checkout, run
+# user and group, home, output and cache dirs) and installs /etc/systemd/system/vlbaweather.service.
+# Edit THIS file (or rerun the installer), not the rendered copy. __REPO__ is the vlbaweather
+# checkout, which holds the weather package the generator is built on. It runs beside
+# local-weather-awareness.service, when a host runs both, with its own env files, output and cache.
+[Unit]
+Description=vlbaweather: VLBA antenna weather page generator (one run)
+Documentation=https://github.com/kirxkirx/vlbaweather
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=__USER__
+Group=__GROUP__
+WorkingDirectory=__REPO__
+SyslogIdentifier=vlbaweather
+
+# Baseline paths, so the generator and the installer agree even with no env file at all.
+# EnvironmentFile= entries override these ('-' = fine if the file is absent); see
+# vlbaweather.env.example. local-weather-awareness's /etc/local-weather-awareness.env is NOT read. If
+# you override WEATHER_OUT_DIR / WEATHER_CACHE_DIR there, rerun deploy/install.sh so the
+# directories, SELinux labels and ReadWritePaths= follow.
+Environment=WEATHER_OUT_DIR=__OUT_DIR__
+Environment=WEATHER_CACHE_DIR=__CACHE_DIR__
+EnvironmentFile=-/etc/vlbaweather.env
+EnvironmentFile=-__HOME__/vlbaweather.env
+
+# Recreate the output and cache directories if they were deleted (e.g. `rm -rf` of the
+# cache to force a basemap rebuild). The generator cannot do it itself: under
+# ProtectHome=read-only a missing cache dir under /home gets no ReadWritePaths= hole ('-'
+# skips paths that do not exist). '+' lifts the sandbox for this one line and setpriv drops
+# to the run user at once, so the directories are made BY the run user: no root action ever
+# follows a path the run user controls (a symlink planted in its home, say). '-' keeps a
+# failure from blocking the run: an output directory under a root-owned parent such as
+# /var/www/html cannot be recreated this way, so after deleting it rerun deploy/install.sh
+# (the generator then exits with status 1 and the journal says so).
+ExecStartPre=-+/usr/bin/setpriv --reuid=__USER__ --regid=__GROUP__ --init-groups /bin/mkdir -p __OUT_DIR__ __CACHE_DIR__
+ExecStart=/usr/bin/python3 __REPO__/make_vlba_page.py
+
+# A oneshot has no start timeout by default; a wedged run must never block the timer for
+# good. A normal run takes well under the 5-minute interval. Its network time is capped by
+# WEATHER_RUN_BUDGET (default 240 s; after that every fetch is skipped and last-good copies
+# are used) and the GLM fetch by VLBA_GLM_TIMEOUT (default 45 s, inside the budget), and
+# rendering the maps (two per antenna) takes seconds, so 10 min leaves a wide margin. Keep
+# WEATHER_RUN_BUDGET well below this value if you raise it.
+TimeoutStartSec=10min
+# Background job on a shared web host: yield to Apache.
+Nice=10
+
+# Hardening. The generator only needs: read the checkout, read/write the output and cache
+# directories, talk HTTPS. ProtectSystem=full mounts /usr, /boot and /etc read-only;
+# ProtectHome=read-only does the same for /home, /root and /run/user; the ReadWritePaths=
+# below punch the two writable holes ('-' = ignore a path that does not exist yet).
+# If the service fails with "Failed to set up mount namespacing" (some container hosts),
+# comment out the Protect*/Private* lines.
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=full
+ProtectHome=read-only
+ProtectKernelTunables=true
+ProtectControlGroups=true
+ReadWritePaths=-__OUT_DIR__ -__CACHE_DIR__
+
+[Install]
+WantedBy=multi-user.target

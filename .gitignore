@@ -1,0 +1,31 @@
+# Local secrets / overrides — never commit
+*.env
+!vlbaweather.env.example
+# private names the publish check looks for (vlba/tests/test_deploy.py)
+.private-patterns
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+venv/
+.venv/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+*.egg-info/
+build/
+dist/
+
+# Generated output and caches (written outside the checkout in production)
+out/
+.cache*/
+
+# NFS silly-rename files, editor and OS leftovers
+.nfs*
+*~
+*.swp
+.DS_Store
+.idea/
+.vscode/
