@@ -1,4 +1,4 @@
-"""vlbaweather: the weather at the ten VLBA antenna sites, as a static page for people.
+"""vlbaweather: the weather at the ten VLBA antenna sites, as a static page.
 
 Built on the ``weather`` package of local-weather-awareness (copied into ``weather/``) for the
 NWS products, alerts, radar maps and sun times, with these additions: the NWS raw gridpoint

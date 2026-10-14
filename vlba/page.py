@@ -164,9 +164,9 @@ def cuts_text(cfg) -> str:
     if cfg.check_enabled("wind"):
         checks.append("wind or gusts of %g mph or more (observed, or forecast for this hour or next)" % cfg.wind_mph)
     listed = "; ".join(checks[:-1]) + "; and " + checks[-1] if len(checks) > 1 else checks[0]
-    return ("The verdict is for people, not a safety interface: BAD when any check is bad, GOOD "
-            "otherwise, “GOOD?” when a check had no usable data (unknown is never counted as "
-            "clear), NO DATA when no check could answer. The checks follow the weather cuts of the "
+    return ("The verdict is BAD when any check is bad, GOOD otherwise, “GOOD?” when a check had "
+            "no usable data (unknown is never counted as clear), and NO DATA when no check could "
+            "answer; it is not a safety interface. The checks follow the weather cuts of the "
             "ttustatus observatory monitor, applied to public data: %s. Thresholds are configuration; "
             "see the README. The sun is shown for information only." % listed)
 

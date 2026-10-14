@@ -1,6 +1,6 @@
 #!/bin/sh
 # vlbaweather cron wrapper: ONE run of the VLBA page generator, for hosts without systemd
-# (tau.kirx.net runs Gentoo with OpenRC) or any host with a cron daemon. The installer
+# (such as Gentoo with OpenRC) or any host with a cron daemon. The installer
 # deploy/install-cron.sh puts this line into the run user's crontab:
 #
 #   */5 * * * * <checkout>/deploy/vlbaweather-cron.sh # vlbaweather

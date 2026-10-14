@@ -947,17 +947,12 @@ def test_installers_print_this_deployments_address(tmp_path):
     assert "WEATHER_PAGE_URL is not set, so the page footer shows no address" in r2.stdout
     for out in (r.stdout, r2.stdout):
         assert "tau.kirx.net" not in out and "/myweather" not in out
-    # the host is named only in comments (as the example deployment), never in output or
-    # in a setting; the Apache snippet is rendered on every host, so it says "example"
-    for name in ("install.sh", "install-cron.sh", "apache-vlbaweather.conf",
-                 "vlbaweather-cron.sh", "vlbaweather.service", "vlbaweather.timer"):
-        for line in _read("deploy", name).splitlines():
-            if "tau.kirx.net" in line:
-                assert line.lstrip().startswith("#"), (name, line)
-                if name.endswith(".conf"):
-                    assert "example" in line, (name, line)
-    for line in _read("run_local.sh").splitlines():
-        assert "tau.kirx.net" not in line or line.lstrip().startswith("#"), line
+    # the install files are host-neutral: no deploy file, the env example or run_local.sh
+    # names the example deployment's host (the README links to its page)
+    for name in sorted(os.listdir(os.path.join(ROOT, "deploy"))):
+        assert "tau.kirx.net" not in _read("deploy", name), name
+    for name in ("vlbaweather.env.example", "run_local.sh"):
+        assert "tau.kirx.net" not in _read(name), name
 
 
 def test_cron_installer_refuses_root_and_needs_root():

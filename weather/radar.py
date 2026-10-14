@@ -782,7 +782,7 @@ class SiteMap:
     for the life of the object, so rendering a second frame costs only the compositing."""
 
     # The scale bars, (label, length in km), drawn bottom-left from the bottom up. A
-    # subclass may draw others (vlbaweather: 10 mi and 10 km, for its rings in km).
+    # subclass may draw others, e.g. 10 mi and 10 km for a map with range rings in km.
     SCALE_BARS: Tuple[Tuple[str, float], ...] = (("25 mi", 25 * geo.MI_TO_KM),
                                                  ("10 mi", 10 * geo.MI_TO_KM))
 
@@ -1316,8 +1316,8 @@ class SiteMap:
         lines = []
         ts = radar.get("ts")
         # The caption names the radar product: MRMS unless the result says otherwise
-        # (``radar["label"]``: a caller that supplies another product's frame, such as the
-        # NWS composites vlbaweather draws for sites outside the MRMS grid).
+        # (``radar["label"]``: for a subclass whose ``_radar_layer`` draws another product's
+        # frame, such as an NWS radar composite for a site outside the MRMS grid).
         label = str(radar.get("label") or "MRMS")
         if radar.get("ok") and isinstance(ts, datetime):
             cap = label + " " + ts.astimezone(timezone.utc).strftime("%H:%MZ")

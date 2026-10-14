@@ -1,10 +1,11 @@
 # vlbaweather
 
-The weather at the ten VLBA antenna sites on one page, regenerated every 5 minutes, for
-people: a GOOD / BAD verdict per antenna with every reason, whether the sun is up, a radar
-map with the active NWS alert areas and the lightning of the last minutes, the current
-conditions, the alerts, the hourly and 7-day forecasts. No local sensors, no road closures,
-no safety-monitor output.
+The weather at the ten VLBA antenna sites on one page, regenerated every 5 minutes: a GOOD /
+BAD verdict per antenna with every reason, whether the sun is up, a radar map with the active
+NWS alert areas and the lightning of the last minutes, the current conditions, the alerts,
+the hourly and 7-day forecasts. No local sensors, no road closures, no safety-monitor output.
+
+**Live page:** https://tau.kirx.net/vlbaweather/
 
 It is built on the `weather` package of
 [local-weather-awareness](https://github.com/kirxkirx/local-weather-awareness) (NWS products
@@ -18,6 +19,16 @@ BR  Brewster, WA        GOOD   all checks clear                       ☀ Sun up
 ...
 SC  St. Croix, VI       BAD    precipitation probability 50 % > 20 % (this hour); ...
 ```
+
+## Sister projects
+
+- [local-weather-awareness](https://github.com/kirxkirx/local-weather-awareness): local
+  weather pages for any list of US places, from public data: NWS forecasts and alerts, MRMS
+  radar maps, New Mexico emergency road closures. Example: https://tau.kirx.net/myweather/.
+- [ttustatus](https://github.com/kirxkirx/ttustatus): the status page and ASCOM Alpaca
+  SafetyMonitor of an observatory's Raspberry Pi, which combines the sun, humidity, rain,
+  the NWS forecast and warnings, GOES lightning and MRMS radar into one `IsSafe` flag that
+  NINA reads.
 
 ## What the page shows
 
@@ -170,13 +181,15 @@ PLAN.md                  the design and the decisions
 .github/workflows/ci.yml lint, tests and shell syntax on Python 3.9 and 3.12
 ```
 
-`weather/` is the parent's library at its commit c3a13b4 with two hooks added for this
-service in `weather.radar.SiteMap`: the caption label (`radar["label"]`, default "MRMS") and
-the scale bars (`SCALE_BARS`, default 25 mi and 10 mi; the antennas' maps draw 10 mi and
-10 km). All of its modules are needed (the page and the maps import the road layer too,
-which stays off here). To take in a later version, copy the parent's `weather/*.py` and its
-`make_weather_page.py` (as `weather/pipeline.py`) over these, keep the two hooks, and run the
-tests; the parent's own tests of its library stay in its repository.
+`weather/` is the parent's library: its commit c3a13b4 and the two hooks in
+`weather.radar.SiteMap` that the parent gained after it, the caption label (`radar["label"]`,
+default "MRMS") and the scale bars (`SCALE_BARS`, default 25 mi and 10 mi; the antennas' maps
+draw 10 mi and 10 km). All of its modules are needed (the page and the maps import the road
+layer too, which stays off here). To take in a later version, copy the parent's
+`weather/*.py` and its `make_weather_page.py` (as `weather/pipeline.py`) over these, put the
+origin notes back at the top of `weather/__init__.py` and `weather/pipeline.py`, naming the
+parent commit you copied, and run the tests; the parent's own tests of its library stay in
+its repository.
 
 ## Run locally
 
@@ -223,13 +236,15 @@ wrapper against a stub generator, DRY_RUN renders of both installers). CI
 the installers' shared functions are compared with the parent's when `LWA_CHECKOUT` names a
 checkout of it.
 
-## Deploy on tau.kirx.net (Gentoo/OpenRC, cron, Apache)
+## Deploy on a Gentoo/OpenRC host with cron and Apache
 
-From its own checkout, beside the parent's page, run as `apache` like the parent. The
-checkout belongs to the admin account (`kirx`), which also runs every later `git pull`;
-`apache` only reads it, so it must be able to enter the home directory: if `ls -ld
-/home/kirx` shows `drwx------`, `chmod 711 /home/kirx` (the parent's deployment already
-needs this). As kirx:
+The generator runs as `apache`, the web server's account, from its own checkout; on a host
+that also runs the parent, the two keep separate env files, cron lines, output and cache
+directories. The host needs Apache, a running cron daemon and git (`www-servers/apache`,
+`sys-process/cronie`, `dev-vcs/git`; the parent's README has the details). The checkout
+belongs to an admin account (`kirx` in the commands below), which also runs every later
+`git pull`; `apache` only reads it, so it must be able to enter the home directory: if
+`ls -ld /home/kirx` shows `drwx------`, `chmod 711 /home/kirx`. As kirx:
 
 ```bash
 git clone https://github.com/kirxkirx/vlbaweather.git ~/vlbaweather
@@ -238,18 +253,27 @@ git clone https://github.com/kirxkirx/vlbaweather.git ~/vlbaweather
 The rest in a root shell:
 
 ```bash
-# packages: Pillow for the maps, numpy and h5py for the GLM lightning layer
-emerge --ask --noreplace dev-python/pillow dev-python/numpy dev-python/h5py
+# packages: Pillow with FreeType and zlib for the maps, a TrueType font for their labels,
+# numpy and h5py for the GLM lightning layer
+echo 'dev-python/pillow truetype zlib' >> /etc/portage/package.use/vlbaweather
+emerge --ask --noreplace dev-python/pillow media-fonts/dejavu dev-python/numpy dev-python/h5py
 
 # configuration: its own env file (the parent's /etc/local-weather-awareness.env is not read)
 cat > /etc/vlbaweather.env <<'EOT'
 WEATHER_OUT_DIR=/var/www/localhost/htdocs/vlbaweather
-WEATHER_PAGE_URL=https://tau.kirx.net/vlbaweather/
+WEATHER_PAGE_URL=https://www.example.org/vlbaweather/
 WEATHER_USER_AGENT=vlbaweather (+https://github.com/kirxkirx/vlbaweather; you@example.org)
 EOT
 chmod 0644 /etc/vlbaweather.env     # and put YOUR REAL e-mail address in the User-Agent
+                                    # and your host's name in WEATHER_PAGE_URL
 
-# the cron job (every 5 min), the directories, the Apache snippet, one first run
+# the output directory, handed to apache: the installer does not create it as root
+# under /var/www, which belongs to apache
+mkdir -p /var/www/localhost/htdocs/vlbaweather
+chown apache:apache /var/www/localhost/htdocs/vlbaweather
+chmod 0755 /var/www/localhost/htdocs/vlbaweather
+
+# the cron job (every 5 min), the cache directory, the Apache snippet, one first run
 RUN_USER=apache /home/kirx/vlbaweather/deploy/install-cron.sh
 # preview only: DRY_RUN=1 RUN_USER=apache /home/kirx/vlbaweather/deploy/install-cron.sh
 
@@ -274,6 +298,14 @@ Gentoo, the `PYTHON_TARGETS` of `dev-python/pillow` must include that version (o
 fonts-dejavu-core`. RHEL, Alma, Rocky: `dnf install python3-pillow python3-numpy python3-h5py
 dejavu-sans-fonts` (python3-pillow comes from EPEL).
 
+Under cron, a virtualenv works instead of system packages (the systemd unit runs
+`/usr/bin/python3`): set `WEATHER_PYTHON=/path/to/venv/bin/python3` in
+`/etc/vlbaweather.env`. A venv's interpreter uses the venv's packages without activation.
+The venv needs Pillow, numpy and h5py (`/path/to/venv/bin/pip install pillow numpy h5py`;
+Pillow from pip has FreeType and zlib built in), and the run user must be able to read it.
+Then rerun the installer, which checks the interpreter, Pillow, the fonts and the GLM modules
+as the run user.
+
 Every setting is documented in `vlbaweather.env.example`; the generic ones keep their
 `WEATHER_*` names (the generator is built on the parent's library), the VLBA page's own are `VLBA_*`.
 Network per run at the defaults: a few dozen small NWS requests (most cached for 30 min), one
@@ -297,7 +329,8 @@ and warnings use weather.gov.
 
 ## License
 
-No license has been chosen for this code yet. Until the owner adds a `LICENSE` file, the
-usual copyright rules apply: you may read the code here, but no permission to copy, modify
-or redistribute it is granted. The data shown on the page are not covered by this: they come
-from public sources under their own terms (see the credits above).
+[0BSD](LICENSE), the BSD Zero Clause License: anyone may use, copy, modify and distribute
+this code for any purpose, with or without fee and with no conditions attached; it comes
+without any warranty. The `weather/` package, copied from local-weather-awareness, is under
+the same license. The data shown on the page are not covered by this: they come from public
+sources under their own terms (see the credits above).

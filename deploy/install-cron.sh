@@ -1,9 +1,8 @@
 #!/bin/bash
-# Install vlbaweather (the VLBA antenna weather page) as a cron job. No systemd needed:
-# tau.kirx.net runs Gentoo with OpenRC. Every 5 minutes cron runs
+# Install vlbaweather (the VLBA antenna weather page) as a cron job, for hosts without
+# systemd such as Gentoo with OpenRC. Every 5 minutes cron runs
 # deploy/vlbaweather-cron.sh as an unprivileged user; it regenerates the static page into
-# OUT_DIR, which Apache serves as https://<host>/vlbaweather/
-# (https://tau.kirx.net/vlbaweather/ in the example deployment). (On a systemd host
+# OUT_DIR, which Apache serves as https://<host>/vlbaweather/. (On a systemd host
 # deploy/install.sh does the same with a service + timer; use one or the other, not both.)
 #
 # vlbaweather is a checkout of its own (https://github.com/kirxkirx/vlbaweather; the weather
@@ -268,6 +267,7 @@ WARNING: '$PY' (as $RUN_USER, PATH=$CRON_PATH) cannot import Pillow: the page wi
                     version; or point WEATHER_PYTHON=python3.X in $SYSTEM_ENV_FILE at a
                     version Pillow is built for; see README)
            Debian/Ubuntu: apt install python3-pil    RHEL family: dnf install python3-pillow (EPEL)
+           In a virtualenv: /path/to/venv/bin/pip install pillow
 MSG
 else
     # The map labels want FreeType and a TrueType font; PNG output needs zlib. Ask the
@@ -319,6 +319,9 @@ WARNING: the GLM lightning layer needs python3-numpy and python3-h5py (or python
            Gentoo:  emerge --ask dev-python/numpy dev-python/h5py   (PYTHON_TARGETS as for Pillow)
            Debian/Ubuntu: apt install python3-numpy python3-h5py
            RHEL family:   dnf install python3-numpy python3-h5py
+           A virtualenv needs them inside it (no activation needed):
+                    /path/to/venv/bin/pip install pillow numpy h5py
+                    and WEATHER_PYTHON=/path/to/venv/bin/python3 in $SYSTEM_ENV_FILE
 MSG
 fi
 if command -v getenforce >/dev/null 2>&1 && [ "$(getenforce 2>/dev/null || echo Disabled)" != "Disabled" ]; then

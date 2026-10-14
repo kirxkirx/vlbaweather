@@ -1,8 +1,7 @@
 #!/bin/bash
 # Install vlbaweather (the VLBA antenna weather page) under systemd: a oneshot service + a
 # 5-minute timer that regenerate the static page into OUT_DIR, which Apache serves as
-# https://<host>/vlbaweather/. (The example deployment, tau.kirx.net, has no systemd and uses
-# deploy/install-cron.sh.)
+# https://<host>/vlbaweather/.
 #
 # vlbaweather is a checkout of its own (https://github.com/kirxkirx/vlbaweather; the weather
 # package it is built on is copied in) and installs beside local-weather-awareness's units
@@ -27,7 +26,7 @@
 # WEATHER_OUT_DIR / WEATHER_CACHE_DIR in an env file. It never touches the Apache config:
 # it renders the snippet and tells you where to copy it.
 #
-# Hosts without systemd (tau.kirx.net: Gentoo with OpenRC) use deploy/install-cron.sh, which
+# Hosts without systemd (such as Gentoo with OpenRC) use deploy/install-cron.sh, which
 # installs a crontab line for deploy/vlbaweather-cron.sh instead. Use one or the other.
 set -euo pipefail
 

@@ -1,7 +1,7 @@
 # vlbaweather — plan and module contract
 
-A static web page with the weather at the ten VLBA antenna sites, generated every 5 minutes,
-for people (no local sensors, no safety-monitor output). Built on the `weather` package of
+A static web page with the weather at the ten VLBA antenna sites, generated every 5 minutes
+(no local sensors, no safety-monitor output). Built on the `weather` package of
 local-weather-awareness (the parent; copied into `weather/`, its `make_weather_page.py` as
 `weather/pipeline.py`), and on the weather cuts of ttustatus (the TTU Alpaca
 SafetyMonitor) for the GOOD / BAD verdict.
@@ -121,7 +121,7 @@ vlbaweather/              the checkout
   deploy/                 vlbaweather-cron.sh, install-cron.sh, apache-vlbaweather.conf
   vlbaweather.env.example every variable with its default
   run_local.sh            local preview (5-min loop + http.server)
-  README.md               what it shows, the cuts, sources, deploy on tau.kirx.net
+  README.md               what it shows, the cuts, sources, deployment
 ```
 
 ### VLBA_* settings (`vlba/config.py`, every one overridable, validated at startup)
@@ -228,10 +228,10 @@ Masthead clock: UTC, with each antenna's local time in its row and section headi
 
 ## 7. Deployment
 
-tau.kirx.net (Gentoo/OpenRC, cron, Apache), beside the parent: its own env files
-`/etc/vlbaweather.env` and `~<run user>/vlbaweather.env`, cron line `*/5 * * * *
+A Gentoo/OpenRC host with cron and Apache, beside the parent when the host runs it: its own
+env files `/etc/vlbaweather.env` and `~<run user>/vlbaweather.env`, cron line `*/5 * * * *
 <checkout>/deploy/vlbaweather-cron.sh # vlbaweather` (its own checkout), output
-`<DocumentRoot>/vlbaweather` (https://tau.kirx.net/vlbaweather/), cache
+`<DocumentRoot>/vlbaweather` (the live page: https://tau.kirx.net/vlbaweather/), cache
 `~apache/.cache/vlbaweather`, syslog tag `vlbaweather`. The generic settings keep their
 `WEATHER_*` names (the generator is built on the parent's library); the VLBA settings are `VLBA_*`.
 GLM needs `dev-python/numpy` and `dev-python/h5py` (or netcdf4) for the run user's Python;
