@@ -1,6 +1,7 @@
 # vlbaweather page generator: ONE run = fetch alerts, radar, GLM lightning and forecasts for
-# the ten VLBA antennas, render the maps, write index.html + status.json into the output
-# directory. vlbaweather.timer starts it every 5 minutes; nothing stays resident between runs.
+# the ten VLBA antennas, the VLA and the GBT, render the maps, write index.html + status.json
+# into the output directory. vlbaweather.timer starts it every 30 minutes; nothing stays
+# resident between runs.
 #
 # Template file: deploy/install.sh fills in the placeholders (the vlbaweather checkout, run
 # user and group, home, output and cache dirs) and installs /etc/systemd/system/vlbaweather.service.
@@ -43,10 +44,10 @@ ExecStartPre=-+/usr/bin/setpriv --reuid=__USER__ --regid=__GROUP__ --init-groups
 ExecStart=/usr/bin/python3 __REPO__/make_vlba_page.py
 
 # A oneshot has no start timeout by default; a wedged run must never block the timer for
-# good. A normal run takes well under the 5-minute interval. Its network time is capped by
+# good. A normal run takes a minute or two. Its network time is capped by
 # WEATHER_RUN_BUDGET (default 240 s; after that every fetch is skipped and last-good copies
-# are used) and the GLM fetch by VLBA_GLM_TIMEOUT (default 45 s, inside the budget), and
-# rendering the maps (two per antenna) takes seconds, so 10 min leaves a wide margin. Keep
+# are used) and the GLM fetch by VLBA_GLM_TIMEOUT (default 90 s, inside the budget), and
+# rendering the maps (two per site) takes seconds, so 10 min leaves a wide margin. Keep
 # WEATHER_RUN_BUDGET well below this value if you raise it.
 TimeoutStartSec=10min
 # Background job on a shared web host: yield to Apache.

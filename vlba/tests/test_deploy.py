@@ -36,7 +36,7 @@ DEPLOY = os.path.join(ROOT, "deploy")
 WRAPPER = os.path.join(DEPLOY, "vlbaweather-cron.sh")
 CRON_INSTALLER = os.path.join(DEPLOY, "install-cron.sh")
 INSTALLER = os.path.join(DEPLOY, "install.sh")
-CRON_LINE = "*/5 * * * * %s # vlbaweather" % WRAPPER
+CRON_LINE = "*/30 * * * * %s # vlbaweather" % WRAPPER
 GENTOO_CRON_FIX = ("emerge --ask sys-process/cronie && rc-update add cronie default"
                    " && rc-service cronie start")
 GLM_WARNING = "the GLM lightning layer needs python3-numpy and python3-h5py"
@@ -225,15 +225,15 @@ def test_service_unit_recreates_dirs_and_outlasts_the_budget():
     assert m, s["TimeoutStartSec"]
     timeout_s = int(m.group(1)) * (60 if m.group(2) == "min" else 1)
     assert timeout_s >= VlbaConfig().run_budget_s + 180
-    assert timeout_s <= 600, "a wedged run must be gone before the following 5-minute ticks pile up"
+    assert timeout_s <= 600, "a wedged run must be gone well before the next 30-minute tick"
 
 
 def test_timer_unit_shape():
-    """Every 5 minutes on the wall clock, like the cron line, with the jitter of the
+    """Every 30 minutes on the wall clock, like the cron line, with the jitter of the
     parent's timer; no placeholders."""
     u = _unit(_read("deploy", "vlbaweather.timer"))
     t = u["Timer"]
-    assert t["OnCalendar"] == ["*:0/5"]
+    assert t["OnCalendar"] == ["*:0/30"]
     assert t["OnBootSec"] == ["2min"]
     assert "OnUnitActiveSec" not in t
     assert t["RandomizedDelaySec"] == ["15"]
@@ -245,11 +245,11 @@ def test_timer_unit_shape():
 
 
 @pytest.mark.skipif(not shutil.which("systemd-analyze"), reason="systemd-analyze not installed")
-def test_timer_calendar_expression_is_every_five_minutes():
-    r = subprocess.run(["systemd-analyze", "calendar", "*:0/5"], capture_output=True, text=True)
+def test_timer_calendar_expression_is_every_thirty_minutes():
+    r = subprocess.run(["systemd-analyze", "calendar", "*:0/30"], capture_output=True, text=True)
     if r.returncode != 0:
         pytest.skip("systemd-analyze calendar unusable here: %s" % r.stderr.strip())
-    assert re.search(r"Normalized form:\s*\*-\*-\* \*:00/5:00", r.stdout), r.stdout
+    assert re.search(r"Normalized form:\s*\*-\*-\* \*:00/30:00", r.stdout), r.stdout
 
 
 # ---- placeholders vs installer ----------------------------------------------------------
@@ -364,7 +364,7 @@ def test_apache_snippet_shape():
     assert "Options -Indexes -FollowSymLinks +SymLinksIfOwnerMatch" in conf
     assert "+FollowSymLinks" not in conf
     assert "Require all granted" in conf and "DirectoryIndex index.html" in conf
-    # the page regenerates every 5 min: 120 s for the page, its health JSON and the PNGs
+    # the page regenerates every 30 min and reloads every 5: 120 s for the page, its health JSON and the PNGs
     assert re.search(r'<FilesMatch "\^\(index\\\.html\|status\\\.json\)\$">\s*'
                      r'Header set Cache-Control "max-age=120"', conf)
     assert re.search(r'<FilesMatch "\\\.png\$">\s*Header set Cache-Control "max-age=120"', conf)
@@ -914,7 +914,7 @@ def test_cron_installer_cron_daemon_check_and_next_steps(tmp_path):
     assert re.search(r"^\+ su -s /bin/sh %s -c 'cd / && exec env -i HOME=\S+ .*"
                      r"WEATHER_LOG=- %s'$" % (re.escape(ME), re.escape(WRAPPER)), r.stdout, re.M)
     assert ("crontab -u %s -l | grep -v '# vlbaweather$' | crontab -u %s -" % (ME, ME)) in r.stdout
-    assert "every 5 minutes" in r.stdout
+    assert "every 30 minutes" in r.stdout
     assert "vlbaweather.env.example" in r.stdout and "/etc/local-weather-awareness.env is" in r.stdout
     assert "repo:      %s\n" % ROOT in r.stdout
     assert "git pull (or rsync) in %s" % ROOT in r.stdout
@@ -1056,7 +1056,7 @@ def test_run_local_previews_the_vlba_page():
     assert r.returncode == 0, r.stderr
     code = _code_lines(text)
     assert "python3 ./make_vlba_page.py" in code
-    assert 'INTERVAL="${INTERVAL:-300}"' in code
+    assert 'INTERVAL="${INTERVAL:-1800}"' in code
     assert 'WEATHER_CACHE_DIR="${WEATHER_CACHE_DIR:-./.cache-dev}"' in code
     assert 'DEV_USER_AGENT="vlbaweather-dev (+https://github.com/kirxkirx/vlbaweather)"' in code
     assert "make_weather_page" not in text and "local-weather-awareness-dev" not in text
@@ -1081,6 +1081,7 @@ def run_local_env(tmp_path):
     stub.write_text('#!/bin/bash\n'
                     'if [ "$1" = "./make_vlba_page.py" ]; then\n'
                     '    echo $$ >> "$STUB_PIDS"\n'
+                    '    echo "${VLBA_GLM_WINDOW_MIN:-unset}" >> "$STUB_WINDOW"\n'
                     '    while [ ! -e "$STUB_GO" ]; do sleep 0.1; done\n'
                     '    echo "the generated page" > "$WEATHER_OUT_DIR/index.html.tmp"\n'
                     '    mv -f "$WEATHER_OUT_DIR/index.html.tmp" "$WEATHER_OUT_DIR/index.html"\n'
@@ -1091,6 +1092,7 @@ def run_local_env(tmp_path):
     env = {k: v for k, v in os.environ.items() if not k.startswith(("WEATHER_", "VLBA_"))}
     env.update(PATH=str(stub_dir) + os.pathsep + env.get("PATH", ""),
                STUB_PIDS=str(tmp_path / "gen.pids"), STUB_GO=str(tmp_path / "go"),
+               STUB_WINDOW=str(tmp_path / "window"),
                BIND="127.0.0.1", INTERVAL="300", WEATHER_CACHE_DIR=str(tmp_path / "cache"))
     return env, tmp_path
 
@@ -1195,6 +1197,8 @@ def test_run_local_shows_a_placeholder_until_the_first_run_has_written_the_page(
         status, body = _get(port)
         assert status == 200 and "Directory listing" not in body
         assert "no page yet" in body and '<meta http-equiv="refresh" content="10">' in body
+        # INTERVAL=300: the GLM window follows the interval (5 min), not the 30-min default
+        assert (tmp / "window").read_text().split()[0] == "5"
         (tmp / "go").touch()
         assert _wait_until(lambda: _get(port) == (200, "the generated page\n"), 15)
         gen = _gen_pids(pids)

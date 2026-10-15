@@ -6,7 +6,9 @@
 # has written the page (a few minutes with an empty cache), the server shows a placeholder
 # page that says so and reloads itself.
 # Usage:  ./run_local.sh [port] [out_dir]        (defaults: 8080, ./out)
-# Env:    INTERVAL=300        seconds between generator runs (the deployment's 5 minutes)
+# Env:    INTERVAL=1800       seconds between generator runs (the deployment's 30 minutes);
+#                             VLBA_GLM_WINDOW_MIN follows it unless set (a longer window
+#                             would fetch the same lightning granules again every run)
 #         BIND=0.0.0.0        address the preview server listens on (0.0.0.0 = every
 #                             interface, so the page can be opened from other machines;
 #                             BIND=127.0.0.1 keeps it on this machine)
@@ -17,7 +19,15 @@ cd "$(dirname "$0")" || exit 1
 
 PORT="${1:-8080}"
 OUT="${2:-./out}"
-INTERVAL="${INTERVAL:-300}"
+INTERVAL="${INTERVAL:-1800}"
+case "$INTERVAL" in
+    '' | *[!0-9]*) ;;
+    *)
+        win=$(( (INTERVAL + 59) / 60 ))
+        if [ "$win" -lt 1 ]; then win=1; fi
+        if [ "$win" -gt 60 ]; then win=60; fi
+        export VLBA_GLM_WINDOW_MIN="${VLBA_GLM_WINDOW_MIN:-$win}" ;;
+esac
 BIND="${BIND:-0.0.0.0}"
 export WEATHER_OUT_DIR="$OUT"
 export WEATHER_CACHE_DIR="${WEATHER_CACHE_DIR:-./.cache-dev}"
@@ -36,9 +46,9 @@ WAITING=""
 if ( set -o noclobber; cat > "$OUT/index.html" ) 2>/dev/null <<EOT
 <!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta http-equiv="refresh" content="10">
-<meta name="color-scheme" content="light dark"><title>VLBA weather: no page yet</title></head>
+<meta name="color-scheme" content="light dark"><title>VLBA, VLA and GBT weather: no page yet</title></head>
 <body style="font: 16px/1.5 sans-serif; max-width: 40em; margin: 3em auto; padding: 0 1em">
-<h1>VLBA weather: no page yet</h1>
+<h1>VLBA, VLA and GBT weather: no page yet</h1>
 <p>The local preview started at $STARTED, and its first generator run writes the page.
 With an empty cache that run takes a few minutes (map tiles, NWS lookups). This page
 reloads every 10 seconds.</p>

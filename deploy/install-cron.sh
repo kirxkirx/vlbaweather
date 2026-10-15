@@ -1,6 +1,6 @@
 #!/bin/bash
 # Install vlbaweather (the VLBA antenna weather page) as a cron job, for hosts without
-# systemd such as Gentoo with OpenRC. Every 5 minutes cron runs
+# systemd such as Gentoo with OpenRC. Every 30 minutes cron runs
 # deploy/vlbaweather-cron.sh as an unprivileged user; it regenerates the static page into
 # OUT_DIR, which Apache serves as https://<host>/vlbaweather/. (On a systemd host
 # deploy/install.sh does the same with a service + timer; use one or the other, not both.)
@@ -32,7 +32,7 @@
 #   3. make /etc/vlbaweather.env set WEATHER_OUT_DIR and WEATHER_CACHE_DIR: the resolved
 #      values are appended when missing, no other line is ever rewritten; mode 0644,
 #      because the cron job reads it as RUN_USER;
-#   4. put "*/5 * * * * <checkout>/deploy/vlbaweather-cron.sh # vlbaweather"
+#   4. put "*/30 * * * * <checkout>/deploy/vlbaweather-cron.sh # vlbaweather"
 #      into RUN_USER's crontab, replacing an older vlbaweather line and keeping every other
 #      line (local-weather-awareness's "# local-weather-awareness" line included);
 #   5. check that a cron daemon is running (prints the Gentoo fix when none is);
@@ -215,7 +215,7 @@ case "$PY" in
         die "$(env_source WEATHER_PYTHON) sets WEATHER_PYTHON=$PY: give an interpreter name
        or absolute path (letters, digits and . _ / + - only), e.g. WEATHER_PYTHON=python3.12" ;;
 esac
-CRON_LINE="*/5 * * * * $WRAPPER $CRON_TAG"
+CRON_LINE="*/30 * * * * $WRAPPER $CRON_TAG"
 
 case "$OUT_DIR" in
     /var/www/html/*)
@@ -536,7 +536,7 @@ if [ -n "$DRY_RUN" ]; then
     echo "+ su -s /bin/sh $RUN_USER -c '$FIRST_RUN'"
 else
     echo "running the generator once as $RUN_USER through the cron wrapper (the first run" \
-         "fetches basemap tiles for all ten antennas: allow a few minutes)"
+         "fetches basemap tiles for all twelve sites: allow a few minutes)"
     rc=0
     su -s /bin/sh "$RUN_USER" -c "$FIRST_RUN" || rc=$?
     if [ "$rc" -eq 0 ]; then
@@ -564,7 +564,7 @@ ENV_LOG="$(env_lookup WEATHER_LOG)"
 [ -z "$ENV_LOG" ] || LOGS="$ENV_LOG (WEATHER_LOG from an env file)"
 cat <<MSG
 
-Done. cron runs $WRAPPER every 5 minutes as $RUN_USER;
+Done. cron runs $WRAPPER every 30 minutes as $RUN_USER;
 it regenerates $OUT_DIR.
   crontab:  crontab -u $RUN_USER -l
   logs:     $LOGS

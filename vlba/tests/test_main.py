@@ -9,13 +9,15 @@ import json
 import os
 import sys
 from datetime import timedelta, timezone
+from urllib.parse import urlencode
 
 import pytest
 from PIL import Image
 
 from weather import geo, http, util
 import make_vlba_page as mvp                     # noqa: E402  (conftest put vlbaweather on sys.path)
-from vlba import glm
+from vlba import decision, glm, nwsradar
+from vlba.sites import SITES
 from vlba.tests.conftest import MK, PT, grib2_around
 
 UTC = timezone.utc
@@ -164,10 +166,13 @@ def island_ts():
     return (util.utcnow() - timedelta(minutes=3)).replace(microsecond=0)
 
 
-def caps_doc():
+def caps_doc(times=None):
+    """The Hawaii workspace's capabilities; ``times``: the frames the time dimension lists."""
+    listed = ",".join(nwsradar._iso_time(t) for t in times) if times else ""
     return ('<WMS_Capabilities><Layer><Name>hawaii_bref_qcd</Name>'
-            '<Dimension name="time" default="%s" units="ISO8601"/></Layer></WMS_Capabilities>'
-            % island_ts().strftime("%Y-%m-%dT%H:%M:%SZ"))
+            '<Dimension name="time" default="%s" units="ISO8601"%s</Layer></WMS_Capabilities>'
+            % (island_ts().strftime("%Y-%m-%dT%H:%M:%SZ"),
+               ' nearestValue="1">%s</Dimension>' % listed if listed else "/>"))
 
 
 def _glm_result(flashes):
@@ -283,7 +288,14 @@ def test_full_run_two_antennas(cfg, fake_http, mrms, glm_flash_pt, monkeypatch):
     run2 = mvp.run_once(cfg)
     radar2 = [c for c in run2["sites"][0]["verdict"]["checks"] if c["key"] == "radar"][0]
     assert radar2["state"] == "watch" and "not counted again" in radar2["detail"]
-    newer = dict(_mrms_result([(PT["lat"] + 0.09, PT["lon"])]), ts=frame_ts() + timedelta(minutes=2))
+    # a newer frame with the very same data in the ring (the radar has not completed a new
+    # scan): no second observation either
+    same = dict(_mrms_result([(PT["lat"] + 0.09, PT["lon"])]), ts=frame_ts() + timedelta(minutes=2))
+    monkeypatch.setattr(mvp.mwp.radar, "load_frame", lambda cfg, cache: same)
+    radar_same = [c for c in mvp.run_once(cfg)["sites"][0]["verdict"]["checks"] if c["key"] == "radar"][0]
+    assert radar_same["state"] == "watch" and "the same radar data as the frame counted last" in radar_same["detail"]
+    # a new scan (the echo has moved) confirms it
+    newer = dict(_mrms_result([(PT["lat"] + 0.08, PT["lon"] + 0.02)]), ts=frame_ts() + timedelta(minutes=4))
     monkeypatch.setattr(mvp.mwp.radar, "load_frame", lambda cfg, cache: newer)
     run3 = mvp.run_once(cfg)
     pt3 = run3["sites"][0]
@@ -747,7 +759,7 @@ def test_cli_exit_codes(tmp_path, monkeypatch, fake_http):
     seen = {}
     monkeypatch.setattr(mvp, "run_once", lambda cfg, skip_radar=False: seen.update(glm=cfg.glm_enabled, n=len(cfg.sites)))
     assert mvp.main(["--skip-glm", "--out", str(tmp_path / "o"), "--cache", str(tmp_path / "c")]) == 0
-    assert seen == {"glm": False, "n": 10}
+    assert seen == {"glm": False, "n": 12}
 
 
 def test_script_runs_as_a_program(tmp_path):
@@ -995,3 +1007,282 @@ def test_island_coverage_of_two_sites_in_one_domain_is_merged(cfg, monkeypatch):
     merged = run["radar_coverage"]["HAWAII"]
     assert not merged["ok"] and merged["error"] == "HTTP 503" and set(merged["sites"]) == {"mk", "hi"}
     assert run["errors"] == ["x radar coverage (MRMS HAWAII) unavailable: HTTP 503"]
+
+
+# ---- the frames before the newest: runs 30 min apart confirm an echo by themselves ----------
+ECHO = [(PT["lat"] + 0.09, PT["lon"])]                  # 30 dBZ 10 km north of Pie Town
+MOVED = [(PT["lat"] + 0.08, PT["lon"] + 0.02)]          # the same shower one scan earlier
+
+
+def _quiet_glm(monkeypatch):
+    monkeypatch.setattr(glm, "fetch", lambda cfg, now=None, since=None, retried=None, seen=None: _glm_result([]))
+    monkeypatch.setattr(glm, "deps_available", lambda: True)
+
+
+def _fixed_frame(monkeypatch, cells):
+    """The newest MRMS frame with the given echo cells, its time fixed for the whole test
+    (the routes of the frames before it are named after it); returns that time."""
+    newest = _mrms_result(cells)
+    monkeypatch.setattr(mvp.mwp.radar, "load_frame", lambda cfg, cache: newest)
+    return newest["ts"]
+
+
+def _archive_name(ts):
+    return ts.strftime("lcref_%Y%m%d%H%M.png")
+
+
+def _radar_state(entry):
+    return {c["key"]: c for c in entry["verdict"]["checks"]}["radar"]
+
+
+def test_one_run_confirms_an_echo_with_the_frame_before(cfg, fake_http, monkeypatch):
+    """Where a ring shows an echo in the newest MRMS frame, the run fetches the frame before it
+    from IEM's archive and confirms the echo by itself; a dry ring (Mauna Kea's composite
+    here) fetches nothing more."""
+    _quiet_glm(monkeypatch)
+    t = _fixed_frame(monkeypatch, ECHO)
+    before = (t - timedelta(minutes=2)).strftime(cfg.mrms_archive)
+    fake_http.add(_archive_name(t - timedelta(minutes=2)), frame_png(MOVED))
+    add_routes(fake_http, cfg)
+    run = mvp.run_once(cfg)
+    pt, mk = run["sites"]
+    radar = _radar_state(pt)
+    assert radar["state"] == "bad" and "on 2 consecutive frames" in radar["detail"]
+    assert pt["verdict"]["status"] == "BAD" and any("rain on radar" in r for r in pt["verdict"]["reasons"])
+    assert [c["frame_ts"] for c in pt["radar_check"]["earlier"]] == [t - timedelta(minutes=2)]
+    assert [c for c in fake_http.calls if "lcref_" in c] == ["HEAD " + before, before]
+    assert "earlier" not in mk["radar_check"] and not any("TIME=" in c for c in fake_http.calls)
+    assert not [e for e in run["errors"] if "frame before" in e or "confirmed" in e], run["errors"]
+    with open(cfg.state_file, encoding="utf-8") as f:
+        st = json.load(f)["sites"]["pt"]
+    assert st["radar_streak"] == 2 and st["radar_last_digest"] == pt["radar_check"]["digest"]
+
+
+def test_an_earlier_frame_with_the_same_ring_data_is_passed_over(cfg, fake_http, monkeypatch):
+    """IEM writes a frame every 2 min but a radar completes a scan only every 4.5-10 min: a
+    frame whose ring holds the very data of the newest is no second observation. It is passed
+    over for the one before it; when every frame within VLBA_RADAR_STALE (20 min) holds the
+    same data, the echo stays unconfirmed, and no older frame is asked for."""
+    _quiet_glm(monkeypatch)
+    t = _fixed_frame(monkeypatch, ECHO)
+    fake_http.add(_archive_name(t - timedelta(minutes=2)), frame_png(ECHO))          # same scan
+    fake_http.add(_archive_name(t - timedelta(minutes=4)), frame_png(MOVED))         # the scan before
+    add_routes(fake_http, cfg)
+    pt = mvp.run_once(cfg)["sites"][0]
+    assert _radar_state(pt)["state"] == "bad"
+    assert [c["frame_ts"] for c in pt["radar_check"]["earlier"]] == [t - timedelta(minutes=4)]
+
+    fake_http.routes.insert(0, ("lcref_", frame_png(ECHO), True))      # every frame the same scan
+    fake_http.calls.clear()
+    os.remove(cfg.state_file)
+    run = mvp.run_once(cfg)
+    radar = _radar_state(run["sites"][0])
+    assert radar["state"] == "watch" and "frame 1 of 2" in radar["detail"]
+    assert run["sites"][0]["radar_check"]["earlier"] == []
+    asked = sorted({c.rsplit("lcref_", 1)[1][:12] for c in fake_http.calls if "lcref_" in c})
+    oldest = (util.utcnow() - timedelta(seconds=cfg.radar_stale_s + 60)).strftime("%Y%m%d%H%M")
+    assert asked and all(a >= oldest for a in asked) and len(asked) <= 8
+    assert not [e for e in run["errors"] if "frame before" in e], run["errors"]
+
+
+def test_runs_half_an_hour_apart_still_confirm_an_echo(cfg, fake_http, monkeypatch):
+    """The 30-minute schedule: the run before counted the echo once, half an hour ago; now the
+    echo is on both of this run's frames: BAD. Without a frame before it (missing from the
+    archive) the echo stays unconfirmed, because frames 30 min apart are not consecutive,
+    and the run says why."""
+    _quiet_glm(monkeypatch)
+    t = _fixed_frame(monkeypatch, ECHO)
+    now = util.utcnow()
+
+    def seed():
+        st = decision.load_state(cfg.state_file)
+        st["sites"]["pt"] = {"radar_streak": 1, "radar_last_frame_ts": (t - timedelta(minutes=30)).timestamp(),
+                             "radar_last_count_ts": (now - timedelta(minutes=30)).timestamp()}
+        assert decision.save_state(cfg.state_file, st, now - timedelta(minutes=30)) is None
+
+    seed()
+    fake_http.add("lcref_", frame_png(MOVED))
+    add_routes(fake_http, cfg)
+    assert _radar_state(mvp.run_once(cfg)["sites"][0])["state"] == "bad"
+
+    seed()
+    fake_http.routes.insert(0, ("lcref_", None, False))         # the archive has no frame before
+    fake_http.calls.clear()
+    run = mvp.run_once(cfg)
+    radar = _radar_state(run["sites"][0])
+    assert radar["state"] == "watch" and "frame 1 of 2" in radar["detail"]
+    assert any("MRMS frame before %s unavailable (frames missing from the archive)" % t.strftime("%H:%MZ") in e
+               for e in run["errors"]), run["errors"]
+    assert sum(c.startswith("HEAD ") and "lcref_" in c for c in fake_http.calls) == 3
+    assert not [c for c in fake_http.calls if "lcref_" in c and not c.startswith("HEAD ")]
+
+
+def test_the_mrms_frames_before_the_newest(cfg, fake_http, monkeypatch):
+    """``_earlier_mrms``: for every site with an echo in its ring, the frames before the newest,
+    oldest first, each fetched once for all sites; a frame missing from the archive is passed
+    over; HEAD answered but GET failing, or an archive that does not answer, ends the search
+    and is a problem of the run; nothing is fetched after a reused (stale) newest frame, for
+    dry rings or with a one-frame trigger."""
+    vla = dict(next(s for s in SITES if s["slug"] == "vla"))
+    cells = ECHO + [(vla["lat"] + 0.09, vla["lon"])]
+    moved = MOVED + [(vla["lat"] + 0.08, vla["lon"] + 0.02)]
+    newest = _mrms_result(cells)
+    t = newest["ts"]
+    fake_http.fail(_archive_name(t - timedelta(minutes=2)))
+    fake_http.add(_archive_name(t - timedelta(minutes=4)), frame_png(moved))
+    fake_http.add("lcref_", frame_png([]))
+    run = {"errors": []}
+    got = mvp._earlier_mrms(cfg, run, newest, [PT, vla, MK])
+    assert set(got) == {"pt", "vla"} and run["errors"] == []
+    for slug in ("pt", "vla"):
+        assert [c["frame_ts"] for c in got[slug]] == [t - timedelta(minutes=4)] and got[slug][0]["in_ring"]
+    assert len([c for c in fake_http.calls if not c.startswith("HEAD ")]) == 1          # one GET for both sites
+    cfg.radar_trigger_after = 3
+    got = mvp._earlier_mrms(cfg, {"errors": []}, newest, [PT])
+    assert [c["frame_ts"] for c in got["pt"]] == [t - timedelta(minutes=6), t - timedelta(minutes=4)]
+    assert [c["in_ring"] for c in got["pt"]] == [False, True]                 # oldest first
+    for stale_or_failed in (dict(newest, stale=True), dict(newest, ok=False)):
+        assert mvp._earlier_mrms(cfg, {"errors": []}, stale_or_failed, [PT]) == {}
+    fake_http.calls.clear()
+    assert mvp._earlier_mrms(cfg, {"errors": []}, _mrms_result([]), [PT]) == {} and fake_http.calls == []
+    cfg.radar_trigger_after = 1
+    assert mvp._earlier_mrms(cfg, {"errors": []}, newest, [PT]) == {} and fake_http.calls == []
+    cfg.radar_trigger_after = 2
+    monkeypatch.setattr(mvp.http, "head_ok", lambda *a, **k: True)
+    monkeypatch.setattr(mvp.http, "get_bytes", lambda *a, **k: (_ for _ in ()).throw(http.HttpError("HTTP 500")))
+    run = {"errors": []}
+    assert mvp._earlier_mrms(cfg, run, newest, [PT]) == {"pt": []}
+    assert run["errors"] == ["MRMS frame before %s unavailable (HTTP 500): an echo in a ring is not confirmed by "
+                             "this run alone" % t.strftime("%H:%MZ")]
+    monkeypatch.setattr(mvp.http, "head_ok", lambda *a, **k: None)
+    run = {"errors": []}
+    assert mvp._earlier_mrms(cfg, run, newest, [PT]) == {"pt": []}
+    assert "(the MRMS archive did not answer)" in run["errors"][0]
+
+
+def _island_setup(cfg, fake_http, monkeypatch, earlier_png):
+    """Mauna Kea with an echo in its ring in the newest composite and the capabilities listing
+    the two frames before it; the frame of 2 min before answers ``earlier_png`` (None: fails),
+    the one of 4 min before a moved echo."""
+    _quiet_glm(monkeypatch)
+    monkeypatch.setattr(mvp.mwp.radar, "load_frame", lambda cfg, cache: _mrms_result([]))
+    east = geo.dest_point(MK["lat"], MK["lon"], 10.0, 90.0)
+    north = geo.dest_point(MK["lat"], MK["lon"], 14.0, 10.0)
+    echo = [(east[0], east[1], (11, 136, 15))]                      # 30 dBZ on the composite's scale
+    moved = [(north[0], north[1], (11, 136, 15))]
+    ts = island_ts()
+    frame = geo.MapFrame(MK["lat"], MK["lon"], cfg.map_km, cfg.map_px, cfg.tile_zoom)
+    fake_http.add("GetCapabilities", caps_doc([ts - timedelta(minutes=4), ts - timedelta(minutes=2), ts]))
+    t2 = urlencode([("TIME", nwsradar._iso_time(ts - timedelta(minutes=2)))])
+    if earlier_png is None:
+        fake_http.fail(t2)
+    else:
+        fake_http.add(t2, earlier_png(frame, echo))
+    fake_http.add(urlencode([("TIME", nwsradar._iso_time(ts - timedelta(minutes=4)))]), island_png(frame, moved))
+    add_routes(fake_http, cfg, mk_blobs=echo)
+    return ts
+
+
+def test_an_island_echo_is_confirmed_with_the_composite_frame_before(cfg, fake_http, monkeypatch):
+    """Mauna Kea: where the newest composite shows an echo in the ring, the run asks for the
+    frames the capabilities list before it (GetMap with TIME) and confirms the echo by itself;
+    a frame with the same data in the ring is passed over for the one before it."""
+    ts = _island_setup(cfg, fake_http, monkeypatch, lambda frame, echo: island_png(frame, echo))   # same scan
+    run = mvp.run_once(cfg)
+    mk = run["sites"][1]
+    radar = _radar_state(mk)
+    assert radar["state"] == "bad" and "on 2 consecutive frames" in radar["detail"]
+    assert [c["frame_ts"] for c in mk["radar_check"]["earlier"]] == [ts - timedelta(minutes=4)]
+    assert sum("TIME=" in c for c in fake_http.calls) == 2
+    assert "times" not in mk["island_radar"]
+    assert not [e for e in run["errors"] if "confirmed" in e], run["errors"]
+
+
+def test_an_island_frame_before_that_fails_or_has_unknown_colours(cfg, fake_http, monkeypatch):
+    """A composite frame before the newest that cannot be fetched ends the search and is a
+    problem of the run (the echo stays unconfirmed, a running streak is not reset); one with a
+    colour the decoder does not know inside the ring is unusable and passed over."""
+    _island_setup(cfg, fake_http, monkeypatch, None)
+    now = util.utcnow()
+    st = decision.load_state(cfg.state_file)
+    st["sites"]["mk"] = {"radar_streak": 1, "radar_last_frame_ts": (island_ts() - timedelta(minutes=4)).timestamp(),
+                         "radar_last_count_ts": (now - timedelta(minutes=4)).timestamp()}
+    assert decision.save_state(cfg.state_file, st, now - timedelta(minutes=4)) is None
+    run = mvp.run_once(cfg)
+    mk = run["sites"][1]
+    assert _radar_state(mk)["state"] == "bad" and mk["radar_check"]["earlier"] == []     # the streak goes on
+    assert any("mk radar composite of %s unavailable" % (island_ts() - timedelta(minutes=2)).strftime("%H:%MZ") in e
+               and "not confirmed by this run alone" in e for e in run["errors"]), run["errors"]
+
+    def unknown_colour(frame, echo):
+        # other data than the newest (a 30 dBZ cell 20 km out), so only the colour rule can
+        # pass it over, and a colour the decoder does not know inside the ring
+        x = geo.dest_point(MK["lat"], MK["lon"], 6.0, 200.0)
+        y = geo.dest_point(MK["lat"], MK["lon"], 20.0, 300.0)
+        return island_png(frame, echo + [(y[0], y[1], (11, 136, 15)), (x[0], x[1], (2, 253, 2))])
+    fake_http.routes = []
+    os.remove(cfg.state_file)
+    ts = _island_setup(cfg, fake_http, monkeypatch, unknown_colour)
+    mk = mvp.run_once(cfg)["sites"][1]
+    assert _radar_state(mk)["state"] == "bad"
+    assert [c["frame_ts"] for c in mk["radar_check"]["earlier"]] == [ts - timedelta(minutes=4)]
+
+
+def test_three_frame_trigger_passes_over_repeats_between_the_frames_before(cfg, fake_http):
+    """VLBA_RADAR_TRIGGER_AFTER=3: two frames before the newest, each a scan of its own; a frame
+    with the data of the next newer one taken is passed over, and the result is oldest first."""
+    cfg.radar_trigger_after = 3
+    newest = _mrms_result(ECHO)
+    t = newest["ts"]
+    fake_http.add(_archive_name(t - timedelta(minutes=2)), frame_png(MOVED))
+    fake_http.add(_archive_name(t - timedelta(minutes=4)), frame_png(MOVED))          # the same scan
+    fake_http.add(_archive_name(t - timedelta(minutes=6)), frame_png([(PT["lat"] + 0.07, PT["lon"] + 0.04)]))
+    got = mvp._earlier_mrms(cfg, {"errors": []}, newest, [PT])
+    assert [c["frame_ts"] for c in got["pt"]] == [t - timedelta(minutes=6), t - timedelta(minutes=2)]
+
+
+def _island_list(cfg, fake_http, monkeypatch, frames):
+    """Mauna Kea with an echo in its ring in the newest composite; ``frames``: {minutes before
+    the newest: blobs or None (that GetMap fails)}, all listed in the capabilities."""
+    _quiet_glm(monkeypatch)
+    monkeypatch.setattr(mvp.mwp.radar, "load_frame", lambda cfg, cache: _mrms_result([]))
+    ts = island_ts()
+    frame = geo.MapFrame(MK["lat"], MK["lon"], cfg.map_km, cfg.map_px, cfg.tile_zoom)
+    fake_http.add("GetCapabilities", caps_doc(sorted([ts - timedelta(minutes=m) for m in frames] + [ts])))
+    for m, blobs in frames.items():
+        frag = urlencode([("TIME", nwsradar._iso_time(ts - timedelta(minutes=m)))])
+        if blobs is None:
+            fake_http.fail(frag)
+        else:
+            fake_http.add(frag, island_png(frame, blobs))
+    return ts
+
+
+def _mk_blob(km, bearing):
+    p = geo.dest_point(MK["lat"], MK["lon"], km, bearing)
+    return [(p[0], p[1], (11, 136, 15))]                           # 30 dBZ on the composite's scale
+
+
+def test_island_three_frame_trigger_and_the_stale_bound(cfg, fake_http, monkeypatch):
+    """Islands, VLBA_RADAR_TRIGGER_AFTER=3: the frames at -2 and -4 min hold one scan, the one
+    at -6 another: the run counts -6 and -2, oldest first, and confirms. When every listed frame
+    repeats the newest scan, no frame older than VLBA_RADAR_STALE is asked for."""
+    cfg.radar_trigger_after = 3
+    echo = _mk_blob(10.0, 90.0)
+    ts = _island_list(cfg, fake_http, monkeypatch,
+                      {2: _mk_blob(12.0, 80.0), 4: _mk_blob(12.0, 80.0), 6: _mk_blob(14.0, 70.0)})
+    add_routes(fake_http, cfg, mk_blobs=echo)
+    mk = mvp.run_once(cfg)["sites"][1]
+    assert [c["frame_ts"] for c in mk["radar_check"]["earlier"]] == [ts - timedelta(minutes=6),
+                                                                     ts - timedelta(minutes=2)]
+    assert _radar_state(mk)["state"] == "bad" and "on 3 consecutive frames" in _radar_state(mk)["detail"]
+
+    fake_http.routes = []
+    fake_http.calls.clear()
+    os.remove(cfg.state_file)
+    ts = _island_list(cfg, fake_http, monkeypatch, {m: echo for m in range(2, 42, 2)})     # 40 min listed
+    add_routes(fake_http, cfg, mk_blobs=echo)
+    mk = mvp.run_once(cfg)["sites"][1]
+    assert mk["radar_check"]["earlier"] == [] and _radar_state(mk)["state"] == "watch"
+    asked = [c for c in fake_http.calls if "TIME=" in c]
+    assert asked and len(asked) <= cfg.radar_stale_s // 120

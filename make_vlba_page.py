@@ -8,15 +8,19 @@ alert feed and zone outlines, the MRMS frame, and the per-site NWS products. One
 
 1. lock, budget, log the sites, the alert areas and the warning products of the verdict;
 2. the active NWS alerts (once) and the outlines of zone-based ones;
-3. the latest MRMS frame (once; skipped when no site's map reaches the MRMS grid);
+3. the latest MRMS frame (once; skipped when no site's map reaches the MRMS grid) and,
+   where a ring shows an echo, the frames before it that a confirmation needs (each
+   fetched once, for all sites; repeats of the same radar scan passed over);
 4. GLM lightning: the granules of the last ``VLBA_GLM_WINDOW_MIN`` minutes from GOES-East
    and GOES-West (once; both satellites, every site uses the ones that see it);
 5. per antenna: point metadata, observation (plus the station's distance and height
    relative to the antenna, and the raw present-weather / precipitation fields), the 7-day,
    hourly and raw gridpoint forecasts, sun altitude and times, the alerts AT / NEAR the
    site, the radar ring check (MRMS, or the NWS composite for a site outside the MRMS
-   grid, fetched here), the GLM view, the verdict (``vlba.decision``, with the holds and
-   streak of the state file), and the two theme maps with the rings and flashes drawn;
+   grid, fetched here; where the ring shows an echo, also on the frames before the newest,
+   so a run confirms an echo on consecutive scans by itself), the GLM view, the verdict
+   (``vlba.decision``, with the holds and streak of the state file), and the two theme
+   maps with the rings and flashes drawn;
 6. the state file, ``index.html`` and ``status.json``.
 
 Exit status 0 even when every source is down (cron must keep publishing whatever there
@@ -32,6 +36,7 @@ import logging
 import os
 import sys
 import time
+from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Sequence
 
 HERE = os.path.dirname(os.path.abspath(__file__))       # the checkout: weather/ and vlba/
@@ -40,6 +45,7 @@ if HERE not in sys.path:
 
 from weather import pipeline as mwp                     # noqa: E402  the base generator's run steps
 from weather import alerts, geo, http, nws, sun, util   # noqa: E402
+from weather import radar as wradar                     # noqa: E402
 from weather.config import parse_sites                  # noqa: E402
 from vlba import decision, glm, gridpoint, maps, mrms, nwsradar, page, radarcheck   # noqa: E402
 from vlba.config import VlbaConfig, parse_event_names   # noqa: E402
@@ -485,7 +491,135 @@ def _radar_word(verdict: Optional[dict], check: dict) -> str:
     return "ring" if check.get("in_ring") else ("clear" if check.get("available") else "n/a")
 
 
-def _radar_for_site(cfg, cache, run: dict, site: dict, frame, frame_res: dict) -> Dict[str, Any]:
+def _stale_limit(cfg) -> datetime:
+    """The oldest frame time the verdict can still use (``cfg.radar_stale_s``): an earlier
+    frame older than this would be "no data", so none is asked for."""
+    return util.utcnow() - timedelta(seconds=float(cfg.radar_stale_s))
+
+
+def _earlier_mrms(cfg, run: dict, frame_res: dict, sites: List[dict]) -> Dict[str, List[Dict[str, Any]]]:
+    """For every site whose ring shows an echo in the newest MRMS frame, the ring checks of
+    the frames before it, ``cfg.radar_trigger_after - 1`` of them, oldest first: with them a
+    run confirms an echo by itself, which runs 30 min apart could not (frames that far apart
+    are not consecutive). IEM writes a frame every 2 min, but a radar completes a volume scan
+    only every 4.5-10 min, so a frame whose ring holds the same data as the next newer one
+    counted (``radarcheck.ring_digest``) is no second observation: it is passed over and the
+    search goes further back, never to a frame older than ``cfg.radar_stale_s``. Each frame is
+    fetched once for all sites and dropped after their ring scans (an MRMS frame takes ~25 MB
+    of memory). Only after a fresh newest frame, not a copy reused after a failed fetch. A
+    frame missing from the archive is passed over (twice at most); a fetch that fails ends
+    the search and is a problem of the run. Returns ``{slug: [check, ...]}``."""
+    want = max(0, int(cfg.radar_trigger_after) - 1)
+    img, newest = frame_res.get("image"), frame_res.get("ts")
+    if not want or not cfg.radar_enabled or not frame_res.get("ok") or frame_res.get("stale") \
+            or img is None or not isinstance(newest, datetime):
+        return {}
+    km, dbz = float(cfg.radar_km), float(cfg.radar_dbz)
+    need: Dict[str, Dict[str, Any]] = {}
+    for s in sites:
+        ring = _step(run, "%s radar ring" % s["slug"], radarcheck.mrms_ring, img, s["lat"], s["lon"], km, dbz)
+        if isinstance(ring, dict) and ring.get("in_ring"):
+            need[s["slug"]] = {"site": s, "digest": radarcheck.ring_digest(img, s["lat"], s["lon"], km),
+                               "checks": []}
+    if not need:
+        return {}
+    oldest = _stale_limit(cfg)
+    ts, misses, err, fetched, same = newest, 0, None, 0, 0
+    while any(len(n["checks"]) < want for n in need.values()):
+        ts = ts - timedelta(minutes=2)
+        if ts < oldest:
+            break
+        try:
+            url = ts.strftime(cfg.mrms_archive)
+            there = http.head_ok(url, cfg, timeout=wradar.HEAD_TIMEOUT)
+        except Exception as e:  # noqa: BLE001 - head_ok should not raise; if it does, no answer
+            err = "%s: %s" % (type(e).__name__, e)
+            break
+        if there is None:
+            err = "the MRMS archive did not answer"
+            break
+        if not there:
+            misses += 1
+            if misses > 2:
+                err = "frames missing from the archive"
+                break
+            continue
+        try:
+            older = wradar._open_frame(http.get_bytes(url, cfg, accept="image/png"))
+        except (http.HttpError, wradar.RadarError) as e:
+            err = str(e).replace(url, "the archive")
+            break
+        except Exception as e:  # noqa: BLE001 - any surprise = no earlier frame, never a crash
+            err = "%s: %s" % (type(e).__name__, e)
+            break
+        fetched += 1
+        for slug, n in need.items():
+            if len(n["checks"]) >= want:
+                continue
+            s = n["site"]
+            digest = radarcheck.ring_digest(older, s["lat"], s["lon"], km)
+            if digest is not None and digest == n["digest"]:
+                same += 1               # the same radar data in the ring: no second observation
+                continue
+            ring = _step(run, "%s radar ring (%s)" % (slug, ts.strftime("%H:%MZ")), radarcheck.mrms_ring,
+                         older, s["lat"], s["lon"], km, dbz)
+            if isinstance(ring, dict):
+                n["checks"].append(dict(ring, available=True, stale=False, error=None, source="MRMS",
+                                        frame_ts=ts, digest=digest))
+                n["digest"] = digest
+        older = None
+    log.info("MRMS: %d earlier frame(s) read for %s (%d ring(s) with the same data passed over)", fetched,
+             ", ".join("%s %d" % (slug, len(n["checks"])) for slug, n in need.items()), same)
+    if err:
+        run["errors"].append("MRMS frame before %s unavailable (%s): an echo in a ring is not confirmed by "
+                             "this run alone" % (newest.strftime("%H:%MZ"), err))
+    return {slug: list(reversed(n["checks"])) for slug, n in need.items()}
+
+
+def _earlier_island_checks(cfg, run: dict, site: dict, frame, island: dict, label: str,
+                           digest: Optional[str]) -> List[Dict[str, Any]]:
+    """As ``_earlier_mrms``, for an island site whose ring shows an echo in the newest
+    composite: the frames the capabilities list before it, newest first, fetched with
+    ``TIME`` one at a time; a frame with the same data in the ring as the next newer one
+    counted (``digest``: the newest frame's) is passed over, none older than
+    ``cfg.radar_stale_s`` is asked for. A frame that fails ends the search and is a problem of
+    the run; one with a pixel of unknown colour in the ring is unusable and passed over, like
+    the newest frame would be. Returns the checks oldest first."""
+    slug, lat, lon = site["slug"], site["lat"], site["lon"]
+    want = max(0, int(cfg.radar_trigger_after) - 1)
+    km = float(cfg.radar_km)
+    times = nwsradar.earlier_times(island, _stale_limit(cfg)) if want else []
+    out: List[Dict[str, Any]] = []
+    for t in times:
+        if len(out) >= want:
+            break
+        when = t.strftime("%H:%MZ")
+        f = _step(run, "%s radar composite of %s" % (slug, when), nwsradar.fetch_at, cfg, frame, island, t)
+        if not isinstance(f, dict) or not f.get("ok") or f.get("index") is None:
+            run["errors"].append("%s radar composite of %s unavailable (%s): an echo in the ring is not "
+                                 "confirmed by this run alone" % (slug, when, (f or {}).get("error") or "no data"))
+            break
+        d = radarcheck.ring_digest(f["index"], lat, lon, km, frame=frame)
+        if d is not None and d == digest:
+            continue                    # the same radar data in the ring: no second observation
+        colors = f.get("colors") if isinstance(f.get("colors"), dict) else {}
+        if colors.get("unknown_px") and _step(run, "%s radar colours (%s)" % (slug, when), radarcheck.mask_ring,
+                                              f.get("unknown_mask"), frame, lat, lon, km):
+            continue                    # unknown colours in the ring: no usable data
+        ring = _step(run, "%s radar ring (%s)" % (slug, when), radarcheck.index_ring, f["index"], frame, lat, lon,
+                     km, float(cfg.radar_dbz))
+        if not isinstance(ring, dict):
+            continue
+        out.append(dict(ring, available=True, stale=False, error=None, source=label, frame_ts=t, digest=d))
+        digest = d
+    if want and not times and isinstance(island.get("ts"), datetime):
+        run["errors"].append("%s radar composite: no earlier frame listed within %d min: an echo in the ring is "
+                             "not confirmed by this run alone" % (slug, int(cfg.radar_stale_s) // 60))
+    return list(reversed(out))
+
+
+def _radar_for_site(cfg, cache, run: dict, site: dict, frame, frame_res: dict,
+                    earlier_mrms: Optional[Dict[str, List[Dict[str, Any]]]] = None) -> Dict[str, Any]:
     """``{"check": radar_check dict, "render": the radar dict for the renderer, "island":
     the island result without images | None}`` for one site: MRMS inside the grid, the NWS
     composite outside it. A check with a ring scan carries the ring's radar ``coverage``."""
@@ -506,6 +640,9 @@ def _radar_for_site(cfg, cache, run: dict, site: dict, frame, frame_res: dict) -
                 check["available"] = True
                 check["error"] = None
                 check["coverage"] = _site_coverage(cfg, run, "CONUS", slug)
+                check["digest"] = radarcheck.ring_digest(img, lat, lon, float(cfg.radar_km))
+                if check.get("in_ring") and not check.get("stale"):
+                    check["earlier"] = list((earlier_mrms or {}).get(slug) or [])
             else:
                 check["error"] = "ring scan failed"
         return {"check": check, "render": frame_res, "island": None}
@@ -564,14 +701,18 @@ def _radar_for_site(cfg, cache, run: dict, site: dict, frame, frame_res: dict) -
                 check["coverage"] = mrms.site_coverage(cov, slug)
         elif check["available"]:
             check["coverage"] = {"off": True}
+        if check["available"]:
+            check["digest"] = radarcheck.ring_digest(island["index"], lat, lon, float(cfg.radar_km), frame=frame)
+        if check["available"] and check.get("in_ring") and not island.get("stale"):
+            check["earlier"] = _earlier_island_checks(cfg, run, site, frame, island, label, check["digest"])
         if check["error"]:
             run["errors"].append("%s radar check: %s" % (slug, check["error"]))
         elif not island.get("stale") and island.get("ts") is None and island.get("error"):
             run["errors"].append("%s radar composite: %s" % (slug, island["error"]))     # frame time unknown
-    render = {k: v for k, v in island.items() if k not in ("index", "unknown_mask")}
+    render = {k: v for k, v in island.items() if k not in ("index", "unknown_mask", "times")}
     render["label"] = label
     return {"check": check, "render": render,
-            "island": {k: v for k, v in island.items() if k not in ("image", "index", "unknown_mask")}}
+            "island": {k: v for k, v in island.items() if k not in ("image", "index", "unknown_mask", "times")}}
 
 
 # ---- one antenna ---------------------------------------------------------------------------------
@@ -614,7 +755,7 @@ def _render_maps(cfg, cache, run: dict, site: dict, tz: str, render_radar: dict,
 
 
 def _run_site(cfg, cache, run: dict, site: dict, feed: dict, frame_res: dict, glm_res: dict,
-              state: dict) -> Dict[str, Any]:
+              state: dict, earlier_mrms: Optional[Dict[str, List[Dict[str, Any]]]] = None) -> Dict[str, Any]:
     slug = site["slug"]
     label = "%s " % slug
     now = util.utcnow()
@@ -692,7 +833,8 @@ def _run_site(cfg, cache, run: dict, site: dict, feed: dict, frame_res: dict, gl
     at = [a for a in (split.get("at") or []) if isinstance(a, dict)]
     candidates = [a for a in (split.get("candidates") or []) if isinstance(a, dict)]
 
-    radar_bits = _step(run, label + "radar", _radar_for_site, cfg, cache, run, site, frame, frame_res)
+    radar_bits = _step(run, label + "radar", _radar_for_site, cfg, cache, run, site, frame, frame_res,
+                       earlier_mrms)
     if not isinstance(radar_bits, dict):
         err = "radar step failed"
         radar_bits = {"check": {"available": False, "stale": True, "source": "radar", "frame_ts": None,
@@ -778,7 +920,7 @@ def _run_locked(cfg, skip_radar: bool) -> Dict[str, Any]:
                            "night_default": False, "alerts": None, "radar": None, "glm": None,
                            "radar_coverage": {}, "network": None, "errors": [], "sites": [], "summary": None}
     _step(run, "network budget", http.begin_run, cfg)
-    log.info("run started: %d antenna(s) from %s, out %s, network budget %s s", len(cfg.sites),
+    log.info("run started: %d site(s) from %s, out %s, network budget %s s", len(cfg.sites),
              cfg.sites_source, cfg.out_dir, cfg.run_budget_s)
     mwp._log_alert_areas(cfg)
     names, unknown = parse_event_names(cfg.veto_events)
@@ -807,10 +949,11 @@ def _run_locked(cfg, skip_radar: bool) -> Dict[str, Any]:
     # of the frame's time: the frame writes "no coverage" like "no echo")
     frame_res = mwp._load_radar(cfg, cache, run, skip_radar)
     run["radar"] = {k: v for k, v in frame_res.items() if k != "image"}
-    if cfg.radar_coverage and frame_res.get("ok") and frame_res.get("image") is not None:
-        conus = [s for s in cfg.sites if _in_mrms_grid(cfg, s)]
-        if conus:
-            _radar_coverage(cfg, run, "CONUS", frame_res.get("ts"), conus, "radar coverage (MRMS CONUS)")
+    conus = [s for s in cfg.sites if _in_mrms_grid(cfg, s)]
+    if cfg.radar_coverage and frame_res.get("ok") and frame_res.get("image") is not None and conus:
+        _radar_coverage(cfg, run, "CONUS", frame_res.get("ts"), conus, "radar coverage (MRMS CONUS)")
+    # where a ring shows an echo, the frames before the newest (each fetched once, for all sites)
+    earlier_mrms = _step(run, "earlier MRMS frames", _earlier_mrms, cfg, run, frame_res, conus) or {}
 
     # 4. GLM, once (the state file says which granules the last run examined)
     state = decision.load_state(cfg.state_file)
@@ -838,7 +981,7 @@ def _run_locked(cfg, skip_radar: bool) -> Dict[str, Any]:
     # 5. the antennas
     for site in cfg.sites:
         try:
-            entry = _run_site(cfg, cache, run, site, feed, frame_res, glm_res, state)
+            entry = _run_site(cfg, cache, run, site, feed, frame_res, glm_res, state, earlier_mrms)
         except Exception as e:  # noqa: BLE001 — one antenna must never take the others down
             log.exception("site %s failed: %s", site.get("slug"), e)
             run["errors"].append("site %s failed: %s" % (site.get("slug"), mwp._exc_text(e)))

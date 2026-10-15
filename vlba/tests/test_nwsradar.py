@@ -202,3 +202,45 @@ def test_stale_copy_only_for_the_same_map(cfg, cache, fake_http):
     assert not res["ok"] and res["index"] is None
     # and the URL is not pasted into the error the map caption shows
     assert "https://" not in (res["error"] or "") and "GetMap" in res["error"]
+
+
+def test_frame_times_and_the_request_for_an_earlier_frame(cfg):
+    """The capabilities list the frames of the last two hours; ``getmap_url`` asks for one of
+    them with TIME, in the dimension's own format. A dimension without a list, or with a range
+    instead of one, lists nothing."""
+    times = nr.parse_frame_times(CAPS, "hawaii_bref_qcd")
+    assert times == [datetime(2026, 10, 8, 13, 38, 56, tzinfo=UTC), datetime(2026, 10, 8, 15, 40, 54, tzinfo=UTC)]
+    assert nr.parse_frame_times(CAPS, "hawaii_cref_qcd") == []
+    assert nr.parse_frame_times(CAPS, "carib_bref_qcd") == [] and nr.parse_frame_times(None, "x") == []
+    rng = CAPS.replace("2026-10-08T13:38:56.000Z,2026-10-08T15:40:54.000Z",
+                       "2026-10-08T13:38:56Z/2026-10-08T15:40:54Z/PT2M")
+    assert nr.parse_frame_times(rng, "hawaii_bref_qcd") == []
+    frame = _frame(cfg)
+    region = nr.region_for(frame.bbox)
+    assert "TIME=2026-10-08T13%3A38%3A56.000Z" in nr.getmap_url(cfg, region, frame, at=times[0])
+    assert "TIME" not in nr.getmap_url(cfg, region, frame)
+
+
+def test_earlier_times_and_fetch_at(cfg, cache, fake_http):
+    """``earlier_times``: the frames the capabilities list before the newest one, newest first,
+    none before the given limit; nothing after a stale copy, without a frame time or for another
+    region. ``fetch_at``: one of them for the same map, decoded for the ring check (no drawn
+    layer); a failure is reported in the result, never raised."""
+    frame = _frame(cfg)
+    fake_http.add("GetCapabilities", CAPS.replace(
+        "2026-10-08T13:38:56.000Z,2026-10-08T15:40:54.000Z",
+        "2026-10-08T15:36:54.000Z,2026-10-08T15:38:54.000Z,2026-10-08T15:40:54.000Z"))
+    fake_http.fail("TIME=2026-10-08T15%3A36%3A54.000Z")
+    fake_http.add("GetMap", _png(_composite(frame, [])))
+    newest = nr.fetch(cfg, cache, MK, frame)
+    assert newest["ok"] and newest["ts"] == datetime(2026, 10, 8, 15, 40, 54, tzinfo=UTC)
+    times = nr.earlier_times(newest)
+    assert [x.strftime("%H:%M:%S") for x in times] == ["15:38:54", "15:36:54"]
+    assert nr.earlier_times(newest, datetime(2026, 10, 8, 15, 38, 0, tzinfo=UTC)) == times[:1]
+    for other in (dict(newest, stale=True), dict(newest, ts=None), dict(newest, region="nowhere"), None):
+        assert nr.earlier_times(other) == []
+    got = nr.fetch_at(cfg, frame, newest, times[0])
+    assert got["ok"] and got["index"] is not None and got["image"] is None and got["ts"] == times[0]
+    bad = nr.fetch_at(cfg, frame, newest, times[1])
+    assert not bad["ok"] and "GetMap" in bad["error"] and bad["index"] is None
+    assert not nr.fetch_at(cfg, frame, dict(newest, region="nowhere"), times[0])["ok"]

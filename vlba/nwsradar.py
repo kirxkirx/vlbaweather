@@ -20,7 +20,9 @@ Why it looks the way it does (all checked 2026-10-08):
 * The frame time comes from the workspace's own GetCapabilities (18 KB, against 2.2 MB for
   the whole server): the ``time`` dimension's ``default`` is the latest frame, the one a
   GetMap without ``TIME`` returns. A failed capabilities fetch costs the time stamp, not
-  the map ("frame time unknown").
+  the map ("frame time unknown"). The dimension also lists the frames of the last two
+  hours (checked 2026-10-14: every 2 min); ``earlier_times`` and ``fetch_at`` give the
+  ones before the latest (by ``TIME``), so a run can confirm an echo by itself.
 * The last good PNG is cached per site and reused for ``cfg.nwsradar_max_stale`` seconds
   when the server is unreachable (labelled stale), like the MRMS frame in the parent.
 * ``region_for`` picks the composite whose bounding box (from the capabilities) meets the
@@ -35,8 +37,8 @@ import io
 import logging
 import math
 import re
-from datetime import datetime
-from typing import Any, Dict, Optional, Sequence, Tuple
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 from urllib.parse import urlencode
 
 try:
@@ -133,7 +135,15 @@ def region_for(frame_bbox: Optional[Sequence[float]]) -> Optional[Dict[str, Any]
     return None
 
 
-def getmap_url(cfg, region: Dict[str, Any], frame) -> str:
+def _iso_time(t: datetime) -> str:
+    """A frame time as the time dimension lists it: ``2026-10-14T19:32:55.000Z``."""
+    t = t.astimezone(timezone.utc)
+    return t.strftime("%Y-%m-%dT%H:%M:%S") + ".%03dZ" % (t.microsecond // 1000)
+
+
+def getmap_url(cfg, region: Dict[str, Any], frame, at: Optional[datetime] = None) -> str:
+    """The GetMap request for the frame's box; ``at``: that frame of the time dimension (no
+    ``TIME``: the latest)."""
     x0, y0 = mercator(frame.west, frame.south)
     x1, y1 = mercator(frame.east, frame.north)
     w, h = frame.size
@@ -142,6 +152,8 @@ def getmap_url(cfg, region: Dict[str, Any], frame) -> str:
          ("CRS", "EPSG:3857"), ("BBOX", "%.3f,%.3f,%.3f,%.3f" % (x0, y0, x1, y1)),
          ("WIDTH", str(int(w))), ("HEIGHT", str(int(h))), ("FORMAT", "image/png"),
          ("TRANSPARENT", "true")]
+    if at is not None:
+        q.append(("TIME", _iso_time(at)))
     return "%s/%s/ows?%s" % (cfg.nwsradar_url.rstrip("/"), region["ws"], urlencode(q))
 
 
@@ -151,37 +163,66 @@ def capabilities_url(cfg, region: Dict[str, Any]) -> str:
 
 
 _DIM_RE = re.compile(r'<Dimension\s+name="time"[^>]*\bdefault="([^"]+)"', re.IGNORECASE)
+_DIM_LIST_RE = re.compile(r'<Dimension\s+name="time"[^>]*>([^<]*)</Dimension>', re.IGNORECASE)
 
 
-def parse_frame_time(xml_text: str, layer: str) -> Optional[datetime]:
-    """The ``default`` of the layer's time dimension in a capabilities document (the latest
-    frame), as an aware UTC datetime; None when it is not there."""
+def _layer_chunk(xml_text: Any, layer: str) -> Optional[str]:
     if not isinstance(xml_text, str):
         return None
     i = xml_text.find("<Name>%s</Name>" % layer)
     if i < 0:
         return None
     j = xml_text.find("</Layer>", i)
-    chunk = xml_text[i:j if j > 0 else None]
-    m = _DIM_RE.search(chunk)
+    return xml_text[i:j if j > 0 else None]
+
+
+def parse_frame_time(xml_text: str, layer: str) -> Optional[datetime]:
+    """The ``default`` of the layer's time dimension in a capabilities document (the latest
+    frame), as an aware UTC datetime; None when it is not there."""
+    chunk = _layer_chunk(xml_text, layer)
+    m = _DIM_RE.search(chunk) if chunk else None
     if not m:
         return None
     return util.parse_iso(m.group(1).strip())
 
 
+def parse_frame_times(xml_text: str, layer: str) -> List[datetime]:
+    """Every time the layer's time dimension lists, oldest first (aware UTC datetimes); an
+    empty list when there is none, or only a range (``start/end/period``), not a list."""
+    chunk = _layer_chunk(xml_text, layer)
+    m = _DIM_LIST_RE.search(chunk) if chunk else None
+    if not m:
+        return []
+    out = []
+    for item in m.group(1).split(","):
+        item = item.strip()
+        t = util.parse_iso(item) if item and "/" not in item else None
+        if t is not None:
+            out.append(t)
+    return sorted(set(out))
+
+
 def frame_time(cfg, region: Dict[str, Any]) -> Tuple[Optional[datetime], Optional[str]]:
     """(latest frame time, error text)."""
+    ts, _times, err = frame_times(cfg, region)
+    return ts, err
+
+
+def frame_times(cfg, region: Dict[str, Any]) -> Tuple[Optional[datetime], List[datetime], Optional[str]]:
+    """(latest frame time, every listed frame time oldest first, error text), from one
+    capabilities document."""
     url = capabilities_url(cfg, region)
     try:
         data = http.get_bytes(url, cfg, accept="text/xml", timeout=CAPS_TIMEOUT)
     except http.HttpError as e:
-        return None, "capabilities: %s" % str(e).replace(url, "GetCapabilities")
+        return None, [], "capabilities: %s" % str(e).replace(url, "GetCapabilities")
     except Exception as e:              # noqa: BLE001 - the time stamp is not worth a failure
-        return None, "capabilities: %s: %s" % (type(e).__name__, e)
-    ts = parse_frame_time(data.decode("utf-8", "replace"), region["layer"])
+        return None, [], "capabilities: %s: %s" % (type(e).__name__, e)
+    text = data.decode("utf-8", "replace")
+    ts = parse_frame_time(text, region["layer"])
     if ts is None:
-        return None, "capabilities: no time dimension for %s" % region["layer"]
-    return ts, None
+        return None, [], "capabilities: no time dimension for %s" % region["layer"]
+    return ts, parse_frame_times(text, region["layer"]), None
 
 
 # ---- colour decoding --------------------------------------------------------------------
@@ -265,9 +306,10 @@ def _cache_key(site: dict) -> str:
     return "nwsradar_%s" % site.get("slug", "site")
 
 
-def _decoded_result(cfg, data: bytes, frame, region, res: dict) -> dict:
-    """Decode PNG bytes into ``res`` (``image``, ``index``, ``colors``); ValueError when the
-    bytes are not a usable map of the frame's size."""
+def _decoded_result(cfg, data: bytes, frame, region, res: dict, layer: bool = True) -> dict:
+    """Decode PNG bytes into ``res`` (``image`` unless ``layer`` is False, ``index``,
+    ``unknown_mask``, ``colors``); ValueError when the bytes are not a usable map of the
+    frame's size."""
     try:
         img = Image.open(io.BytesIO(data))
         img.load()
@@ -278,7 +320,7 @@ def _decoded_result(cfg, data: bytes, frame, region, res: dict) -> dict:
     idx, counts, mask = decode(img, with_mask=True)
     res["index"] = idx
     res["unknown_mask"] = mask if counts.get("unknown_px") else None
-    res["image"] = layer_from_index(idx, cfg)
+    res["image"] = layer_from_index(idx, cfg) if layer else None
     res["colors"] = counts
     return res
 
@@ -288,12 +330,14 @@ def fetch(cfg, cache, site: dict, frame, now: Optional[datetime] = None) -> dict
 
     Returns ``{"ok", "stale", "error", "age_s", "ts", "url", "label", "source", "region",
     "image" (RGBA layer of frame.size or None), "index" ("L" image or None), "unknown_mask"
-    ("L" image of the pixels whose colour was not recognised, or None), "colors"}``; never
+    ("L" image of the pixels whose colour was not recognised, or None), "colors", "times"
+    (the frame times the capabilities list, oldest first, for ``earlier_times``)}``; never
     raises. ``ok`` with ``stale`` True is the last good copy (within
     ``cfg.nwsradar_max_stale``, and only for the same map request) after a failed fetch."""
     res: Dict[str, Any] = {"ok": False, "stale": False, "error": None, "age_s": None, "ts": None,
                            "url": None, "label": "NWS radar composite", "source": None, "region": None,
-                           "image": None, "index": None, "unknown_mask": None, "colors": None}
+                           "image": None, "index": None, "unknown_mask": None, "colors": None,
+                           "times": []}
     if Image is None:
         res["error"] = "Pillow not installed"
         return res
@@ -306,7 +350,8 @@ def fetch(cfg, cache, site: dict, frame, now: Optional[datetime] = None) -> dict
         return res
     res.update(label=region["label"], source=region["layer"], region=region["ws"])
     key = _cache_key(site)
-    ts, ts_err = frame_time(cfg, region)
+    ts, times, ts_err = frame_times(cfg, region)
+    res["times"] = times
     url = getmap_url(cfg, region, frame)
     res["url"] = url
     err = None
@@ -354,3 +399,40 @@ def fetch(cfg, cache, site: dict, frame, now: Optional[datetime] = None) -> dict
     log.info("%s: using the cached %s from %s (%s old)", site.get("slug"), region["label"],
              meta.get("ts"), util.fmt_age(age))
     return res
+
+
+def _region(newest: dict) -> Optional[Dict[str, Any]]:
+    return next((r for r in REGIONS if r["ws"] == newest.get("region")), None)
+
+
+def earlier_times(newest: dict, oldest: Optional[datetime] = None) -> List[datetime]:
+    """The frame times the capabilities list before ``newest["ts"]``, newest first, none
+    before ``oldest``; empty without a fresh latest frame of known time (``newest``: a
+    ``fetch`` result)."""
+    ts = newest.get("ts") if isinstance(newest, dict) else None
+    if not isinstance(ts, datetime) or not newest.get("ok") or newest.get("stale") or _region(newest) is None:
+        return []
+    return sorted((t for t in (newest.get("times") or [])
+                   if isinstance(t, datetime) and t < ts and (oldest is None or t >= oldest)), reverse=True)
+
+
+def fetch_at(cfg, frame, newest: dict, at: datetime) -> Dict[str, Any]:
+    """One listed frame of ``newest``'s composite for the same map, fetched with ``TIME`` and
+    decoded like the latest one but without the drawn layer (only the ring check reads it):
+    ``{"ok", "ts", "index", "unknown_mask", "colors", "error"}``. Nothing is cached and nothing
+    raises."""
+    r: Dict[str, Any] = {"ok": False, "ts": at, "index": None, "unknown_mask": None, "colors": None,
+                         "error": None, "image": None}
+    region = _region(newest) if isinstance(newest, dict) else None
+    if region is None or frame is None or Image is None:
+        r["error"] = "no composite to ask"
+        return r
+    url = getmap_url(cfg, region, frame, at=at)
+    try:
+        _decoded_result(cfg, http.get_bytes(url, cfg, accept="image/png"), frame, region, r, layer=False)
+        r["ok"] = True
+    except (http.HttpError, ValueError) as e:
+        r["error"] = str(e).replace(url, "GetMap")
+    except Exception as e:              # noqa: BLE001 - any surprise = that frame unavailable
+        r["error"] = "%s: %s" % (type(e).__name__, e)
+    return r

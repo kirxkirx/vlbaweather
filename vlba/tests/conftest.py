@@ -23,11 +23,11 @@ if VLBAWEATHER_DIR not in sys.path:
 from weather import http as _http                                  # noqa: E402
 from vlba.tests.fakehttp import FakeHttp                           # noqa: E402,F401
 from vlba.config import VlbaConfig                                 # noqa: E402
-from vlba.sites import VLBA_SITES                                  # noqa: E402
+from vlba.sites import SITES                                       # noqa: E402
 
-PT = next(dict(s) for s in VLBA_SITES if s["slug"] == "pt")
-MK = next(dict(s) for s in VLBA_SITES if s["slug"] == "mk")
-SC = next(dict(s) for s in VLBA_SITES if s["slug"] == "sc")
+PT = next(dict(s) for s in SITES if s["slug"] == "pt")
+MK = next(dict(s) for s in SITES if s["slug"] == "mk")
+SC = next(dict(s) for s in SITES if s["slug"] == "sc")
 TEST_SITES = [PT, MK]
 
 

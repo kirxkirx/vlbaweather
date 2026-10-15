@@ -3,7 +3,7 @@
 # (such as Gentoo with OpenRC) or any host with a cron daemon. The installer
 # deploy/install-cron.sh puts this line into the run user's crontab:
 #
-#   */5 * * * * <checkout>/deploy/vlbaweather-cron.sh # vlbaweather
+#   */30 * * * * <checkout>/deploy/vlbaweather-cron.sh # vlbaweather
 #
 # vlbaweather is a checkout of its own and runs beside local-weather-awareness's cron job
 # when a host runs both: its own env files, cron line, output and cache directories and

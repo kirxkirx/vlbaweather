@@ -1,20 +1,20 @@
-# Runs vlbaweather.service every 5 minutes, on the same wall-clock minutes as the cron line
-# of deploy/install-cron.sh (*/5 * * * *). Forecasts and observations are cached, so most
-# runs only fetch the new radar frames, the GLM granules of the last minutes and the alert
-# feed.
+# Runs vlbaweather.service every 30 minutes, on the same wall-clock minutes as the cron line
+# of deploy/install-cron.sh (*/30 * * * *). Each run fetches the alert feed, the newest
+# radar frames, the GLM granules of the last half hour and the NWS products whose cached
+# copy has expired.
 # No placeholders: deploy/install.sh copies this file to /etc/systemd/system/ as is.
 [Unit]
-Description=Regenerate the vlbaweather page every 5 minutes
+Description=Regenerate the vlbaweather page every 30 minutes
 
 [Timer]
 Unit=vlbaweather.service
 # First run 2 min after boot (network-online has usually settled by then)...
 OnBootSec=2min
-# ...then at every minute divisible by 5 (:00, :05, :10, ...). A run that is still busy at
-# the next tick is simply not started twice (a run lock guards the rest).
-OnCalendar=*:0/5
-# systemd coalesces timers within AccuracySec (1 min by default), which would stretch the
-# 5-minute schedule; keep the ticks within 15 s of the minute...
+# ...then on every half hour (:00 and :30). A run that is still busy at the next tick is
+# simply not started twice (a run lock guards the rest).
+OnCalendar=*:0/30
+# systemd coalesces timers within AccuracySec (1 min by default); keep the ticks within
+# 15 s of the minute, like the cron line...
 AccuracySec=15s
 # ...and spread the load on the upstream APIs (and on the host) by up to 15 s on top.
 RandomizedDelaySec=15

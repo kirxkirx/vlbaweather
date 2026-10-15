@@ -1,6 +1,6 @@
 #!/bin/bash
 # Install vlbaweather (the VLBA antenna weather page) under systemd: a oneshot service + a
-# 5-minute timer that regenerate the static page into OUT_DIR, which Apache serves as
+# 30-minute timer that regenerate the static page into OUT_DIR, which Apache serves as
 # https://<host>/vlbaweather/.
 #
 # vlbaweather is a checkout of its own (https://github.com/kirxkirx/vlbaweather; the weather
@@ -371,7 +371,7 @@ run systemctl daemon-reload
 # triggers the service; the explicit start below then just joins that run (one run, not
 # two) and blocks until it finishes so the first result is visible here.
 run systemctl enable --now vlbaweather.timer
-echo "running the generator once (fetches basemap tiles for all ten antennas: allow a few minutes)"
+echo "running the generator once (fetches basemap tiles for all twelve sites: allow a few minutes)"
 if ! run systemctl start vlbaweather.service; then
     echo "WARNING: the first run failed - see: journalctl -u vlbaweather -n 50" >&2
 fi
@@ -384,7 +384,7 @@ fi
 snippet="$ETC_DIR/apache-vlbaweather.conf"
 cat <<MSG
 
-Done. The timer regenerates $OUT_DIR every 5 minutes.
+Done. The timer regenerates $OUT_DIR every 30 minutes.
   timers:   systemctl list-timers 'vlbaweather*'
   logs:     journalctl -u vlbaweather -n 50
             (follow: journalctl -u vlbaweather -f)

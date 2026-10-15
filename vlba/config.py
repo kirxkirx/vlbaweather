@@ -4,8 +4,8 @@ page differs, plus the ``VLBA_*`` settings of the verdict, the GLM layer and the
 (see ``vlbaweather.env.example``).
 
 Sites: ``--sites`` / ``WEATHER_SITES`` / ``WEATHER_SITES_FILE`` work as in the parent (a subset
-for tests, or another array); with none of them the built-in VLBA list (``vlba.sites``) is
-used, which is the normal deployment.
+for tests, or another array); with none of them the built-in list (``vlba.sites``: the ten
+VLBA antennas, the VLA and the GBT) is used, which is the normal deployment.
 
 Everything is validated at startup: a malformed value is a ValueError (exit status 2 in the
 generator), never a silent default, because a verdict built on a mis-set threshold would be
@@ -122,16 +122,30 @@ def parse_glm_buckets(raw: str) -> List[Tuple[str, float]]:
 @dataclass
 class VlbaConfig(Config):
     # ---- the parent's fields with other defaults ---------------------------------------
-    sites_source: str = "the built-in VLBA list (vlba/sites.py)"
+    sites_source: str = "the built-in list (vlba/sites.py)"
     cache_dir: str = os.path.expanduser("~/.cache/vlbaweather")
-    title: str = "VLBA weather"
-    refresh_seconds: int = 300      # the page is regenerated every 5 min (asked)
+    title: str = "VLBA, VLA and GBT weather"
+    # The browser reload. The generator runs every 30 min (cron / timer, asked 2026-10-14);
+    # reloading every 5 min shows a new run's page within 5 min of its writing.
+    refresh_seconds: int = 300
     user_agent: str = "vlbaweather (+https://github.com/kirxkirx/vlbaweather)"
-    # A run fetches ten sites, two radar sources and ~30 GLM granules; the first run of a
-    # fresh cache also downloads ~16 basemap tiles per site and theme. Measured 2026-10-08:
-    # a cold run needs about 150 s, a warm one about 40 s. 240 s is well inside the 5-minute
-    # cron interval and the wrapper's 10-minute timeout.
+    # A run fetches twelve sites, one radar frame per source (more where a ring shows an echo)
+    # and ~185 GLM granules (the 30-minute window, 25-30 s, measured 2026-10-14); the first run
+    # of a fresh cache also
+    # downloads ~16 basemap tiles per site and theme. Measured 2026-10-08 with ten sites and a
+    # 5-minute window: a cold run needs about 150 s, a warm one about 40 s. 240 s is well
+    # inside the wrapper's 10-minute timeout and the 30-minute run interval.
     run_budget_s: int = 240
+    # The runs are 30 min apart (2026-10-14), so the parent's timings meant for runs 2 min
+    # apart would expire between two runs: the forecasts' cached copies are re-fetched by
+    # every scheduled run (25 min < 30), and the alert feed of the run before is reused for
+    # one failed run (40 min): a failed fetch must not drop a warning in effect.
+    forecast_ttl: int = 1500
+    hourly_ttl: int = 1500
+    alerts_max_stale: int = 2400
+    # likewise the last good MRMS frame (the map shows it labelled stale; the verdict never
+    # counts a frame that old)
+    radar_max_stale: int = 2400
     roads_enabled: bool = False     # no road closures (asked)
     lsr_enabled: bool = False
     attribution: str = ("© OpenStreetMap contributors · Radar: NOAA MRMS via IEM / NWS · "
@@ -139,7 +153,9 @@ class VlbaConfig(Config):
 
     # ---- the verdict ---------------------------------------------------------------------
     veto_events: str = DEFAULT_VETO_EVENTS      # VLBA_VETO_EVENTS
-    veto_onset_lead_s: int = 900                # VLBA_VETO_ONSET_LEAD
+    # ttustatus counts a warning from 15 min before its onset; runs 30 min apart need the
+    # interval on top, so the page is BAD at least 15 min before every onset (45 min).
+    veto_onset_lead_s: int = 2700               # VLBA_VETO_ONSET_LEAD
     radar_km: float = 30.0                      # VLBA_RADAR_KM
     radar_dbz: float = 20.0                     # VLBA_RADAR_DBZ
     radar_trigger_after: int = 2                # VLBA_RADAR_TRIGGER_AFTER
@@ -158,7 +174,7 @@ class VlbaConfig(Config):
     # 6 h between updates), so ttustatus's 150 min would blank the forecast checks most of
     # the time; an update older than 12 h means the office or the feed has a problem.
     nws_stale_min: int = 720                    # VLBA_NWS_STALE_MIN
-    gridpoint_ttl: int = 1800                   # VLBA_GRIDPOINT_TTL
+    gridpoint_ttl: int = 1500                   # VLBA_GRIDPOINT_TTL (every 30-min run re-fetches)
     gridpoint_max_stale: int = 7200             # VLBA_GRIDPOINT_MAX_STALE
     # Off (asked 2026-10-08): ttustatus's 95 % protects an optical dome from condensation,
     # which does not concern a radio antenna. A value 0..100 switches it back on.
@@ -175,17 +191,22 @@ class VlbaConfig(Config):
     glm_enabled: bool = True                    # VLBA_GLM
     glm_km: float = 50.0                        # VLBA_GLM_KM
     glm_hold_s: int = 1800                      # VLBA_GLM_HOLD
-    glm_window_min: int = 5                     # VLBA_GLM_WINDOW_MIN
+    # The run interval (30 min since 2026-10-14): the window plus its minute of overlap covers
+    # the 30-minute hold above, so no flash that could still count goes unexamined; a flash of
+    # the window older than the hold no longer counts.
+    glm_window_min: int = 30                    # VLBA_GLM_WINDOW_MIN
     glm_stride: int = 1                         # VLBA_GLM_STRIDE
     glm_buckets: str = DEFAULT_GLM_BUCKETS      # VLBA_GLM_BUCKETS
-    glm_max_arc_deg: float = 70.0               # VLBA_GLM_MAX_ARC
-    glm_timeout_s: int = 45                     # VLBA_GLM_TIMEOUT
+    # GLM's field of view ends about 62 deg of arc from the sub-satellite point diagonally
+    # (measured 2026-10-14 in the granules: GOES-18 sees nothing at the GBT, 64.9 deg away)
+    glm_max_arc_deg: float = 62.0               # VLBA_GLM_MAX_ARC
+    glm_timeout_s: int = 90                     # VLBA_GLM_TIMEOUT (184 granules: ~25 s measured)
     glm_workers: int = 4                        # VLBA_GLM_WORKERS
 
     # ---- radar for sites outside the MRMS grid ------------------------------------------
     island_radar: bool = True                   # VLBA_ISLAND_RADAR
     nwsradar_url: str = "https://opengeo.ncep.noaa.gov/geoserver"   # VLBA_NWSRADAR_URL
-    nwsradar_max_stale: int = 1800              # VLBA_NWSRADAR_MAX_STALE
+    nwsradar_max_stale: int = 2400              # VLBA_NWSRADAR_MAX_STALE (one failed 30-min run)
 
     @classmethod
     def from_env(cls, **overrides) -> "VlbaConfig":
@@ -195,16 +216,16 @@ class VlbaConfig(Config):
         builtin = (overrides.get("sites") is None and not _env_str("WEATHER_SITES", "")
                    and not _env_str("WEATHER_SITES_FILE", ""))
         if builtin:
-            overrides = dict(overrides, sites=[dict(s) for s in _sites.VLBA_SITES])
+            overrides = dict(overrides, sites=[dict(s) for s in _sites.SITES])
         c = super().from_env(**overrides)
         if builtin:
-            c.sites_source = "the built-in VLBA list (vlba/sites.py)"
+            c.sites_source = "the built-in list (vlba/sites.py)"
             c._site_where = {s["slug"]: "vlba/sites.py entry %d" % n
                              for n, s in enumerate(c.sites, 1)}
         else:
-            # a VLBA antenna named through --sites / WEATHER_SITES keeps its code and height
+            # a built-in site named through --sites / WEATHER_SITES keeps its code and height
             # (the parent's format has neither; the station elevation rule needs the height)
-            known = {s["slug"]: s for s in _sites.VLBA_SITES}
+            known = {s["slug"]: s for s in _sites.SITES}
             for s in c.sites:
                 k = known.get(s.get("slug"))
                 try:
@@ -280,15 +301,22 @@ class VlbaConfig(Config):
         if not isinstance(self.radar_dbz, (int, float)) or isinstance(self.radar_dbz, bool) \
                 or not (-30 <= self.radar_dbz <= 80):
             raise ValueError("VLBA_RADAR_DBZ must be a reflectivity between -30 and 80 (dBZ)")
+        # each run fetches the frames before the newest one that a confirmation needs
+        # (make_vlba_page._earlier_mrms and _earlier_island_checks): more per extra frame, so the
+        # count is bounded
         if isinstance(self.radar_trigger_after, bool) or not isinstance(self.radar_trigger_after, int) \
-                or self.radar_trigger_after < 1:
-            raise ValueError("VLBA_RADAR_TRIGGER_AFTER must be a whole number >= 1")
+                or not (1 <= self.radar_trigger_after <= 6):
+            raise ValueError("VLBA_RADAR_TRIGGER_AFTER must be a whole number, 1..6")
         if isinstance(self.radar_min_coverage, bool) or not isinstance(self.radar_min_coverage, (int, float)) \
                 or not math.isfinite(self.radar_min_coverage) or not (0 <= self.radar_min_coverage <= 100):
             raise ValueError("VLBA_RADAR_MIN_COVERAGE must be a percentage, 0..100")
         if not isinstance(self.mrms_url, str) or not self.mrms_url.startswith(("http://", "https://")):
             raise ValueError("VLBA_MRMS_URL must be an http:// or https:// URL")
         self.mrms_url = self.mrms_url.rstrip("/")
+        if not isinstance(self.glm_hold_s, bool) and isinstance(self.glm_hold_s, int) and 0 <= self.glm_hold_s < 60:
+            # a flash counts only while it is younger than the hold: a shorter one ignores flashes
+            raise ValueError("VLBA_GLM_HOLD must be >= 60 s (a shorter hold would ignore the flashes; "
+                             "VLBA_GLM=0 switches lightning off)")
         for name, value in (("VLBA_RADAR_HOLD", self.radar_hold_s),
                             ("VLBA_RADAR_STALE", self.radar_stale_s),
                             ("VLBA_GLM_HOLD", self.glm_hold_s),

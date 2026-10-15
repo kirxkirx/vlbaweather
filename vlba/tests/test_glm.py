@@ -17,7 +17,8 @@ import pytest
 from weather import geo
 from weather import http as _http
 from vlba import glm
-from vlba.sites import VLBA_SITES
+from vlba.config import VlbaConfig
+from vlba.sites import SITES
 
 UTC = timezone.utc
 NOW = datetime(2026, 10, 8, 15, 42, 30, tzinfo=UTC)         # day 281
@@ -25,10 +26,20 @@ EAST, WEST = "noaa-goes19", "noaa-goes18"
 
 
 def _site(slug: str) -> dict:
-    return dict(next(s for s in VLBA_SITES if s["slug"] == slug))
+    return dict(next(s for s in SITES if s["slug"] == slug))
 
 
 PT, MK, SC, HN = _site("pt"), _site("mk"), _site("sc"), _site("hn")
+
+
+@pytest.fixture
+def cfg(cfg):
+    """The tests below were written for a 5-minute window and a 45-s deadline, the defaults
+    until the run interval became 30 min (2026-10-14). The mechanics they test do not depend
+    on the window; the 30-minute default has tests of its own."""
+    cfg.glm_window_min = 5
+    cfg.glm_timeout_s = 45
+    return cfg
 
 
 # ---- synthetic granules and a fake S3 ------------------------------------------------------
@@ -735,10 +746,11 @@ def test_fetch_catches_up_on_what_the_last_run_could_not_see(cfg, fake_get):
     assert all(any(k.rsplit("/", 1)[1] in u for u in got) for k in hidden)
     assert res["window_start"] < datetime(2026, 10, 8, 15, 42, 0, tzinfo=UTC)
     assert res["newest"]["G19"] > t_last
-    # a "since" older than MAX_CATCHUP_S reaches back MAX_CATCHUP_S, not further; junk is ignored,
+    # a "since" older than the catch-up limit reaches back that far, not further; junk is ignored,
     # and a number too big for a float (a corrupt state file) too
     res = glm.fetch(cfg, now=late, since={"G19": (late - timedelta(hours=1)).timestamp(), "G18": "x"})
-    assert res["window_start"] == late - timedelta(seconds=glm.MAX_CATCHUP_S)
+    assert res["window_start"] == late - timedelta(seconds=glm.max_catchup_s(cfg)) \
+        == late - timedelta(seconds=cfg.glm_hold_s + glm.GRANULE_S)   # the whole hold, even at 5 min
     res = glm.fetch(cfg, now=late, since={"G19": 10 ** 400, "G18": True})
     assert res["ok"] and res["window_start"] == late - timedelta(minutes=6) and set(res["newest"]) == {"G19", "G18"}
 
@@ -746,7 +758,8 @@ def test_fetch_catches_up_on_what_the_last_run_could_not_see(cfg, fake_get):
 def test_failed_granules_are_retried_by_the_next_run(cfg, fake_get):
     """A granule that fails is fetched again by the next run, before anything else, even
     when that run's window no longer reaches it; the marker of the newest granule examined
-    does not move back (a slow store would otherwise fetch whole windows again)."""
+    does not move back (a slow store would otherwise fetch whole windows again), and the
+    window the run names is the span it examined in one piece, not back to that granule."""
     cfg.glm_workers = 1                 # one download at a time: the order is the queue's
     t_failed = datetime(2026, 10, 8, 15, 40, 0, tzinfo=UTC)
     failed = _key("G19", t_failed)
@@ -760,7 +773,7 @@ def test_failed_granules_are_retried_by_the_next_run(cfg, fake_get):
     fake_get.calls.clear()
     res = glm.fetch(cfg, now=NOW + timedelta(minutes=8), since=res["newest"], retried=res["retry"])
     assert failed.rsplit("/", 1)[1] in fake_get.granule_calls()[0]            # first of all
-    assert res["window_start"] == t_failed
+    assert res["window_start"] == datetime.fromtimestamp(newest, tz=UTC) + timedelta(milliseconds=100)
     assert res["sats"]["G19"]["ok"] and not res["partial"] and res["retry"] == {}
 
 
@@ -810,18 +823,21 @@ def test_a_failed_refetch_of_the_overlap_is_no_gap(cfg, fake_get):
 
 def test_granules_to_fetch_again_are_kept_or_given_up(cfg, fake_get, monkeypatch):
     """A satellite that cannot be listed (or a fetch that fails as a whole) keeps what was
-    to be fetched again; one older than MAX_CATCHUP_S, or gone from the store, is given up,
+    to be fetched again; one gone from the store is given up, and the run says so, while one
+    older than the catch-up limit (past the hold: its flashes no longer count) is dropped quietly,
     and the run says so."""
     t = datetime(2026, 10, 8, 15, 40, 0, tzinfo=UTC).timestamp()
     fake_get.fail_listing.add(EAST)
     res = glm.fetch(cfg, now=NOW, retried={"G19": [t]})
     assert res["retry"] == {"G19": [t]} and res["partial"]
     fake_get.fail_listing.clear()
-    too_old = (NOW - timedelta(seconds=glm.MAX_CATCHUP_S + 60)).timestamp()
+    too_old = (NOW - timedelta(seconds=glm.max_catchup_s(cfg) + 60)).timestamp()
     gone = datetime(2026, 10, 8, 15, 40, 5, tzinfo=UTC).timestamp()        # no granule starts then
     res = glm.fetch(cfg, now=NOW, retried={"G19": [too_old, gone]})
     g19 = res["sats"]["G19"]
-    assert g19["dropped"] == 2 and g19["failed"] == 2 and res["partial"] and res["retry"] == {}
+    assert g19["dropped"] == 1 and g19["failed"] == 1 and res["partial"] and res["retry"] == {}
+    res = glm.fetch(cfg, now=NOW, retried={"G19": [too_old]})
+    assert not res["partial"] and not res["sats"]["G19"].get("dropped") and res["retry"] == {}
 
     def boom(*a, **k):
         raise RuntimeError("surprise")
@@ -855,9 +871,50 @@ def test_a_junk_retry_list_is_ignored(cfg, fake_get):
 
 
 def test_catch_up_never_shrinks_a_long_window(cfg, fake_get):
+    """A 30-minute window covers the 30-minute hold by itself: a "since" inside it changes
+    nothing, and an older one (a late or missed run) reaches no further back either, since an
+    older flash could not change the verdict."""
     cfg.glm_window_min = 30
-    res = glm.fetch(cfg, now=NOW, since={"G19": (NOW - timedelta(hours=2)).timestamp()})
+    res = glm.fetch(cfg, now=NOW, since={"G19": (NOW - timedelta(minutes=20)).timestamp()})
     assert res["window_start"] == NOW - timedelta(minutes=31)
+    res = glm.fetch(cfg, now=NOW, since={"G19": (NOW - timedelta(hours=2)).timestamp()})
+    assert res["window_start"] == NOW - timedelta(minutes=31) and not res["partial"]
+
+
+def test_the_default_window_is_the_30_minute_run_interval(cfg, fake_get):
+    """Since 2026-10-14 the generator runs every 30 min; by default each run fetches the
+    last 30 min of granules plus the minute of overlap, under a 90-s deadline (about 184
+    granules with both satellites, ~25 s measured), and reaches back no further: that window
+    covers the 30-minute hold."""
+    cfg.glm_window_min, cfg.glm_timeout_s = VlbaConfig.glm_window_min, VlbaConfig.glm_timeout_s
+    assert (cfg.glm_window_min, cfg.glm_timeout_s) == (30, 90)
+    assert glm.max_catchup_s(cfg) == 31 * 60
+    cfg.glm_window_min = 5
+    assert glm.max_catchup_s(cfg) == 30 * 60 + 20           # at 5 min: the hold plus a granule
+    cfg.glm_window_min = 30
+    res = glm.fetch(cfg, now=NOW)
+    assert res["ok"] and not res["partial"] and res["window_start"] == NOW - timedelta(minutes=31)
+    for sid in ("G19", "G18"):          # 15:11:40 .. 15:42:20, every 20 s
+        assert res["sats"][sid]["selected"] == res["sats"][sid]["fetched"] == 93
+
+
+def test_a_granule_that_failed_half_an_hour_ago_is_dropped_quietly(cfg, fake_get):
+    """At the 30-minute default the run before was half an hour ago: a granule that failed
+    then is nearly an hour old now, past the 30-minute hold, so its flashes could not change
+    the verdict. It is not fetched again, and losing it does not make the run partial (it
+    would make every run after a failed granule partial)."""
+    cfg.glm_window_min = 30
+    t_old = datetime(2026, 10, 8, 14, 45, 0, tzinfo=UTC)          # 57.5 min before NOW
+    old = _key("G19", t_old)
+    fake_get.fail_keys.add(old)
+    res = glm.fetch(cfg, now=NOW - timedelta(minutes=30))       # the run before: from 14:41:30
+    assert res["partial"] and res["retry"] == {"G19": [t_old.timestamp()]}
+    fake_get.fail_keys.clear()
+    fake_get.calls.clear()
+    res = glm.fetch(cfg, now=NOW, since=res["newest"], retried=res["retry"], seen=res["seen"])
+    assert not any(old.rsplit("/", 1)[1] in u for u in fake_get.granule_calls())
+    g19 = res["sats"]["G19"]
+    assert not res["partial"] and res["retry"] == {} and g19["failed"] == 0 and not g19.get("dropped")
 
 
 def test_site_view_gives_the_time_of_the_newest_flash_in_the_ring(cfg):
@@ -866,3 +923,57 @@ def test_site_view_gives_the_time_of_the_newest_flash_in_the_ring(cfg):
     far = geo.dest_point(PT["lat"], PT["lon"], 80.0, 0.0)
     v = glm.site_view(_res([_fl(near[0], near[1], "G19", t1), _fl(far[0], far[1], "G19", t2)]), PT, cfg)
     assert v["count_window"] == 1 and v["last_in_ring_t"] == t1
+
+
+def test_default_field_of_view_gives_the_gbt_goes_east_only(cfg):
+    """GLM's field of view ends about 62 deg of arc from the sub-satellite point (measured
+    2026-10-14: GOES-18 records nothing at the GBT, 64.9 deg away), so the GBT takes GOES-East
+    only; Brewster (61.6 deg from GOES-East) and North Liberty (58.4 deg from GOES-West) keep
+    both, as does the VLA; Mauna Kea is West only, St. Croix and Hancock East only."""
+    cfg.glm_max_arc_deg = VlbaConfig.glm_max_arc_deg
+    assert cfg.glm_max_arc_deg == 62.0
+    want = {"gbt": ["G19"], "br": ["G19", "G18"], "nl": ["G19", "G18"], "vla": ["G19", "G18"],
+            "mk": ["G18"], "sc": ["G19"], "hn": ["G19"]}
+    for slug, sats in want.items():
+        assert glm.site_view({"ok": False, "error": "x"}, _site(slug), cfg)["sats"] == sats, slug
+
+
+def test_a_failed_granule_past_the_hold_is_no_gap(cfg, fake_get):
+    """At the 30-minute window its first minute can only hold flashes past the 30-minute hold:
+    a granule there that fails leaves no gap that matters (the satellite stays complete, nothing
+    is fetched again); one a little newer, inside the hold, still makes the run partial."""
+    cfg.glm_window_min = 30
+    cfg.glm_timeout_s = 90
+    old = _key("G19", datetime(2026, 10, 8, 15, 11, 40, tzinfo=UTC))      # ends 15:12:00, hold from 15:12:30
+    fake_get.fail_keys.add(old)
+    res = glm.fetch(cfg, now=NOW)
+    g19 = res["sats"]["G19"]
+    assert g19["ok"] and g19["failed"] == 0 and g19["past_hold_failed"] == 1
+    assert not res["partial"] and res["retry"] == {}
+    fake_get.fail_keys = {_key("G19", datetime(2026, 10, 8, 15, 12, 20, tzinfo=UTC))}   # ends inside the hold
+    res = glm.fetch(cfg, now=NOW)
+    assert res["partial"] and res["sats"]["G19"]["failed"] == 1 and res["retry"] == {"G19": [
+        datetime(2026, 10, 8, 15, 12, 20, tzinfo=UTC).timestamp()]}
+
+
+def test_the_reach_follows_the_configured_hold(cfg, fake_get):
+    """With VLBA_GLM_HOLD at an hour, a granule that failed 40 min ago may still hold a flash
+    that counts: it is fetched again, not dropped."""
+    cfg.glm_hold_s = 3600
+    t_old = datetime(2026, 10, 8, 15, 2, 20, tzinfo=UTC)                  # 40 min 10 s before NOW
+    old = _key("G19", t_old)
+    res = glm.fetch(cfg, now=NOW, retried={"G19": [t_old.timestamp()]})
+    assert any(old.rsplit("/", 1)[1] in u for u in fake_get.granule_calls())
+    assert not res["partial"] and res["retry"] == {}
+
+
+def test_the_view_window_reaches_back_to_the_oldest_flash_it_counts(cfg):
+    """A flash from a granule fetched again can be older than the span examined in one piece:
+    the view's minutes reach back to it, so "within 50 km in the last N min" stays true."""
+    near = geo.dest_point(PT["lat"], PT["lon"], 5.0, 0.0)
+    res = _res([_fl(near[0], near[1], "G19", NOW - timedelta(minutes=9))],
+               window_start=NOW - timedelta(minutes=6))
+    v = glm.site_view(res, PT, cfg, now=NOW)
+    assert v["count_window"] == 1 and v["window_min"] == 9
+    v = glm.site_view(_res([], window_start=NOW - timedelta(minutes=6)), PT, cfg, now=NOW)
+    assert v["window_min"] == 6

@@ -12,7 +12,7 @@ from html.parser import HTMLParser
 import pytest
 
 from vlba import decision, page
-from vlba.sites import VLBA_SITES
+from vlba.sites import SITES
 
 UTC = timezone.utc
 GEN = datetime(2026, 10, 8, 16, 12, tzinfo=UTC)
@@ -98,8 +98,8 @@ def _site_entry(site, verdict, sun_alt=30.0, island=None, glm=None, maps_ok=True
 
 @pytest.fixture
 def run(cfg):
-    pt = next(dict(s) for s in VLBA_SITES if s["slug"] == "pt")
-    mk = next(dict(s) for s in VLBA_SITES if s["slug"] == "mk")
+    pt = next(dict(s) for s in SITES if s["slug"] == "pt")
+    mk = next(dict(s) for s in SITES if s["slug"] == "mk")
     bad = _verdict(decision.BAD, reasons=["rain on radar within 30 km (nearest echo 12.3 km)", "humidity 97 % at KONM"],
                    checks=[_check("warning", "ok", "none", "x", "none in effect"),
                            _check("radar", "bad", "echo in the ring", "20 dBZ within 30 km", "MRMS: echo <b>bold</b>"),
@@ -151,7 +151,7 @@ def test_page_renders_the_layout(cfg, run):
     c.feed(html)
     assert not c.errors and c.scripts == 1 and not c.stack[1:]      # one <script> (PAGE_JS), tags balanced
     # order: masthead, summary, nav, banner, PT section, MK section, footer
-    for a, b in (("Weather at the antennas", 'class="nav"'), ('class="nav"', 'id="alerts"'),
+    for a, b in (("Weather at the sites", 'class="nav"'), ('class="nav"', 'id="alerts"'),
                  ('id="site-pt"', 'id="site-mk"'), ('id="site-mk"', "<h2>Sources</h2>")):
         assert html.index(a) < html.index(b)
     # the summary table: both antennas, badges, reasons, sun chips, local times
@@ -159,7 +159,7 @@ def test_page_renders_the_layout(cfg, run):
     assert '<span class="vbadge caution sm" title="inputs missing: Lightning (GOES GLM)">GOOD?</span>' in html
     assert "rain on radar within 30 km" in html and "+" not in html.split("<table class=\"sum\">")[1].split("</table>")[0].split("humidity 97")[0][-5:]
     assert "Sun up 35" in html and "Sun down -12" in html
-    assert "<b>1</b> of 2 antennas GOOD, <b>1</b> BAD, 1 with inputs missing." in html
+    assert "<b>1</b> of 2 sites GOOD, <b>1</b> BAD, 1 with inputs missing." in html
     assert html.count("UTC") >= 2 and "local times in each row" in html
     # at phone width the summary's local-time column is hidden, and so is the note about it
     assert '<span class="lt"> · local times in each row</span>' in html
@@ -194,7 +194,7 @@ def test_page_renders_the_layout(cfg, run):
     assert "GLM lightning:" in html and "G18 3/15 granules" in html
     assert "MK radar (NWS Hawaii composite): fresh" in html
     assert "Geostationary Lightning Mapper" in html and "ttustatus" in html
-    assert "refreshes every 300 s" in html
+    assert "page reloads every 300 s" in html and "refreshes every" not in html
 
 
 def test_status_json_carries_verdicts(cfg, run):
@@ -240,7 +240,7 @@ def test_older_and_partial_run_dicts_render(cfg, run):
     html = page.render_html(cfg, run)
     assert "could not be rendered" not in html
     assert "NO VERDICT" in html and "No GLM result this run" in html
-    assert "<b>0</b> of 2 antennas GOOD, <b>0</b> BAD, 2 without data." in html
+    assert "<b>0</b> of 2 sites GOOD, <b>0</b> BAD, 2 without data." in html
 
 
 def test_garbage_never_raises(cfg):
@@ -248,7 +248,7 @@ def test_garbage_never_raises(cfg):
                 {"sites": [{"site": {"slug": "x"}, "verdict": {"status": "BAD", "checks": [None, {"key": 1}],
                                                                "reasons": [None], "missing": 7}}]}):
         html = page.render_html(cfg, run)
-        assert "<title>VLBA weather</title>" in html
+        assert "<title>VLBA, VLA and GBT weather</title>" in html
         page.status_doc(cfg, run)
 
 

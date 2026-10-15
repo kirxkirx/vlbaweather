@@ -6,7 +6,7 @@ import pytest
 
 from vlba import config as vc
 from vlba.config import VlbaConfig
-from vlba.sites import VLBA_SITES, site_code, site_elevation_m
+from vlba.sites import SITES, site_code, site_elevation_m
 
 try:
     from zoneinfo import ZoneInfo
@@ -23,31 +23,42 @@ def _cfg(monkeypatch, tmp_path, **env):
     return VlbaConfig.from_env(out_dir=str(tmp_path / "out"), cache_dir=str(tmp_path / "cache"))
 
 
-def test_builtin_sites_are_the_ten_vlba_antennas(monkeypatch, tmp_path):
+def test_builtin_sites_are_the_vlba_antennas_the_vla_and_the_gbt(monkeypatch, tmp_path):
     c = _cfg(monkeypatch, tmp_path)
-    assert [s["slug"] for s in c.sites] == ["br", "fd", "hn", "kp", "la", "mk", "nl", "ov", "pt", "sc"]
+    assert [s["slug"] for s in c.sites] == ["br", "fd", "hn", "kp", "la", "mk", "nl", "ov", "pt", "sc",
+                                            "vla", "gbt"]
     assert "vlba/sites.py" in c.sites_source
     assert c.refresh_seconds == 300 and c.roads_enabled is False and c.lsr_enabled is False
-    assert c.title == "VLBA weather" and c.page_title == "VLBA weather"
+    assert c.title == "VLBA, VLA and GBT weather" and c.page_title == "VLBA, VLA and GBT weather"
+    # the 30-minute run interval: the GLM window, the forecasts re-fetched by every run, the
+    # alert feed reused over one failed run, the warning lead; GLM's measured field of view
+    assert c.glm_window_min == 30 and c.glm_timeout_s == 90 and c.glm_max_arc_deg == 62.0
+    assert (c.forecast_ttl, c.hourly_ttl, c.gridpoint_ttl) == (1500, 1500, 1500)
+    assert c.alerts_max_stale == 2400 and c.veto_onset_lead_s == 2700
     assert c.state_file == str(tmp_path / "cache" / "vlba_state.json")
     # the alert query covers Hawaii, the Virgin Islands and their marine areas
-    for code in ("HI", "VI", "PR", "NM", "WA", "NH", "PH"):
+    for code in ("HI", "VI", "PR", "NM", "WA", "NH", "PH", "WV", "VA"):
         assert code in c.alert_area_codes
 
 
 def test_site_table_is_sound():
-    slugs = [s["slug"] for s in VLBA_SITES]
-    assert len(slugs) == 10 and len(set(slugs)) == 10
-    for s in VLBA_SITES:
-        assert s["slug"] == s["code"].lower() and len(s["code"]) == 2
+    slugs = [s["slug"] for s in SITES]
+    assert len(slugs) == 12 and len(set(slugs)) == 12
+    for s in SITES:
+        assert s["slug"] == s["code"].lower() and len(s["code"]) == (3 if s["slug"] in ("vla", "gbt") else 2)
         assert -90 < s["lat"] < 90 and -180 < s["lon"] < 0, s
         assert isinstance(site_elevation_m(s), float) and site_code(s) == s["code"]
         if ZoneInfo is not None:
             ZoneInfo(s["tz"])
     assert site_code({"slug": "x1"}) == "X1" and site_elevation_m({"slug": "x"}) is None
-    mk = next(s for s in VLBA_SITES if s["slug"] == "mk")
+    mk = next(s for s in SITES if s["slug"] == "mk")
     assert abs(mk["lat"] - 19.8014) < 1e-4 and abs(mk["lon"] + 155.4555) < 1e-4
     assert mk["tz"] == "Pacific/Honolulu" and mk["elev_m"] > 3700
+    # the VLA and the GBT: SCHED's VLA (array reference) and GBT-VLBA positions
+    vla, gbt = (next(s for s in SITES if s["slug"] == x) for x in ("vla", "gbt"))
+    assert (vla["code"], vla["lat"], vla["lon"], vla["tz"]) == ("VLA", 34.0788, -107.6183, "America/Denver")
+    assert (gbt["code"], gbt["lat"], gbt["lon"], gbt["tz"]) == ("GBT", 38.4331, -79.8398, "America/New_York")
+    assert 2100 < vla["elev_m"] < 2150 and 790 < gbt["elev_m"] < 840
 
 
 def test_weather_sites_override_the_builtin_list(monkeypatch, tmp_path):
@@ -126,6 +137,7 @@ def test_state_file_path_is_expanded(monkeypatch, tmp_path):
     {"VLBA_RADAR_TRIGGER_AFTER": "0"}, {"VLBA_RADAR_HOLD": "-1"}, {"VLBA_NWS_CLOUD_MAX": "101"},
     {"VLBA_NWS_STALE_MIN": "0"}, {"VLBA_OBS_MAX_KM": "-5"}, {"VLBA_WIND_MPH": "-1"},
     {"VLBA_GLM_KM": "1000"}, {"VLBA_GLM_WINDOW_MIN": "0"}, {"VLBA_GLM_STRIDE": "31"},
+    {"VLBA_GLM_HOLD": "0"}, {"VLBA_GLM_HOLD": "59"}, {"VLBA_RADAR_TRIGGER_AFTER": "7"},
     {"VLBA_GLM_BUCKETS": "noaa-goes19"}, {"VLBA_GLM_BUCKETS": "a=1;a=2"},
     {"VLBA_GLM_BUCKETS": "bad bucket=-75"}, {"VLBA_GLM_MAX_ARC": "95"},
     {"VLBA_GLM_TIMEOUT": "1"}, {"VLBA_GLM_WORKERS": "0"}, {"VLBA_NWSRADAR_URL": "ftp://x"},

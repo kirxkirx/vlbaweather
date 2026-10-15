@@ -110,10 +110,13 @@ def test_warning_ahead_of_its_onset_is_scheduled_not_bad(cfg):
     v = d.evaluate(cfg, e, {}, NOW)
     assert v["status"] == d.GOOD and v["scheduled"] and "Winter Storm Warning" in v["scheduled"][0]
     assert v["checks"][0]["state"] == "scheduled"
-    # within the 15-min lead it counts
-    e = _entry(alerts_at=[_alert("Winter Storm Warning", onset=NOW + timedelta(minutes=10),
-                                 ends=NOW + timedelta(hours=20))])
-    assert d.evaluate(cfg, e, {}, NOW)["status"] == d.BAD
+    # within the lead it counts: 45 min by default, ttustatus's 15 plus the 30-minute run
+    # interval, so the run before the onset's last 15 min already shows BAD
+    assert cfg.veto_onset_lead_s == 2700
+    for minutes, state in ((10, "bad"), (16, "bad"), (44, "bad"), (46, "scheduled")):
+        e = _entry(alerts_at=[_alert("Winter Storm Warning", onset=NOW + timedelta(minutes=minutes),
+                                     ends=NOW + timedelta(hours=20))])
+        assert d.evaluate(cfg, e, {}, NOW)["checks"][0]["state"] == state, minutes
 
 
 def test_warning_matching_is_case_insensitive_and_list_configurable(cfg):
@@ -252,6 +255,158 @@ def test_radar_counts_each_frame_once(cfg):
     st = {"radar_streak": 1, "radar_last_frame_ts": (f1 - timedelta(hours=3)).timestamp()}
     v = d.evaluate(cfg, _entry(radar_check=_radar(True, frame_ts=f1)), st, NOW)
     assert v["status"] == d.GOOD and st["radar_streak"] == 1
+
+
+def _rc(minutes_ago, in_ring, **kw):
+    """A ring check of the frame of ``minutes_ago`` min before NOW."""
+    c = {"available": True, "stale": False, "source": "MRMS", "frame_ts": NOW - timedelta(minutes=minutes_ago),
+         "in_ring": in_ring, "nearest_km": 12.0 if in_ring else None, "count": 5 if in_ring else 0,
+         "max_dbz": 30.0 if in_ring else None, "error": None}
+    c.update(kw)
+    return c
+
+
+def _radar_of(v):
+    return {c["key"]: c for c in v["checks"]}["radar"]
+
+
+def test_radar_one_run_confirms_with_the_frame_before(cfg):
+    """Runs are 30 min apart (2026-10-14): where the newest frame shows an echo, the run also
+    has the frame before it (``earlier``, oldest first), counted first, so the run confirms
+    an echo on two consecutive frames by itself; the frames of the run 30 min before are too
+    far apart to continue a streak."""
+    st = {}
+    # the run half an hour ago saw an echo on its newest frame only (the one before was dry)
+    v = d.evaluate(cfg, _entry(radar_check=dict(_rc(34, True), earlier=[_rc(36, False)])), st,
+                   NOW - timedelta(minutes=30))
+    assert _radar_of(v)["state"] == "watch" and st["radar_streak"] == 1
+    # now the echo is on the newest frame and on the one before: BAD from this run alone
+    v = d.evaluate(cfg, _entry(radar_check=dict(_rc(4, True), earlier=[_rc(6, True)])), st, NOW)
+    assert _radar_of(v)["state"] == "bad" and "on 2 consecutive frames" in _radar_of(v)["detail"]
+    assert v["status"] == d.BAD and st["radar_streak"] == 2
+    assert st["radar_last_frame_ts"] == (NOW - timedelta(minutes=4)).timestamp()
+    # without the frame before, the same newest frame is only "unconfirmed": the last frame
+    # counted is 30 min older, too far back to be consecutive
+    st = {"radar_streak": 1, "radar_last_frame_ts": (NOW - timedelta(minutes=34)).timestamp(),
+          "radar_last_count_ts": (NOW - timedelta(minutes=30)).timestamp()}
+    v = d.evaluate(cfg, _entry(radar_check=_rc(4, True)), st, NOW)
+    assert _radar_of(v)["state"] == "watch" and st["radar_streak"] == 1
+    # a dry frame before the echo: unconfirmed, frame 1 of 2
+    st = {}
+    v = d.evaluate(cfg, _entry(radar_check=dict(_rc(4, True), earlier=[_rc(6, False)])), st, NOW)
+    assert _radar_of(v)["state"] == "watch" and "frame 1 of 2" in _radar_of(v)["detail"]
+
+
+def test_radar_frames_before_the_newest_count_once(cfg):
+    """A frame before the newest that the run before already counted (runs close together)
+    is not counted again; an unusable one is no new data; a check switched off ignores them;
+    junk in the list is skipped."""
+    st = {"radar_streak": 1, "radar_last_frame_ts": (NOW - timedelta(minutes=6)).timestamp(),
+          "radar_last_count_ts": (NOW - timedelta(minutes=2)).timestamp()}
+    v = d.evaluate(cfg, _entry(radar_check=dict(_rc(4, True), earlier=[_rc(6, True)])), st, NOW)
+    assert _radar_of(v)["state"] == "bad" and st["radar_streak"] == 2         # 6 min ago: counted once
+    st = {}
+    bad_scan = _rc(6, True, available=False, error="12 px of unrecognised colour within 30 km")
+    v = d.evaluate(cfg, _entry(radar_check=dict(_rc(4, True), earlier=[bad_scan])), st, NOW)
+    assert _radar_of(v)["state"] == "watch" and st["radar_streak"] == 1
+    st = {}
+    v = d.evaluate(cfg, _entry(radar_check=dict(_rc(4, True), off=True, earlier=[_rc(6, True)])), st, NOW)
+    assert _radar_of(v)["state"] == "off" and not st.get("radar_streak")
+    st = {}
+    v = d.evaluate(cfg, _entry(radar_check=dict(_rc(4, True), earlier=[None, 3, "x", _rc(6, True)])), st, NOW)
+    assert _radar_of(v)["state"] == "bad"
+    st = {}
+    v = d.evaluate(cfg, _entry(radar_check=dict(_rc(4, True), earlier="junk")), st, NOW)
+    assert _radar_of(v)["state"] == "watch"
+
+
+def test_radar_three_frame_trigger_counts_the_frames_before_oldest_first(cfg):
+    """With VLBA_RADAR_TRIGGER_AFTER=3 a run has two frames before the newest, oldest first
+    (the producers' contract): counted in that order they complete the streak; newest first,
+    the older one would not be newer than the frame counted last."""
+    cfg.radar_trigger_after = 3
+    st = {}
+    v = d.evaluate(cfg, _entry(radar_check=dict(_rc(4, True), earlier=[_rc(8, True), _rc(6, True)])), st, NOW)
+    assert _radar_of(v)["state"] == "bad" and st["radar_streak"] == 3
+    st = {}
+    v = d.evaluate(cfg, _entry(radar_check=dict(_rc(4, True), earlier=[_rc(6, True), _rc(8, True)])), st, NOW)
+    assert _radar_of(v)["state"] == "watch" and st["radar_streak"] == 2
+
+
+def test_radar_counts_each_scan_once(cfg):
+    """A frame whose ring holds the same data as the frame counted last (the same ``digest``:
+    the radar had not completed a new scan) is no new observation: it neither counts nor
+    resets the streak, and the detail says why. Within a run and across runs alike."""
+    st = {}
+    v = d.evaluate(cfg, _entry(radar_check=dict(_rc(4, True, digest="a"), earlier=[_rc(6, True, digest="a")])), st, NOW)
+    assert _radar_of(v)["state"] == "watch" and st["radar_streak"] == 1
+    assert "the same radar data as the frame counted last" in _radar_of(v)["detail"]
+    st = {}
+    v = d.evaluate(cfg, _entry(radar_check=dict(_rc(4, True, digest="b"), earlier=[_rc(6, True, digest="a")])), st, NOW)
+    assert _radar_of(v)["state"] == "bad" and st["radar_streak"] == 2 and st["radar_last_digest"] == "b"
+    # the next run, 2 min later, sees the counted scan once more: still confirmed, nothing counted
+    v = d.evaluate(cfg, _entry(radar_check=_rc(2, True, digest="b")), st, NOW + timedelta(minutes=2))
+    assert _radar_of(v)["state"] == "bad" and st["radar_streak"] == 2
+    assert st["radar_last_frame_ts"] == (NOW - timedelta(minutes=4)).timestamp()
+    # a run that starts a streak afresh does not let one scan confirm itself across runs
+    st = {}
+    d.evaluate(cfg, _entry(radar_check=_rc(4, True, digest="c")), st, NOW)
+    v = d.evaluate(cfg, _entry(radar_check=_rc(2, True, digest="c")), st, NOW + timedelta(minutes=5))
+    assert _radar_of(v)["state"] == "watch" and st["radar_streak"] == 1
+    # frames without a digest (older producers, tests) are told apart by their time, as before
+    st = {}
+    v = d.evaluate(cfg, _entry(radar_check=dict(_rc(4, True), earlier=[_rc(6, True)])), st, NOW)
+    assert _radar_of(v)["state"] == "bad" and st["radar_last_digest"] is None
+
+
+def test_radar_a_repeated_scan_trusts_only_a_recent_streak(cfg):
+    """A frame with the data of the frame counted last speaks for the stored streak only while
+    that count is recent (VLBA_RADAR_STALE): a source serving unchanged data must not revive a
+    confirmation from an hour ago."""
+    old = {"radar_streak": 2, "radar_last_frame_ts": (NOW - timedelta(minutes=64)).timestamp(),
+           "radar_last_count_ts": (NOW - timedelta(minutes=60)).timestamp(), "radar_last_digest": "x"}
+    v = d.evaluate(cfg, _entry(radar_check=_rc(4, True, digest="x")), dict(old), NOW)
+    assert _radar_of(v)["state"] == "watch" and v["status"] == d.GOOD
+    recent = dict(old, radar_last_frame_ts=(NOW - timedelta(minutes=8)).timestamp(),
+                  radar_last_count_ts=(NOW - timedelta(minutes=5)).timestamp())
+    v = d.evaluate(cfg, _entry(radar_check=_rc(4, True, digest="x")), recent, NOW)
+    assert _radar_of(v)["state"] == "bad"
+
+
+def _glm_entry(**over):
+    g = {"covered": True, "sats": ["G19"], "available": True, "partial": False, "error": None,
+         "count_window": 0, "nearest_km": None, "nearest_bearing": None, "window_min": 31}
+    g.update(over)
+    return _entry(glm=g)
+
+
+def test_glm_flashes_past_the_hold_in_incomplete_data_are_no_data(cfg):
+    """Flashes of the window that are past the hold are no hit; with a satellite's data
+    incomplete the check then has no data, never "clear"; a past-hold flash leaves the stored
+    last hit alone."""
+    st = {"glm_last_hit": {"nearest_km": 3.0, "nearest_bearing": "E", "count": 4, "at": 1.0}}
+    e = _glm_entry(available=False, partial=True, error="G19: 1 of 93 granules failed", count_window=1,
+                   nearest_km=12.0, nearest_bearing="N", last_in_ring_t=NOW - timedelta(minutes=30, seconds=30))
+    v = d.evaluate(cfg, e, st, NOW)
+    glm_check = [c for c in v["checks"] if c["key"] == "glm"][0]
+    assert glm_check["state"] == "unknown" and v["incomplete"]
+    assert st["glm_last_hit"] == {"nearest_km": 3.0, "nearest_bearing": "E", "count": 4, "at": 1.0}
+
+
+def test_glm_held_detail_says_only_what_the_window_shows(cfg):
+    """The held detail opens with what this run's window says: flashes past the hold, "no
+    flash" when the window does not reach the last flash, and nothing when the last flash lies
+    inside the window but this run missed it (a refetch that failed)."""
+    def detail(e, ago_min):
+        st = {"glm_last_hit_ts": (NOW - timedelta(minutes=ago_min)).timestamp(),
+              "glm_last_hit": {"nearest_km": 5.6, "nearest_bearing": "N", "count": 1, "at": 1.0}}
+        return [c for c in d.evaluate(cfg, e, st, NOW)["checks"] if c["key"] == "glm"][0]["detail"]
+    past = _glm_entry(count_window=1, nearest_km=11.0, nearest_bearing="N",
+                      last_in_ring_t=NOW - timedelta(minutes=30, seconds=30))
+    assert detail(past, 15).startswith("1 flash(es) within 50 km, the newest 30 min ago: past the 30 min hold; "
+                                       "held 30 min after the last one (15 min ago")
+    assert detail(_glm_entry(), 15).startswith("held 30 min after the last one (15 min ago")
+    assert detail(_glm_entry(window_min=6), 15).startswith("no flash within 50 km in the last 6 min; held 30 min")
 
 
 def test_confirmed_echo_stays_bad_on_a_repeated_frame(cfg):
@@ -400,16 +555,24 @@ def test_glm_hold_runs_from_the_flash_not_from_the_run(cfg):
     assert d.evaluate(cfg, _entry(glm=g2), st, NOW + timedelta(minutes=12))["status"] == d.GOOD
 
 
-def test_glm_flash_in_the_window_is_bad_even_past_the_hold(cfg):
-    """A flash the page shows in the fetch window is never "no flash": a long catch-up
-    window can hold one older than VLBA_GLM_HOLD."""
+def test_glm_flash_past_the_hold_is_no_hit(cfg):
+    """The hold runs from the flash: a flash still in a long window but older than
+    VLBA_GLM_HOLD (a window that reached back) no longer makes the weather BAD, and the detail
+    names it rather than saying "no flash"; a flash inside the hold is a hit."""
     st = {}
     g = {"covered": True, "sats": ["G19"], "available": True, "partial": False, "error": None,
          "count_window": 1, "nearest_km": 20.0, "nearest_bearing": "N", "window_min": 45,
          "last_in_ring_t": NOW - timedelta(minutes=40)}
     v = d.evaluate(cfg, _entry(glm=g), st, NOW)
     glm_check = [c for c in v["checks"] if c["key"] == "glm"][0]
+    assert v["status"] == d.GOOD and glm_check["state"] == "ok" and st["glm_last_hit_ts"] is None
+    assert glm_check["detail"].startswith("1 flash(es) within 50 km, the newest 40 min ago: past the 30 min hold; "
+                                          "nearest flash 20 km N")
+    v = d.evaluate(cfg, _entry(glm=dict(g, last_in_ring_t=NOW - timedelta(minutes=20))), {}, NOW)
+    glm_check = [c for c in v["checks"] if c["key"] == "glm"][0]
     assert v["status"] == d.BAD and glm_check["detail"].startswith("1 flash(es) within 50 km in the last 45 min")
+    st = {}
+    v = d.evaluate(cfg, _entry(glm=g), st, NOW)
     g2 = dict(g, count_window=0, last_in_ring_t=None, nearest_km=None, window_min=6)
     assert d.evaluate(cfg, _entry(glm=g2), st, NOW + timedelta(minutes=2))["status"] == d.GOOD
 

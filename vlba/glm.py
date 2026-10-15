@@ -11,17 +11,20 @@ Why it looks the way it does:
   a latch of this module. Granules are parsed from the downloaded bytes (h5py, else netCDF4;
   both optional): nothing is written to disk.
 * Each site is served by the satellites whose sub-satellite point is within
-  ``cfg.glm_max_arc_deg`` of great-circle arc (70 deg by default): GOES-East sees roughly 80
-  deg, but GLM's detection efficiency collapses towards the limb, so Mauna Kea takes
-  GOES-West only and St. Croix / Hancock GOES-East only, and a site outside every field of
-  view is reported as "not covered" rather than silently "clear" (ttustatus's rule).
+  ``cfg.glm_max_arc_deg`` of great-circle arc (62 deg by default: GLM's field of view ends
+  about there diagonally, measured in the granules on 2026-10-14, where GOES-18 recorded
+  nothing near the GBT, 64.9 deg away), so Mauna Kea takes GOES-West only and St. Croix,
+  Hancock and the GBT GOES-East only, and a site outside every field of view is reported
+  as "not covered" rather than silently "clear" (ttustatus's rule).
 * Each run fetches the last ``cfg.glm_window_min`` minutes plus ``WINDOW_OVERLAP_S`` of the
   previous run's window: the newest granules of a window are often not published yet when
   the run lists them, and without the overlap no run would ever fetch them.
-* The downloads (up to ~36 granules of ~200 KB per run) run in a small thread pool with one
-  deadline for the whole fetch (``cfg.glm_timeout_s``, shortened to what the run budget
-  leaves): a slow S3 must not eat the 5-minute cron interval. Whatever is not in by the
-  deadline counts as failed and the pool is abandoned without waiting.
+* The downloads (about 185 granules per run with both satellites and the 30-minute window,
+  45-75 MB: GOES-19's granules run 300-600 KB, GOES-18's about 200 KB; ~25-30 s measured
+  2026-10-14) run in a small thread pool with one deadline
+  for the whole fetch (``cfg.glm_timeout_s``, shortened to what the run budget leaves): a
+  slow S3 must not eat the run's network budget. Whatever is not in by the deadline counts
+  as failed and the pool is abandoned without waiting.
 * The transport is the module's own ``_get`` (urllib with the configured User-Agent), used
   by the listing and the granule downloads alike, because ``weather.http.get_bytes`` keeps
   per-run state that is not thread-safe; the tests monkeypatch ``_get``.
@@ -83,7 +86,9 @@ MAP_FLASH_CAP = 2000                # flashes handed to the map renderer per sit
 # A flash seen by two runs is harmless: the check needs one flash and holds 30 min.
 WINDOW_OVERLAP_S = 60
 # With the newest granule a previous run examined (``since``), a satellite's window reaches
-# back to just after it, however late that run was, but never further than this.
+# back to just after it, however late that run was, but never further than ``max_catchup_s``:
+# this, the window with its overlap, or the hold, whichever is longest. An older flash cannot
+# change the verdict.
 MAX_CATCHUP_S = 900
 # Two satellites' detections this close in time and place are one flash: both GLMs see most
 # flashes where their views overlap, a fraction of a second and a few km (parallax) apart.
@@ -439,6 +444,26 @@ def _sat_entry(bucket: str, sub_lon: float) -> dict:
             "listed": 0, "selected": 0, "fetched": 0, "failed": 0, "flashes": 0}
 
 
+def _hold_s(cfg) -> float:
+    try:
+        return float(cfg.glm_hold_s)
+    except (TypeError, ValueError, AttributeError):
+        return 1800.0
+
+
+def max_catchup_s(cfg) -> float:
+    """How far back a run reaches for a late or missed run's granules and for those to fetch
+    again: ``MAX_CATCHUP_S``, the window plus its overlap, or the hold plus one granule,
+    whichever is longest: every granule whose flashes still count is within reach, and none
+    is fetched whose flashes no longer can (31 min at the 30-minute window, 30 min 20 s at a
+    5-minute one)."""
+    try:
+        window_s = 60.0 * int(cfg.glm_window_min)
+    except (TypeError, ValueError, AttributeError):
+        window_s = 300.0
+    return max(float(MAX_CATCHUP_S), window_s + WINDOW_OVERLAP_S, _hold_s(cfg) + GRANULE_S)
+
+
 def _base_result(cfg, now: Optional[datetime]) -> dict:
     end = _as_utc(now)
     try:
@@ -536,7 +561,11 @@ def _fetch(cfg, now: Optional[datetime], since: Any = None, retried: Any = None,
 
     deadline_at = time.monotonic() + _deadline_s(cfg)
     end = res["window_end"]
-    reach = end - timedelta(seconds=MAX_CATCHUP_S)      # nothing older is fetched any more
+    reach = end - timedelta(seconds=max_catchup_s(cfg))     # nothing older is fetched any more
+    hold_s = _hold_s(cfg)
+    # a granule that ended before the hold began can only hold flashes that no longer count:
+    # losing it leaves no gap that matters
+    past_hold = end.timestamp() - hold_s - GRANULE_S
     sats: Dict[str, dict] = {}
     order: List[str] = []
     lo: Dict[str, datetime] = {}
@@ -557,11 +586,13 @@ def _fetch(cfg, now: Optional[datetime], since: Any = None, retried: Any = None,
         examined[sid] = _retry_set(seen, sid)
         old = {x for x in again[sid] if x < reach.timestamp()}
         again[sid] -= old
-        given_up[sid] = len(old)
+        given_up[sid] = len({x for x in old if x > past_hold})
     starts = [lo[sid] for sid in order] + [datetime.fromtimestamp(min(again[sid]), tz=timezone.utc)
                                            for sid in order if again[sid]]
-    res["window_start"] = min(starts) if starts else res["window_start"]
-    prefixes = hour_prefixes(res["window_start"], end)
+    # the window the page names is the span every satellite examined in one piece; a granule
+    # fetched again from before it adds no minutes to it
+    res["window_start"] = min(lo.values()) if lo else res["window_start"]
+    prefixes = hour_prefixes(min(starts) if starts else res["window_start"], end)
     res["sats"] = sats
 
     try:
@@ -609,7 +640,7 @@ def _fetch(cfg, now: Optional[datetime], since: Any = None, retried: Any = None,
                 if t is not None and round(t.timestamp(), 1) in again[sid]:
                     by_start.setdefault(round(t.timestamp(), 1), k)
             retry_keys[sid] = sorted(by_start.values(), key=lambda k: key_start(k), reverse=True)
-            given_up[sid] += len(again[sid]) - len(by_start)        # gone from the store
+            given_up[sid] += sum(1 for x in again[sid] if x not in by_start and x > past_hold)    # gone
             first = set(retry_keys[sid])
             selected[sid] = [k for k in selected[sid] if k not in first]
             sats[sid]["selected"] = len(selected[sid]) + len(retry_keys[sid])
@@ -645,6 +676,10 @@ def _fetch(cfg, now: Optional[datetime], since: Any = None, retried: Any = None,
                 if not is_retry and ts is not None and ts in examined[sid]:
                     # the overlap with the last run, which examined it: no gap
                     entry["refetch_failed"] = entry.get("refetch_failed", 0) + 1
+                    continue
+                if ts is not None and ts <= past_hold:
+                    # ended before the hold began: its flashes no longer count, no gap
+                    entry["past_hold_failed"] = entry.get("past_hold_failed", 0) + 1
                     continue
                 entry["failed"] += 1
                 first_error.setdefault(sid, err)
@@ -710,19 +745,21 @@ def fetch(cfg, now: Optional[datetime] = None, since: Any = None, retried: Any =
     the previous run's window (granules published late), from every configured satellite.
     ``since`` ({satellite id: start of the newest granule a previous run examined, epoch
     s}, as ``newest`` gives it) stretches a satellite's window back to just after that
-    granule when it is older (a late or missed run), by at most ``MAX_CATCHUP_S``. A
+    granule when it is older (a late or missed run), by at most ``max_catchup_s(cfg)``. A
     granule that fails (or is not reached before the deadline) is fetched again by the next
     run, before anything else (``retry`` in the result, handed back as ``retried``): once;
-    failing again, or older than ``MAX_CATCHUP_S`` by then, it is given up and that run is
-    partial. A granule the last run examined (``seen``, as the result gives it), fetched
-    again in the overlap, that fails is no gap; one published too late for the last run
-    is. Returns
+    failing again, or older than ``max_catchup_s(cfg)`` by then, it is given up and that run
+    is partial. A granule that ended before ``cfg.glm_hold_s`` began is never a gap (its
+    flashes no longer count): it is not fetched again, and failing it marks nothing. A
+    granule the last run examined (``seen``, as the result gives it), fetched again in the
+    overlap, that fails is no gap; one published too late for the last run is. Returns
 
         {"ok": bool, "stale": False, "error": str|None, "age_s": 0.0|None,
          "window_start", "window_end": aware UTC datetimes (window_end = now),
          "flashes": [{"lat", "lon", "sat": "G19", "t": aware datetime}, ...],
          "sats": {"G19": {"bucket", "sub_lon", "ok", "error", "listed", "selected",
-                          "fetched", "failed", "flashes", ["dropped"], ["refetch_failed"]},
+                          "fetched", "failed", "flashes", ["dropped"], ["refetch_failed"],
+                          ["past_hold_failed"]},
                   ...},
          "deps": bool, "elapsed_s": float, "skipped": str|None, "partial": bool,
          "newest": {satellite id: start of the newest granule of the window, epoch s}
@@ -834,9 +871,6 @@ def _site_view(out: dict, res: Any, site: dict, cfg, map_radius_km: float) -> di
         err = res.get("error") or res.get("skipped") if isinstance(res, dict) else None
         out["error"] = str(err) if err else "GLM data unavailable"
         return out
-    w0, w1 = res.get("window_start"), res.get("window_end")
-    if isinstance(w0, datetime) and isinstance(w1, datetime) and w1 > w0:
-        out["window_min"] = int(round((w1 - w0).total_seconds() / 60.0))
     sats = res.get("sats") if isinstance(res.get("sats"), dict) else {}
     problems = []
     complete = got_data = False
@@ -873,6 +907,12 @@ def _site_view(out: dict, res: Any, site: dict, cfg, map_radius_km: float) -> di
     near = _one_per_flash([r for r in rows if r[0] <= max(float(map_radius_km), ring_km)])
     out["count_window"] = sum(1 for r in near if r[0] <= ring_km)
     in_ring_t = [r[3] for r in near if r[0] <= ring_km and isinstance(r[3], datetime)]
+    # the minutes the view speaks for: the span examined in one piece, back to the oldest
+    # flash it counts (one from a granule fetched again may be older than that span)
+    w0, w1 = res.get("window_start"), res.get("window_end")
+    if isinstance(w0, datetime) and isinstance(w1, datetime) and w1 > w0:
+        w0 = min([w0] + [t for t in in_ring_t if t < w0])
+        out["window_min"] = int(round((w1 - w0).total_seconds() / 60.0))
     out["last_in_ring_t"] = max(in_ring_t) if in_ring_t else None
     out["flashes_on_map"] = [(r[1], r[2]) for r in near if r[0] <= float(map_radius_km)][:MAP_FLASH_CAP]
     if rows:

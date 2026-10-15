@@ -14,9 +14,12 @@ The checks (PLAN.md section 4; every threshold is a ``VlbaConfig`` field):
 * ``radar``: an echo of at least ``cfg.radar_dbz`` within ``cfg.radar_km`` in
   ``cfg.radar_trigger_after`` consecutive radar frames (one frame is an observation, two
   are weather: MRMS composites carry one-frame artefacts), held ``cfg.radar_hold_s`` after
-  the last confirmed hit. Each frame counts once. A frame that is missing, older than
-  ``cfg.radar_stale_s``, already counted by an earlier run, or reused after a failed fetch
-  is no new data: it neither clears nor extends the streak.
+  the last confirmed hit. Where the newest frame shows an echo in the ring, the run also
+  has the frames just before it (``radar_check["earlier"]``), counted first, so one run
+  confirms an echo by itself: runs 30 min apart are too far apart to be consecutive.
+  Each frame counts once. A frame that is missing, older than ``cfg.radar_stale_s``,
+  already counted by an earlier run, or reused after a failed fetch is no new data: it
+  neither clears nor extends the streak.
 * ``glm``: a GLM flash within ``cfg.glm_km`` in the fetch window, held ``cfg.glm_hold_s``;
   a flash counts even when a satellite's data is incomplete, while "clear" needs one
   covering satellite's complete window.
@@ -258,10 +261,13 @@ def check_warning(cfg, entry: dict, now: datetime) -> Tuple[dict, List[str], Lis
 def check_radar(cfg, entry: dict, st: dict, now: datetime) -> Tuple[dict, List[str]]:
     """The ring check with the ttustatus confirmation and hold, on ``entry["radar_check"]``
     (``available``, ``stale``, ``frame_ts``, ``in_ring``, ``nearest_km``, ``count``,
-    ``max_dbz``, ``source``, ``error``). State keys: ``radar_streak``, ``radar_last_hit_ts``,
-    ``radar_last_frame_ts``.
+    ``max_dbz``, ``source``, ``error``, ``digest``). State keys: ``radar_streak``,
+    ``radar_last_hit_ts``, ``radar_last_frame_ts``, ``radar_last_digest``.
 
-    The streak counts radar FRAMES, each once: a frame an earlier run already counted (two
+    The streak counts radar SCANS, each once: a frame whose ring holds the same data as the
+    frame counted last (``digest``, ``radarcheck.ring_digest``: the composites are written
+    every 2 min, a radar completes a scan every 4.5-10 min) is no new observation, like a
+    frame an earlier run already counted (two
     runs inside one radar update) and a copy reused after a failed fetch (``stale``) are no
     new evidence and neither extend nor reset it, as in ttustatus, where a failed fetch
     never counts. Otherwise one echo frame, seen fresh by one run and reused by the next,
@@ -304,7 +310,14 @@ def check_radar(cfg, entry: dict, st: dict, now: datetime) -> Tuple[dict, List[s
     usable = bool(rc.get("available")) and (age_s is None or age_s <= float(cfg.radar_stale_s))
     stale = bool(rc.get("stale"))
     frame_key = frame_ts.timestamp() if frame_ts else None
-    new_frame = usable and not stale and (frame_key is None or last_frame is None or frame_key > last_frame)
+    digest = rc.get("digest") if isinstance(rc.get("digest"), str) else None
+    last_digest = st.get("radar_last_digest") if isinstance(st.get("radar_last_digest"), str) else None
+    same_scan = digest is not None and digest == last_digest
+    # a repeat of the scan counted last speaks for the stored streak only while that count is
+    # recent: a source serving unchanged data must not revive a streak from hours ago
+    same_recent = same_scan and last_count is not None and now_ts - last_count <= float(cfg.radar_stale_s)
+    new_frame = usable and not stale and not same_scan and \
+        (frame_key is None or last_frame is None or frame_key > last_frame)
     confirmed_now = False
     if new_frame:
         if frame_key is not None and last_frame is not None:
@@ -323,6 +336,7 @@ def check_radar(cfg, entry: dict, st: dict, now: datetime) -> Tuple[dict, List[s
             streak = 0
         if frame_key is not None:
             st["radar_last_frame_ts"] = frame_key
+        st["radar_last_digest"] = digest
     st["radar_streak"] = streak
     st["radar_last_hit_ts"] = last
     held = last is not None and (now_ts - last) < hold_s
@@ -336,7 +350,7 @@ def check_radar(cfg, entry: dict, st: dict, now: datetime) -> Tuple[dict, List[s
     # the stored streak speaks for this frame only if it is new, or is the frame last counted
     # (a frame without a time: counted recently); a reused copy of a frame never counted, or a
     # state file from before an outage, confirms nothing
-    trusted = new_frame or (frame_key is not None and frame_key == last_frame) or \
+    trusted = new_frame or same_recent or (frame_key is not None and frame_key == last_frame) or \
         (frame_key is None and last_count is not None and now_ts - last_count <= float(cfg.radar_stale_s))
     confirmed = usable and rc.get("in_ring") and trusted and streak >= int(cfg.radar_trigger_after)
     if confirmed_now or confirmed or (usable and rc.get("in_ring") and held):
@@ -362,7 +376,8 @@ def check_radar(cfg, entry: dict, st: dict, now: datetime) -> Tuple[dict, List[s
             count_txt = "frame %d of %d" % (streak, int(cfg.radar_trigger_after))
         else:
             count_txt = "%s, not counted again; %d of %d frames so far" % (
-                "a copy reused after a failed fetch" if stale else "the frame the last run saw",
+                "a copy reused after a failed fetch" if stale else
+                "the same radar data as the frame counted last" if same_scan else "the frame the last run saw",
                 streak, int(cfg.radar_trigger_after))
         detail = "%s: echo within %g km, unconfirmed (%s)%s%s" % (
             src, cfg.radar_km, count_txt, "; " + where if where else "", "; " + frame_txt if frame_txt else "")
@@ -394,7 +409,8 @@ def check_radar(cfg, entry: dict, st: dict, now: datetime) -> Tuple[dict, List[s
 
 
 def check_glm(cfg, entry: dict, st: dict, now: datetime) -> Tuple[dict, List[str]]:
-    """Lightning: a flash within ``glm_km`` in the fetch window, held ``glm_hold_s``.
+    """Lightning: a flash within ``glm_km`` in the fetch window, held ``glm_hold_s`` from the
+    flash (a flash of the window already older than that is no hit).
     State keys: ``glm_last_hit_ts``, ``glm_last_hit`` (nearest_km, bearing)."""
     g = entry.get("glm") if _is_dict(entry.get("glm")) else {}
     now_ts = now.timestamp()
@@ -410,17 +426,21 @@ def check_glm(cfg, entry: dict, st: dict, now: datetime) -> Tuple[dict, List[str
     available = bool(g.get("available"))
     count = _num(g.get("count_window")) or 0.0
     hit = {}
+    past_hold = None                # (count, age) of flashes in the window but past the hold
     if count > 0:                   # a flash in a partial window is still a flash
         # the hold runs from the flash, not from this run: a window that reached back (a late
-        # run, a catch-up) must not stretch it
+        # run, a catch-up) must not stretch it, and a flash already past the hold is no hit
         t_flash = g.get("last_in_ring_t")
-        t_flash = t_flash.timestamp() if isinstance(t_flash, datetime) else now_ts
-        last = max(last or 0.0, min(now_ts, t_flash))
-        hit = {"nearest_km": g.get("nearest_km"), "nearest_bearing": g.get("nearest_bearing"),
-               "count": int(count), "at": now_ts}
-        st["glm_last_hit"] = hit
+        t_flash = min(now_ts, t_flash.timestamp()) if isinstance(t_flash, datetime) else now_ts
+        if now_ts - t_flash < hold_s:
+            last = max(last or 0.0, t_flash)
+            hit = {"nearest_km": g.get("nearest_km"), "nearest_bearing": g.get("nearest_bearing"),
+                   "count": int(count), "at": now_ts}
+            st["glm_last_hit"] = hit
+        else:
+            past_hold = (int(count), now_ts - t_flash)
     st["glm_last_hit_ts"] = last
-    # bad while a flash is in the fetch window, and VLBA_GLM_HOLD after the last one
+    # bad from a flash until VLBA_GLM_HOLD after the last one
     held = bool(hit) or (last is not None and (now_ts - last) < hold_s)
     reasons: List[str] = []
     if held:
@@ -436,9 +456,19 @@ def check_glm(cfg, entry: dict, st: dict, now: datetime) -> Tuple[dict, List[str
                 int(count), cfg.glm_km, _num_txt(g.get("window_min")), "; " + where if where else "")
             reasons.append("lightning within %g km%s" % (cfg.glm_km, " (%s)" % where.strip() if where else ""))
         else:
-            detail = "no flash within %g km in the last %s min; held %s after the last one (%s ago%s)" % (
-                cfg.glm_km, _num_txt(g.get("window_min")), _fmt_min(hold_s), _fmt_min(ago),
-                "; " + where if where else "")
+            # what this run's window says: flashes past the hold, nothing (when the window does
+            # not reach the last flash), or nothing worth saying (the last flash lies inside the
+            # window but this run's data missed it, e.g. a refetch that failed)
+            window_s = (_num(g.get("window_min")) or 0.0) * 60.0
+            if past_hold:
+                opening = "%d flash(es) within %g km, the newest %s ago: past the %s hold; " % (
+                    past_hold[0], cfg.glm_km, _fmt_min(past_hold[1]), _fmt_min(hold_s))
+            elif not window_s or ago >= window_s:
+                opening = "no flash within %g km in the last %s min; " % (cfg.glm_km, _num_txt(g.get("window_min")))
+            else:
+                opening = ""
+            detail = "%sheld %s after the last one (%s ago%s)" % (
+                opening, _fmt_min(hold_s), _fmt_min(ago), "; " + where if where else "")
             reasons.append("lightning within %g km %s ago (hold, %s left)" % (
                 cfg.glm_km, _fmt_min(ago), _fmt_min(hold_s - ago)))
         return _check("glm", BAD_STATE, value="%d flash(es)" % int(count) if hit else "recent",
@@ -448,6 +478,9 @@ def check_glm(cfg, entry: dict, st: dict, now: datetime) -> Tuple[dict, List[str
         return _check("glm", UNKNOWN, limit=limit, detail=str(why)), []
     near = g.get("nearest_km")
     detail = "no flash within %g km in the last %s min" % (cfg.glm_km, _num_txt(g.get("window_min")))
+    if past_hold:
+        detail = "%d flash(es) within %g km, the newest %s ago: past the %s hold" % (
+            past_hold[0], cfg.glm_km, _fmt_min(past_hold[1]), _fmt_min(hold_s))
     if near is not None:
         detail += "; nearest flash %s km %s" % (_num_txt(near), g.get("nearest_bearing") or "")
     sats = g.get("sats") or []
@@ -949,6 +982,13 @@ def evaluate(cfg, entry: dict, st: dict, now: Optional[datetime] = None) -> dict
     else:
         checks["warning"], r, scheduled = res
         checks["warning"]["reasons"] = r
+    # the frames before the newest one (``radar_check["earlier"]``, oldest first, fetched where
+    # the newest shows an echo in the ring) go through the same count first: each frame counts
+    # once, so a run confirms an echo on consecutive frames by itself
+    rc = entry.get("radar_check")
+    for older in (rc.get("earlier") or []) if _is_dict(rc) and not rc.get("off") else []:
+        if _is_dict(older):
+            guarded("radar (earlier frame)", check_radar, cfg, {"radar_check": older}, st, now)
     res = guarded("radar", check_radar, cfg, entry, st, now)
     if res is None:
         checks["radar"] = _check("radar", UNKNOWN, detail="check failed (see the log)")

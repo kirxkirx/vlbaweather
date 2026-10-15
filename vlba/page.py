@@ -3,11 +3,12 @@ masthead style, alert banner and cards, current conditions, sun row, hourly and 
 tables, footer pills, escaping helpers) assembled in the VLBA layout:
 
 1. masthead (title, UTC clock, the good / bad count, the day/night button);
-2. the summary table: every antenna with its verdict badge, the reasons in a few words,
-   whether the sun is up, the local time, and a link to its section;
-3. the sticky navigation (one pill per antenna, its dot in the verdict colour);
+2. the summary table: every site (the VLBA antennas, the VLA, the GBT) with its verdict
+   badge, the reasons in a few words, whether the sun is up, the local time, and a link to
+   its section;
+3. the sticky navigation (one pill per site, its dot in the verdict colour);
 4. the NWS alerts banner across all sites (the parent's);
-5. per antenna: heading, the verdict card (badge, reasons, the hold / scheduled notes,
+5. per site: heading, the verdict card (badge, reasons, the hold / scheduled notes,
    and every check with its state, value, limit and detail), the map, current conditions,
    GLM, the alert cards, the sun row (with "Sun up / down"), the hourly table and the 7-day
    cards;
@@ -118,14 +119,16 @@ NWSRADAR_CREDIT_HTML = (
     'Radar outside the contiguous US: NWS radar composites (MRMS-based) from '
     '<a href="https://radar.weather.gov/" rel="noopener">radar.weather.gov</a> '
     '(opengeo.ncep.noaa.gov)')
-SITES_CREDIT_HTML = "Antenna positions: NRAO (VLBA Observational Status Summary)"
-# The parent's disclaimer, naming NRAO: on a page titled "VLBA weather" with a verdict per
-# antenna, readers could take it for the observatory's own operations status.
+SITES_CREDIT_HTML = ("Antenna positions: NRAO (VLBA Observational Status Summary); the VLA and "
+                     "the GBT from the SCHED station catalog")
+# The parent's disclaimer, naming NRAO and the Green Bank Observatory: on a page with a
+# verdict per VLBA antenna, the VLA and the GBT, readers could take it for the
+# observatories' own operations status.
 DISCLAIMER_HTML = (
     'Not an official product: this page is not from, or endorsed by, NOAA, the National '
-    'Weather Service, NRAO or any other agency, and it must not be the only source for '
-    'safety or operations decisions. It can be late, incomplete or wrong whenever a source '
-    'is. For official forecasts, watches and warnings use '
+    'Weather Service, NRAO, the Green Bank Observatory or any other agency, and it must not '
+    'be the only source for safety or operations decisions. It can be late, incomplete or '
+    'wrong whenever a source is. For official forecasts, watches and warnings use '
     '<a href="https://www.weather.gov/" rel="noopener">weather.gov</a>.')
 
 
@@ -311,12 +314,12 @@ def _summary_html(run: dict, sites: List[dict], gen: datetime) -> str:
                why, _sun_chip(s), _e(_local_time(gen, tz))))
     counts = run.get("summary") if _is_dict(run.get("summary")) else decision.summary([_verdict(s) for s in sites])
     n = len(sites)
-    line = ('<p class="counts"><b>%d</b> of %d antennas GOOD, <b>%d</b> BAD%s%s.</p>\n'
+    line = ('<p class="counts"><b>%d</b> of %d sites GOOD, <b>%d</b> BAD%s%s.</p>\n'
             % (int(counts.get("good") or 0), n, int(counts.get("bad") or 0),
                (", %d without data" % int(counts.get("no_data") or 0)) if counts.get("no_data") else "",
                (", %d with inputs missing" % int(counts.get("incomplete") or 0)) if counts.get("incomplete") else ""))
     return (
-        '<div class="summary" id="summary">\n<h2>Weather at the antennas</h2>\n'
+        '<div class="summary" id="summary">\n<h2>Weather at the sites</h2>\n'
         '<table class="sum">\n<thead><tr><th>Site</th><th></th><th>Verdict</th><th>Why</th>'
         '<th>Sun</th><th class="lt">Local time</th></tr></thead>\n<tbody>\n%s</tbody></table>\n%s</div>\n'
         % ("".join(rows), line))
@@ -330,7 +333,7 @@ def _nav_html(sites: List[dict]) -> str:
         title = _short_reasons(v)
         links.append('  <a class="pill" href="#%s" title="%s"><span class="dot %s"></span>%s</a>\n'
                      % (_e(wp.site_anchor(slug)), _e(title), _dot_cls(v), _e(_code(s))))
-    return '<nav class="nav" aria-label="Antennas">\n%s</nav>\n' % "".join(links)
+    return '<nav class="nav" aria-label="Sites">\n%s</nav>\n' % "".join(links)
 
 
 def _site_head_html(s: dict, gen: datetime, tz: str) -> str:
@@ -683,6 +686,10 @@ def _footer_html(cfg, run: dict, sites: List[dict], gen: datetime) -> str:
     if extra:
         base = base.replace("\n</div>\n", "\n%s\n</div>\n" % extra, 1)
     base = base.replace(wp.DISCLAIMER_HTML, DISCLAIMER_HTML, 1)
+    # the parent's stamp: "refreshes" means the browser reload, which here is not when the
+    # data change (the generator runs every 30 min, the page reloads every 5)
+    base = base.replace("refreshes every %d s" % int(cfg.refresh_seconds),
+                        "page reloads every %d s" % int(cfg.refresh_seconds), 1)
     credits = ('<p class="foot">%s · %s · %s</p>\n<p class="foot">%s</p>\n'
                % (GLM_CREDIT_HTML, NWSRADAR_CREDIT_HTML, SITES_CREDIT_HTML, _e(cuts_text(cfg))))
     marker = '<p class="foot disclaimer">'
