@@ -1,3 +1,5 @@
+[![CI](https://github.com/kirxkirx/vlbaweather/actions/workflows/ci.yml/badge.svg)](https://github.com/kirxkirx/vlbaweather/actions/workflows/ci.yml)
+
 # vlbaweather
 
 The weather at the ten VLBA antenna sites, the VLA and the GBT on one page, regenerated every
