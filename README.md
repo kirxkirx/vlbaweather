@@ -75,9 +75,10 @@ a look), the NWS alerts banner across all sites, and one section per site:
 The footer lists every source's freshness (alerts, MRMS, GLM per satellite, the island
 composites, each site's NWS products, the gridpoint forecasts behind the forecast checks,
 the radar coverage per MRMS domain),
-the credits, what the checks are (spelled out from the configuration in use), and the
+the credits, what the checks are (spelled out from the configuration in use), the
 disclaimer: not an official product of NOAA, NWS, NRAO or the Green Bank Observatory, not
-the only source for safety or operations decisions.
+the only source for safety or operations decisions, and as its last line a link to this
+repository, the source code.
 `status.json` beside the page is a machine-readable health summary of the generator (the
 parent's, plus the verdicts, the GLM state, the island radar and the radar coverage) for
 monitoring; it is not a safety interface. Where no station qualifies (Mauna Kea, Pie Town,
@@ -188,10 +189,12 @@ PLAN.md                  the design and the decisions
 .github/workflows/ci.yml lint, tests and shell syntax on Python 3.9 and 3.12
 ```
 
-`weather/` is the parent's library: its commit c3a13b4 and the two hooks in
-`weather.radar.SiteMap` that the parent gained after it, the caption label (`radar["label"]`,
+`weather/` is the parent's library as of 2026-10-15, byte for byte apart from the origin
+notes at the top of `weather/__init__.py` and `weather/pipeline.py`. It has the hooks the
+parent took in for this page: in `weather.radar.SiteMap` the caption label (`radar["label"]`,
 default "MRMS") and the scale bars (`SCALE_BARS`, default 25 mi and 10 mi; the antennas' maps
-draw 10 mi and 10 km). All of its modules are needed (the page and the maps import the road
+draw 10 mi and 10 km), and the footer's source-code link (`source_url`, set to this
+repository in `vlba/config.py`). All of its modules are needed (the page and the maps import the road
 layer too, which stays off here). To take in a later version, copy the parent's
 `weather/*.py` and its `make_weather_page.py` (as `weather/pipeline.py`) over these, put the
 origin notes back at the top of `weather/__init__.py` and `weather/pipeline.py`, naming the

@@ -1630,12 +1630,16 @@ def _footer_html(cfg, run: dict, sites: List[dict], gen: datetime) -> str:
     url_html = ('<a href="%s">%s</a>' % (_e(url), _e(url))) if url else _e(page_url)
     stamp = "generated %s · refreshes every %d s" % (
         gen.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"), int(cfg.refresh_seconds))
+    # the last line: where the code that made this page lives (https only, like every link)
+    src = _https(str(getattr(cfg, "source_url", "") or "").strip())
+    src_html = ('<br>Source code: <a href="%s" rel="noopener">%s</a>' % (_e(src), _e(src.split("://", 1)[1]))
+                if src else "")
     return (
         '<h2>Sources</h2>\n<div class="pills">\n%s\n</div>\n%s%s'
         '<p class="foot disclaimer">%s</p>\n'
-        '<p class="foot">%s<br>%s</p>\n'
+        '<p class="foot">%s<br>%s%s</p>\n'
         % ("\n".join(pills), err_html, _roads_credit_html(cfg, run, sites), DISCLAIMER_HTML,
-           ATTRIBUTION_HTML, (url_html + " · " + _e(stamp)) if page_url else _e(stamp))
+           ATTRIBUTION_HTML, (url_html + " · " + _e(stamp)) if page_url else _e(stamp), src_html)
     )
 
 

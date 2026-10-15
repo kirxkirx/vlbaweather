@@ -339,6 +339,8 @@ class Config:
     # page
     title: str = ""                 # empty: derived from the site names (page_title)
     page_url: str = ""              # the page's public address for the footer; empty: none
+    # The footer links to the source code (an https URL; a fork points this at its own copy).
+    source_url: str = "https://github.com/kirxkirx/local-weather-awareness"
     refresh_seconds: int = 90       # browser reload; the page is regenerated every 2 min
     units: str = "us"               # "us" (°F/mph primary) or "metric"
     hourly_hours: int = 24

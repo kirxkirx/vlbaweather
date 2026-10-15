@@ -129,6 +129,7 @@ class VlbaConfig(Config):
     # reloading every 5 min shows a new run's page within 5 min of its writing.
     refresh_seconds: int = 300
     user_agent: str = "vlbaweather (+https://github.com/kirxkirx/vlbaweather)"
+    source_url: str = "https://github.com/kirxkirx/vlbaweather"     # the footer's source-code link
     # A run fetches twelve sites, one radar frame per source (more where a ring shows an echo)
     # and ~185 GLM granules (the 30-minute window, 25-30 s, measured 2026-10-14); the first run
     # of a fresh cache also

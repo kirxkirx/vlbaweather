@@ -195,6 +195,11 @@ def test_page_renders_the_layout(cfg, run):
     assert "MK radar (NWS Hawaii composite): fresh" in html
     assert "Geostationary Lightning Mapper" in html and "ttustatus" in html
     assert "page reloads every 300 s" in html and "refreshes every" not in html
+    # the last footer line links to this repository, not to the parent's
+    last = html[html.rindex('<p class="foot">'):].split("</p>", 1)[0]
+    assert last.endswith('<br>Source code: <a href="https://github.com/kirxkirx/vlbaweather" '
+                         'rel="noopener">github.com/kirxkirx/vlbaweather</a>')
+    assert "github.com/kirxkirx/local-weather-awareness" not in html
 
 
 def test_status_json_carries_verdicts(cfg, run):
