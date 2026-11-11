@@ -297,6 +297,7 @@ def test_radar_coverage_in_the_footer_and_status(cfg, run):
     assert '<span class="dot off"></span>Radar coverage (MRMS HAWAII): unavailable · HTTP 503' in html
     doc = page.status_doc(cfg, run)
     assert doc["radar_coverage"]["CONUS"] == {"ok": True, "ts": FRAME_TS.isoformat(), "error": None,
+                                              "source": None, "older": False, "behind_s": None, "note": None,
                                               "covered_pct": {"pt": 63.95}}
     assert "pt radar coverage: below 90 %" in doc["problems"]
     assert "radar coverage (MRMS HAWAII): unavailable" in doc["problems"] and doc["degraded"]
@@ -313,6 +314,37 @@ def test_radar_coverage_in_the_footer_and_status(cfg, run):
     cfg.radar_coverage = False
     assert "Radar coverage (MRMS): not checked" in page.render_html(cfg, run)
     assert page.status_doc(cfg, run)["radar_coverage"] is None
+
+
+def test_radar_coverage_from_an_older_file_or_the_mirror_says_so(cfg, run):
+    """NOAA's bucket late (2026-11-10): an older file (within VLBA_RADAR_COVERAGE_MAX_LAG)
+    is amber in the footer and a stale problem in status.json; the mirror's file of the
+    frame's time is named, no problem; the footer's account of the checks says which."""
+    os.makedirs(cfg.out_dir, exist_ok=True)
+    cfg.radar_coverage_max_lag_s = 1800
+    old = FRAME_TS - timedelta(minutes=24)
+    run["radar_coverage"] = {
+        "HAWAII": {"ok": True, "error": None, "ts": old, "source": "bucket", "older": True, "behind_s": 1441,
+                   "note": "HTTP 404 for noaa-mrms-pds.s3.amazonaws.com",
+                   "url": "https://noaa-mrms-pds.s3.amazonaws.com/HAWAII/x", "sites": {"mk": {"covered_pct": 100.0}}},
+        "CONUS": {"ok": True, "error": None, "ts": FRAME_TS, "source": "mirror", "older": False, "behind_s": 0,
+                  "note": "bucket: HTTP 404 for noaa-mrms-pds.s3.amazonaws.com",
+                  "url": "https://mtarchive.geol.iastate.edu/2026/10/08/x.grib2.gz",
+                  "sites": {"pt": {"covered_pct": 100.0}}}}
+    html = page.render_html(cfg, run)
+    assert ('<span class="dot warnc"></span>Radar coverage (MRMS HAWAII): %s, an older file (24 min before the '
+            'frame) · every ring fully covered' % old.strftime("%H:%MZ")) in html
+    assert ('<span class="dot"></span>Radar coverage (MRMS CONUS): %s from the mirror mtarchive.geol.iastate.edu'
+            ' · every ring fully covered' % FRAME_TS.strftime("%H:%MZ")) in html
+    assert "of the frame&#x27;s time or, when none can be had, one up to 30 min older)" in html
+    doc = page.status_doc(cfg, run)
+    assert doc["radar_coverage"]["HAWAII"]["older"] is True and doc["radar_coverage"]["HAWAII"]["behind_s"] == 1441
+    assert doc["radar_coverage"]["CONUS"]["source"] == "mirror" and doc["radar_coverage"]["CONUS"]["older"] is False
+    assert doc["radar_coverage"]["CONUS"]["note"] == "bucket: HTTP 404 for noaa-mrms-pds.s3.amazonaws.com"
+    assert "radar coverage (MRMS HAWAII): stale" in doc["problems"] and doc["degraded"]
+    assert not any("MRMS CONUS" in p for p in doc["problems"])
+    cfg.radar_coverage_max_lag_s = 0
+    assert "one up to" not in page.render_html(cfg, run)
 
 
 def test_an_observation_only_shown_is_no_problem(cfg, run):

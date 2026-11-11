@@ -450,11 +450,14 @@ def _in_mrms_grid(cfg, site: dict, frame=None) -> bool:
         return True
 
 
-def _radar_coverage(cfg, run: dict, domain: str, frame_ts, sites: List[dict], what: str) -> Dict[str, Any]:
+def _radar_coverage(cfg, run: dict, domain: str, frame_ts, sites: List[dict], what: str,
+                    reused: bool = False) -> Dict[str, Any]:
     """The radar coverage of the sites' rings in MRMS's own file of the frame's time
-    (``vlba.mrms.coverage``), kept in ``run["radar_coverage"][domain]``; failing is a problem
-    of the run."""
-    cov = _step(run, what, mrms.coverage, cfg, domain, frame_ts, sites, float(cfg.radar_km))
+    (``vlba.mrms.coverage``; ``reused``: the frame is a copy reused after a failed fetch, for
+    which no older file may stand in), kept in ``run["radar_coverage"][domain]``; failing is a
+    problem of the run."""
+    cov = _step(run, what, mrms.coverage, cfg, domain, frame_ts, sites, float(cfg.radar_km),
+                allow_older=not reused)
     if not isinstance(cov, dict):
         err = run["errors"][-1] if cov is None and run["errors"] else "%s returned no result" % what
         cov = {"ok": False, "error": err, "domain": domain, "ts": None, "url": None, "sites": {}}
@@ -467,6 +470,9 @@ def _radar_coverage(cfg, run: dict, domain: str, frame_ts, sites: List[dict], wh
         merged = dict(prev, sites=dict(prev.get("sites") or {}, **(cov.get("sites") or {})))
         if not cov.get("ok"):
             merged.update(ok=False, error=cov.get("error"))
+        elif cov.get("older") and (not prev.get("older") or (cov.get("behind_s") or 0) >= (prev.get("behind_s") or 0)):
+            # one site's older file marks the domain: the farthest behind is shown, its own time with it
+            merged.update({k: cov.get(k) for k in ("ts", "url", "source", "older", "behind_s", "note")})
         have[domain] = merged
     else:
         have[domain] = cov
@@ -697,7 +703,7 @@ def _radar_for_site(cfg, cache, run: dict, site: dict, frame, frame_res: dict,
                                      "error": "no MRMS domain for the composite %r" % island.get("region")}
             else:
                 cov = _radar_coverage(cfg, run, domain, island.get("ts"), [site],
-                                      "%s radar coverage (MRMS %s)" % (slug, domain))
+                                      "%s radar coverage (MRMS %s)" % (slug, domain), reused=bool(island.get("stale")))
                 check["coverage"] = mrms.site_coverage(cov, slug)
         elif check["available"]:
             check["coverage"] = {"off": True}
@@ -951,7 +957,8 @@ def _run_locked(cfg, skip_radar: bool) -> Dict[str, Any]:
     run["radar"] = {k: v for k, v in frame_res.items() if k != "image"}
     conus = [s for s in cfg.sites if _in_mrms_grid(cfg, s)]
     if cfg.radar_coverage and frame_res.get("ok") and frame_res.get("image") is not None and conus:
-        _radar_coverage(cfg, run, "CONUS", frame_res.get("ts"), conus, "radar coverage (MRMS CONUS)")
+        _radar_coverage(cfg, run, "CONUS", frame_res.get("ts"), conus, "radar coverage (MRMS CONUS)",
+                        reused=bool(frame_res.get("stale")))
     # where a ring shows an echo, the frames before the newest (each fetched once, for all sites)
     earlier_mrms = _step(run, "earlier MRMS frames", _earlier_mrms, cfg, run, frame_res, conus) or {}
 

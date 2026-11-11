@@ -193,6 +193,35 @@ def test_no_echo_is_clear_only_where_radar_covers_the_ring(cfg):
     assert _radar_state(cfg, {"ok": True, "covered_pct": 64.0, "ts": ts})[1]["state"] == "ok"
 
 
+def test_coverage_from_an_older_file_counts_only_within_its_bound_and_says_so(cfg):
+    """NOAA's bucket late (2026-11-10): a file older than the frame may stand in within
+    VLBA_RADAR_COVERAGE_MAX_LAG (an hour by default), checked again here. The check is then
+    stale, and its detail names the file and what it cannot show. At 0 it never does."""
+    frame = NOW - timedelta(minutes=4)                  # the frame of _radar(): 15:56Z
+    older = {"ok": True, "covered_pct": 100.0, "ts": frame - timedelta(minutes=20), "older": True, "behind_s": 1200}
+    cfg.radar_coverage_max_lag_s = 0
+    v, c = _radar_state(cfg, older)                     # the strict rule: a radar outage reads "no data"
+    assert c["state"] == "unknown" and v["incomplete"] and "Rain on radar" in v["missing"]
+    assert "MRMS's file read is 20 min older than the frame, more than VLBA_RADAR_COVERAGE_MAX_LAG allows" in c["detail"]
+    cfg.radar_coverage_max_lag_s = 1800
+    v, c = _radar_state(cfg, older)
+    assert c["state"] == "ok" and c["stale"] and not v["incomplete"]
+    assert c["detail"].endswith("; radar covers the ring in an older MRMS file (15:36Z, 20 min before the frame): "
+                                "a radar that failed since would look the same")
+    v, c = _radar_state(cfg, dict(older, covered_pct=95.5))
+    assert c["state"] == "ok" and c["stale"] and c["detail"].endswith(
+        "; radar covers 95.5 % of the ring in an older MRMS file (15:36Z, 20 min before the frame): "
+        "a radar that failed since would look the same")
+    v, c = _radar_state(cfg, dict(older, covered_pct=64.0))
+    assert c["state"] == "unknown" and v["incomplete"] and c["detail"].startswith(
+        "MRMS: no radar covers 36 % of the 30 km ring in an older MRMS file (15:36Z, 20 min before the frame), "
+        "so no echo there would show")
+    for bad in (dict(older, behind_s=1801), dict(older, behind_s=None), dict(older, ts=None)):
+        assert _radar_state(cfg, bad)[1]["state"] == "unknown"
+    v, c = _radar_state(cfg, {"ok": True, "covered_pct": 100.0, "ts": frame, "older": False, "behind_s": 0})
+    assert c["state"] == "ok" and not c["stale"] and "covers" not in c["detail"] and "older" not in c["detail"]
+
+
 def test_an_echo_counts_whatever_the_coverage(cfg):
     st = {}
     low = {"ok": True, "covered_pct": 20.0, "ts": NOW}

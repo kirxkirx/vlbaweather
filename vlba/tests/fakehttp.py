@@ -11,7 +11,9 @@ from weather import http as _http
 
 class FakeHttp:
     """Registry of URL fragment -> response. ``add(fragment, body)`` where body is bytes,
-    str, or a JSON-serialisable object; ``fail(fragment)`` makes that URL raise HttpError.
+    str, a JSON-serialisable object, or a callable that makes the body from the URL (a file
+    whose content names its own time, like MRMS's); ``fail(fragment)`` makes that URL raise
+    HttpError.
     The FIRST registered fragment contained in the requested URL wins. Unregistered URLs
     raise HttpError (so a test never hits the network by accident)."""
 
@@ -34,7 +36,7 @@ class FakeHttp:
     def _lookup(self, url):
         for frag, body, ok in self.routes:
             if frag in url:
-                return body, ok
+                return (body(url) if callable(body) else body), ok
         return None, False
 
     def get_bytes(self, url, cfg, accept=None, timeout=None, retries=None, method="GET"):

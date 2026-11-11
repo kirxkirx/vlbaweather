@@ -283,7 +283,11 @@ def check_radar(cfg, entry: dict, st: dict, now: datetime) -> Tuple[dict, List[s
     No echo is "clear" only where radar covers the ring: the frames write "no coverage" like
     "no echo", so ``coverage`` (MRMS's own file, ``vlba.mrms.site_coverage``) must say radar
     covers at least ``cfg.radar_min_coverage`` % of it; less, or coverage that could not be
-    read, is "no data". ``{"off": True}`` (VLBA_RADAR_COVERAGE=0) and a check without the key
+    read, is "no data". A coverage from an older file (``older``: none of the frame's time
+    could be had; only with VLBA_RADAR_COVERAGE_MAX_LAG > 0) counts while ``behind_s`` is
+    within that bound, checked again here: the check is then marked stale and its detail
+    names the file, how far it lies before the frame and that a radar which failed since
+    would look the same. ``{"off": True}`` (VLBA_RADAR_COVERAGE=0) and a check without the key
     keep the frame's "clear". A new frame without an echo restarts the count whatever its
     coverage: it is real data where radar covers the ring, and holding the count over frames
     of unknown coverage would let two echo frames far apart confirm each other."""
@@ -394,6 +398,18 @@ def check_radar(cfg, entry: dict, st: dict, now: datetime) -> Tuple[dict, List[s
         pct = _num(cov.get("covered_pct"))
         cov_ts = _as_dt(cov.get("ts"))
         cov_txt = " (MRMS %s)" % cov_ts.astimezone(timezone.utc).strftime("%H:%MZ") if cov_ts else ""
+        older = bool(cov.get("older")) and bool(cov.get("ok"))
+        if older:
+            # no file of the frame's time could be had and an older one stands in
+            # (VLBA_RADAR_COVERAGE_MAX_LAG): within that bound only, saying what it cannot see
+            behind = _num(cov.get("behind_s"))
+            if behind is None or cov_ts is None or behind > float(getattr(cfg, "radar_coverage_max_lag_s", 0) or 0):
+                return _check("radar", UNKNOWN, limit=limit, stale=stale, detail=(
+                    "%s, but the radar coverage of the ring is unknown (MRMS's file read is %s older than the "
+                    "frame, more than VLBA_RADAR_COVERAGE_MAX_LAG allows): a radar outage would look the same"
+                    % (detail, _fmt_min(behind) if behind is not None else "an unknown time"))), []
+            cov_txt = " in an older MRMS file (%s, %s before the frame)" % (
+                cov_ts.astimezone(timezone.utc).strftime("%H:%MZ"), _fmt_min(behind))
         if not cov.get("ok") or pct is None:
             return _check("radar", UNKNOWN, limit=limit, stale=stale, detail=(
                 "%s, but the radar coverage of the ring is unknown (%s): a radar outage would look "
@@ -403,6 +419,10 @@ def check_radar(cfg, entry: dict, st: dict, now: datetime) -> Tuple[dict, List[s
                 src, _num_txt(100.0 - pct), cfg.radar_km, cov_txt)
             why += " (clear needs %g %% covered)%s" % (cfg.radar_min_coverage, "; " + frame_txt if frame_txt else "")
             return _check("radar", UNKNOWN, limit=limit, stale=stale, detail=why), []
+        if older:
+            detail += "; radar covers %s%s: a radar that failed since would look the same" % (
+                "the ring" if pct >= 100.0 else "%s %% of the ring" % _num_txt(pct), cov_txt)
+            return _check("radar", OK, value="clear", limit=limit, detail=detail, stale=True), []
         if pct < 100.0:
             detail += "; radar covers %s %% of the ring%s" % (_num_txt(pct), cov_txt)
     return _check("radar", OK, value="clear", limit=limit, detail=detail, stale=stale), []

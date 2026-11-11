@@ -71,19 +71,27 @@ def _fresh_http_run_state(monkeypatch):
 
 
 # ---- MRMS GRIB2 files (vlba.mrms): what NOAA's bucket serves, in small ----------------------
+# MRMS's GRIB2 parameter (category, number) of the CONUS product (SeamlessHSR_00.00) and of the
+# islands' (MergedBaseReflectivityQC_00.50), in MRMS's local discipline 209 (vlba.mrms.PRODUCT_IDS)
+CONUS_PARAMETER = (8, 8)
+ISLAND_PARAMETER = (11, 0)
+
+
 def _sm(v: int, n: int) -> bytes:
     """A GRIB2 signed integer of ``n`` bytes (sign and magnitude)."""
     return ((1 << (8 * n - 1)) | -v).to_bytes(n, "big") if v < 0 else v.to_bytes(n, "big")
 
 
 def grib2_message(rows, la1, lo1, di, dj, ts, scan=0x00, R=-9990.0, E=0, D=1, template3=0, template5=41,
-                  bitmap=255, gz=True, angle=(1, 1000000)):
+                  bitmap=255, gz=True, angle=(1, 1000000), discipline=209, parameter=CONUS_PARAMETER):
     """A GRIB2 message as MRMS writes it: grid template 3.0 (``la1``/``lo1`` the first
     cell's centre, degrees; ``lo1`` as given, MRMS uses 0..360), data template 5.41 (a
     16-bit grey PNG of ``X``, value = (R + X * 2**E) / 10**D), no bitmap. ``rows`` are the
     values (dBZ, -99 no echo, -999 no coverage) in the scanning order. ``angle`` is the basic
     angle and its subdivisions (MRMS: 1 and 10**6, so coordinates count micro-degrees; (0, 0)
-    means the same by default). gzip'ed like the bucket's ``.grib2.gz`` unless ``gz`` is false."""
+    means the same by default). ``discipline`` and ``parameter`` (category, number): MRMS's
+    identity of the product, the CONUS one by default (``ISLAND_PARAMETER`` for the islands').
+    gzip'ed like the bucket's ``.grib2.gz`` unless ``gz`` is false."""
     import gzip
     import io
     import struct
@@ -116,13 +124,13 @@ def grib2_message(rows, la1, lo1, di, dj, ts, scan=0x00, R=-9990.0, E=0, D=1, te
     sec3[63:67] = int(round(di * per)).to_bytes(4, "big")
     sec3[67:71] = int(round(dj * per)).to_bytes(4, "big")
     sec3[71] = scan
-    sec4 = (9).to_bytes(4, "big") + bytes([4, 0, 0, 0, 0])
+    sec4 = (11).to_bytes(4, "big") + bytes([4, 0, 0, 0, 0, parameter[0], parameter[1]])
     sec5 = (21).to_bytes(4, "big") + bytes([5]) + (ni * nj).to_bytes(4, "big") + template5.to_bytes(2, "big") + \
         struct.pack(">f", R) + _sm(E, 2) + _sm(D, 2) + bytes([16, 0])
     sec6 = (6).to_bytes(4, "big") + bytes([6, bitmap])
     sec7 = (5 + len(png)).to_bytes(4, "big") + bytes([7]) + png
     body = bytes(sec1) + bytes(sec3) + sec4 + sec5 + sec6 + sec7 + b"7777"
-    raw = b"GRIB" + bytes([0, 0, 0, 2]) + (16 + len(body)).to_bytes(8, "big") + body
+    raw = b"GRIB" + bytes([0, 0, discipline, 2]) + (16 + len(body)).to_bytes(8, "big") + body
     return gzip.compress(raw) if gz else raw
 
 

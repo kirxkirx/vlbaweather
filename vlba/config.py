@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import math
 import os
+import re
 from dataclasses import dataclass, fields
 from typing import List, Tuple
 
@@ -43,6 +44,62 @@ _KNOWN_EVENTS = {k.lower() for k in _alerts.NWS_COLORS} | {k.lower() for k in _a
 # wrapper skips empty values in env files (so that an empty line cannot clear an earlier
 # file's setting), which makes an empty VLBA_VETO_EVENTS= work under systemd only.
 VETO_OFF = ("", "none")
+
+# MRMS's CONUS product behind IEM's lcref frames (vlba.mrms reads it for the radar coverage);
+# a CONUS mirror must serve its files.
+MRMS_CONUS_PRODUCT = "SeamlessHSR_00.00"
+# VLBA_RADAR_COVERAGE_MAX_LAG's upper bound (s): coverage changes over hours, and every hour of
+# the lag is one more listing request when the frame's own file is missing.
+MAX_COVERAGE_LAG_S = 3600
+_MIRROR_FIELDS = {"Y": r"\d{4}", "m": r"\d{2}", "d": r"\d{2}", "H": r"\d{2}", "M": r"\d{2}", "S": r"\d{2}"}
+
+
+def mirror_name_regex(name: str):
+    """A regex of the file names the strftime pattern ``name`` gives, the time's fields as
+    named groups (a field given twice must repeat its value). ValueError for a pattern with
+    a field other than %Y %m %d %H %M %S (also "%%" or a last "%"), or whose names do not
+    hold the whole time: a listed name must give its file's time."""
+    out: List[str] = []
+    seen = set()
+    pos = 0
+    for m in re.finditer(r"%(.?)", name):
+        f = m.group(1)
+        if f not in _MIRROR_FIELDS:
+            raise ValueError("%%%s in the file name (only %%Y %%m %%d %%H %%M %%S are filled in)" % f)
+        out.append(re.escape(name[pos:m.start()]))
+        out.append("(?P=%s)" % f if f in seen else "(?P<%s>%s)" % (f, _MIRROR_FIELDS[f]))
+        seen.add(f)
+        pos = m.end()
+    out.append(re.escape(name[pos:]))
+    if set(_MIRROR_FIELDS) - seen:
+        raise ValueError("the file name %r does not hold the whole time (%%Y %%m %%d %%H %%M %%S)" % name)
+    return re.compile(r"(?<![\w.-])%s(?![\w.-])" % "".join(out))
+
+
+def _mirror_pattern(raw) -> str:
+    """VLBA_MRMS_CONUS_MIRROR: "none" = no mirror (""; an empty value in an env file counts
+    as unset, i.e. the default mirror); else an http(s) URL pattern of a file of
+    ``MRMS_CONUS_PRODUCT``, whose name holds the whole time (``mirror_name_regex``) and whose
+    directory nothing finer than %H (each hour's directory is listed)."""
+    if not isinstance(raw, str):
+        raise ValueError("VLBA_MRMS_CONUS_MIRROR must be a URL pattern or none")
+    s = raw.strip()
+    if s.lower() in VETO_OFF:
+        return ""
+    if not s.startswith(("http://", "https://")):
+        raise ValueError("VLBA_MRMS_CONUS_MIRROR must be an http:// or https:// URL pattern (or none)")
+    head, _, name = s.rpartition("/")
+    try:
+        mirror_name_regex(name)
+    except ValueError as e:
+        raise ValueError("VLBA_MRMS_CONUS_MIRROR: %s" % e)
+    odd = sorted(set(re.findall(r"%(.?)", head)) - set("YmdH"))
+    if odd:
+        raise ValueError("VLBA_MRMS_CONUS_MIRROR: the directory may hold %%Y %%m %%d %%H only, not %s"
+                         % " ".join("%" + f for f in odd))
+    if MRMS_CONUS_PRODUCT + "_" not in name:
+        raise ValueError("VLBA_MRMS_CONUS_MIRROR: the file name must be MRMS's %s file's" % MRMS_CONUS_PRODUCT)
+    return s
 
 
 def _env_events(name: str, default: str) -> str:
@@ -163,10 +220,22 @@ class VlbaConfig(Config):
     radar_hold_s: int = 900                     # VLBA_RADAR_HOLD
     radar_stale_s: int = 1200                   # VLBA_RADAR_STALE
     # The radar frames write "no coverage" like "no echo" (asked 2026-10-12: a radar outage
-    # must read "no data", never "clear"): MRMS's own files of the frame tell them apart.
+    # must read "no data", never "clear"): MRMS's own files of the frame tell them apart,
+    # or, while NOAA's feed is late, an older one (VLBA_RADAR_COVERAGE_MAX_LAG below).
     radar_coverage: bool = True                 # VLBA_RADAR_COVERAGE
     radar_min_coverage: float = 90.0            # VLBA_RADAR_MIN_COVERAGE (% of the ring)
     mrms_url: str = "https://noaa-mrms-pds.s3.amazonaws.com"    # VLBA_MRMS_URL
+    # NOAA's feed to the bucket can fall behind: on 2026-11-10 its files came 25-30 min late in
+    # every domain, and the radar check read "no data" at every site, while IEM's archive,
+    # fed by NCEP directly, had each CONUS file within minutes (as through the bucket's
+    # one-hour stall of 2026-09-11; the 94 min of 2026-10-07 reached neither in time).
+    mrms_conus_mirror: str = ("https://mtarchive.geol.iastate.edu/%Y/%m/%d/mrms/ncep/SeamlessHSR/"
+                              "SeamlessHSR_00.00_%Y%m%d-%H%M%S.grib2.gz")  # VLBA_MRMS_CONUS_MIRROR
+    # IEM has no Hawaii or Caribbean files, and MRMS's files can be late everywhere: then a
+    # file up to this many seconds before the frame's time stands in, marked stale. A radar
+    # that failed after it reads "clear" until a newer file shows it, the exception to the
+    # rule above that the user chose on 2026-11-10 (one hour); 0 keeps the rule strict.
+    radar_coverage_max_lag_s: int = 3600        # VLBA_RADAR_COVERAGE_MAX_LAG (0..3600)
     nws_cloud_max: float = 60.0                 # VLBA_NWS_CLOUD_MAX (negative = off)
     nws_precip_max: float = 20.0                # VLBA_NWS_PRECIP_MAX (negative = off)
     nws_thunder_max: float = 15.0               # VLBA_NWS_THUNDER_MAX (negative = off)
@@ -247,6 +316,8 @@ class VlbaConfig(Config):
         c.radar_coverage = _env_flag("VLBA_RADAR_COVERAGE", c.radar_coverage)
         c.radar_min_coverage = _env_float("VLBA_RADAR_MIN_COVERAGE", c.radar_min_coverage)
         c.mrms_url = _env_str("VLBA_MRMS_URL", c.mrms_url)
+        c.mrms_conus_mirror = _env_str("VLBA_MRMS_CONUS_MIRROR", c.mrms_conus_mirror)
+        c.radar_coverage_max_lag_s = _env_int("VLBA_RADAR_COVERAGE_MAX_LAG", c.radar_coverage_max_lag_s)
         c.nws_cloud_max = _env_float("VLBA_NWS_CLOUD_MAX", c.nws_cloud_max)
         c.nws_precip_max = _env_float("VLBA_NWS_PRECIP_MAX", c.nws_precip_max)
         c.nws_thunder_max = _env_float("VLBA_NWS_THUNDER_MAX", c.nws_thunder_max)
@@ -314,6 +385,11 @@ class VlbaConfig(Config):
         if not isinstance(self.mrms_url, str) or not self.mrms_url.startswith(("http://", "https://")):
             raise ValueError("VLBA_MRMS_URL must be an http:// or https:// URL")
         self.mrms_url = self.mrms_url.rstrip("/")
+        self.mrms_conus_mirror = _mirror_pattern(self.mrms_conus_mirror)
+        if isinstance(self.radar_coverage_max_lag_s, bool) or not isinstance(self.radar_coverage_max_lag_s, int) \
+                or not (0 <= self.radar_coverage_max_lag_s <= MAX_COVERAGE_LAG_S):
+            raise ValueError("VLBA_RADAR_COVERAGE_MAX_LAG must be a whole number of seconds, 0..%d"
+                             % MAX_COVERAGE_LAG_S)
         if not isinstance(self.glm_hold_s, bool) and isinstance(self.glm_hold_s, int) and 0 <= self.glm_hold_s < 60:
             # a flash counts only while it is younger than the hold: a shorter one ignores flashes
             raise ValueError("VLBA_GLM_HOLD must be >= 60 s (a shorter hold would ignore the flashes; "

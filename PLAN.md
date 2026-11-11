@@ -53,7 +53,8 @@ TISX (19 m, 24 km).
 | Radar, contiguous US | NOAA MRMS composite via IEM, `weather.radar` | the 10 CONUS sites; ring check on the palette indices; where a ring shows an echo, also on the frames before the newest (IEM's archive, a frame every 2 min) |
 | Radar, Hawaii and the Virgin Islands | NWS radar.weather.gov composites on `https://opengeo.ncep.noaa.gov/geoserver/{hawaii,carib}/ows` (WMS 1.3.0, layers `hawaii_bref_qcd`, `carib_bref_qcd`: "Quality Controlled 1km x 1km ... Radar Base Reflectivity ... MRMS algorithm", a frame every 2 min, TIME dimension with the latest as default) | `vlba/nwsradar.py`. The server returns pre-coloured RGBA (GetFeatureInfo gives RED/GREEN/BLUE/ALPHA bands; `SLD_BODY` is "forbidden"; WCS is the same 4 bands), so dBZ is decoded from the colours with the radar.weather.gov colour scale. Per-workspace GetCapabilities (18 KB) gives the latest frame time. IEM's `ridge::PHKM-N0B-0` tiles are the fallback option (not implemented) |
 | MRMS Hawaii/Caribbean GRIB2 on mrms.ncep.noaa.gov | NOT usable: 403 for every product directory and file from here |
-| MRMS GRIB2 on NOAA Open Data (AWS `noaa-mrms-pds`, anonymous HTTPS; added 2026-10-12) | `CONUS/SeamlessHSR_00.00` (behind IEM's lcref, ~1.3 MB every 2 min) and `HAWAII` / `CARIB` `MergedBaseReflectivityQC_00.50` (behind the NWS composites, 20-60 KB): read for the radar coverage only (-999 no radar, -99 no echo), `vlba/mrms.py` |
+| MRMS GRIB2 on NOAA Open Data (AWS `noaa-mrms-pds`, anonymous HTTPS; added 2026-10-12) | `CONUS/SeamlessHSR_00.00` (behind IEM's lcref, ~1.3 MB every 2 min) and `HAWAII` / `CARIB` `MergedBaseReflectivityQC_00.50` (behind the NWS composites, 20-60 KB): read for the radar coverage only (-999 no radar, -99 no echo), `vlba/mrms.py`. Usually ~1 min behind the data, but not by contract: 25-30 min late on 2026-11-10, a 1-h stall on 2026-09-11, 94 min never delivered on 2026-10-07 (section 15) |
+| MRMS CONUS GRIB2 in IEM's archive (`https://mtarchive.geol.iastate.edu/YYYY/MM/DD/mrms/ncep/SeamlessHSR/`, anonymous HTTPS, Apache index pages; added 2026-11-10) | the same `SeamlessHSR_00.00` files, byte for byte, from NCEP by LDM, usually within ~1 min: through the bucket's stall of 2026-09-11 within ~1 min, its lag of 2026-11-10 within 1-9 min; the 94 min of 2026-10-07 only the next morning (backfilled), though IEM's lcref frames kept coming. The CONUS mirror of the coverage (`VLBA_MRMS_CONUS_MIRROR`). No Hawaii or Caribbean products |
 | GLM lightning | GOES-19 (East, 75.2 W) and GOES-18 (West, 137.0 W) `GLM-L2-LCFA` granules on AWS Open Data (`noaa-goes19`, `noaa-goes18` buckets, anonymous HTTPS; 20-s granules, GOES-19's 300-600 KB, GOES-18's ~200 KB) | `vlba/glm.py`, parsed in RAM with numpy + h5py (netCDF4 also accepted). Each site uses the satellites whose sub-satellite point is within 62 deg of arc, where GLM's field of view ends diagonally (MK: West only; SC, HN and the GBT: East only; the other eight both). 45-75 MB per run with both satellites and the 30-min window |
 | Sun | `weather.sun` (NOAA equations) | sun up = altitude above -0.833 deg (upper limb visible) |
 | Basemap | OpenStreetMap tiles via `weather.radar` | fetched once per site and theme, cached |
@@ -116,7 +117,8 @@ vlbaweather/              the checkout
                           frame, newest, t) -> a listed frame before it, by TIME
   vlba/radarcheck.py      mrms_ring(img, lat, lon, km, dbz) / index_ring(idx, frame, ...)
   vlba/mrms.py            coverage(cfg, domain, frame_ts, sites, km) -> the radar coverage
-                          of each ring from MRMS's own GRIB2 file; site_coverage(res, slug)
+                          of each ring from MRMS's own GRIB2 file (the bucket, a CONUS
+                          mirror, an older file); site_coverage(res, slug)
   vlba/decision.py        evaluate(cfg, entry, state, now) -> verdict; load/save_state
   vlba/maps.py            VlbaSiteMap(weather.radar.SiteMap): island radar layer, rings
                           and GLM flashes drawn, caption label
@@ -144,6 +146,8 @@ vlbaweather/              the checkout
 | VLBA_RADAR_COVERAGE | 1 | read MRMS's own file of each frame for the radar coverage of the rings |
 | VLBA_RADAR_MIN_COVERAGE | 90 | % of the ring radar must cover for "no echo" to be clear |
 | VLBA_MRMS_URL | https://noaa-mrms-pds.s3.amazonaws.com | base of the MRMS bucket |
+| VLBA_MRMS_CONUS_MIRROR | IEM's archive, `.../%Y/%m/%d/mrms/ncep/SeamlessHSR/SeamlessHSR_00.00_%Y%m%d-%H%M%S.grib2.gz` | strftime pattern of a CONUS file the bucket lacks (MRMS's SeamlessHSR_00.00); "none" = the bucket only |
+| VLBA_RADAR_COVERAGE_MAX_LAG | 3600 | s (0..3600): when no source has a file within 5 min of the frame, the newest one at most this much before the frame's time stands in, the check marked stale (a radar that failed since reads "clear"; the user's choice of 2026-11-10); 0 = never |
 | VLBA_ISLAND_RADAR | 1 | NWS composites for sites outside the MRMS grid |
 | VLBA_NWSRADAR_URL | https://opengeo.ncep.noaa.gov/geoserver | base of the WMS |
 | VLBA_NWSRADAR_MAX_STALE | 2400 | s: reuse the last good composite (labelled stale; one failed 30-min run) |
@@ -176,9 +180,11 @@ run["glm"]      = glm.fetch result without "flashes" (ok, stale, error, age_s, w
                   granule of the window}, retry {G19: [epoch s of the granules to fetch
                   again, first]}, seen {G19: [epoch s of the granules examined or given
                   up]}); the state file keeps them as glm_newest / glm_retry / glm_seen
-run["radar_coverage"] = {domain: mrms.coverage result (ok, error, domain, ts, url, sites:
-                  {slug: {cells, uncovered, covered_pct}})}: CONUS once per run, an
-                  island domain per site (merged)
+run["radar_coverage"] = {domain: mrms.coverage result (ok, error, domain, ts (the file's own),
+                  url, source "bucket"|"mirror", older, behind_s, note (why the bucket's file
+                  of the frame's time was not read), sites: {slug: {cells, uncovered,
+                  covered_pct}})}: CONUS once per run, an island domain per site (merged;
+                  the farthest-behind older file marks the domain, with its own time)
 run["summary"]  = {"good": n, "bad": n, "incomplete": n}
 site entry +=
   "gridpoint":    gridpoint.fetch result (ok, stale, error, age_s, updated, update_age_min,
@@ -205,7 +211,8 @@ site entry +=
                    "frame_ts", "age_s" (islands: the copy's age), "in_ring", "nearest_km",
                    "count", "max_dbz", "error", "off" (switched off on purpose),
                    "coverage": mrms.site_coverage result (ok, error, ts, cells,
-                   uncovered, covered_pct) | {"off": True} (with a ring scan only),
+                   uncovered, covered_pct, older, behind_s, source) | {"off": True}
+                   (with a ring scan only),
                    "digest": radarcheck.ring_digest of the ring's raster,
                    "earlier": [ring checks of the frames before the newest, oldest
                    first; only where the newest shows an echo]}
@@ -583,3 +590,75 @@ and the user's answers to the open questions, changed:
   meant the browser reload, which no longer matches the data's interval).
 - On an installed host, rerun the installer right after the `git pull`: it replaces the
   `*/5` crontab line (or the timer) with the 30-minute one.
+
+
+## 15. NOAA's bucket late (2026-11-10)
+
+- The page of 22:30Z read "GOOD?" at all twelve sites, "inputs missing: Rain on radar", and
+  so did the 22:00Z run: the radar coverage of every domain failed with "no ... file within
+  5 min of 22:24:00Z (HTTP 404 ...)". The frames were current (IEM's 22:24Z, the island
+  composites' 22:28:56Z); NOAA's feed to `noaa-mrms-pds` was not: the files of 21:42Z and
+  later reached the bucket 8, 10, 13 ... 25-30 min after their time, in CONUS, HAWAII and
+  CARIB at once (S3 `LastModified` against the time in the key; ~1 min for the three days
+  before). A file 5 min from the frame's time did not exist yet, so every ring's coverage
+  was unknown and every radar check "no data", as designed for a radar outage.
+- 120 days of the bucket's listings (2026-07-13 .. 2026-11-10, every run of a 30-min
+  schedule replayed against the upload times) show three such episodes, ~0.1 % of the runs
+  but all sites each time: 2026-09-11 15:46-16:46Z, CONUS only, a stall then a burst
+  (needed: a file 10 and 40 min older than the frame); 2026-10-07 14:28-16:02Z, 94 min of
+  files never delivered in any domain (26, 56, 86 min; islands 30, 60, 90); 2026-11-10 from
+  21:42Z, 25-30 min late (8, 20; islands 12, 24).
+- IEM's archive (`mtarchive.geol.iastate.edu`, fed by NCEP over LDM) holds the same CONUS
+  files, byte for byte the bucket's (SHA-256 of 22:00Z), read by `parse_grib2`. It had them
+  within ~1 min on 2026-09-11 and within 1-9 min on 2026-11-10 (its own feed lagged up to
+  9 min from 21:42Z, then caught up by 22:24Z, while the bucket's grew to 30). The 94 min of
+  2026-10-07 reached it only the next morning (written 2026-10-08 08:15 CDT), though IEM's
+  lcref frames kept coming every 2 min: that gap was MRMS's files, not the bucket's feed.
+  IEM has no Hawaii or Caribbean products; NCEP's own server (`mrms.ncep.noaa.gov`) serves
+  CONUS only (403 for the islands, as in section 3).
+- Changed (`vlba/mrms.py`), after an independent review of a first version (three critics,
+  then four reviewers with adversarial checks, all with scripts against the code and the
+  live services):
+  * Sources: the file of the frame's time from the bucket, then from a CONUS mirror
+    (`VLBA_MRMS_CONUS_MIRROR`, a strftime pattern of MRMS's SeamlessHSR_00.00 file, IEM's
+    archive by default; "none" = off, an empty value cannot be off); then the nearest file
+    either lists within 5 min (S3 by the hour; IEM's index by the hour with `?P=`, 9 KB
+    instead of the day's 190 KB; IEM makes a day's directory with its first file, so a 404
+    within 15 min of a period's start is an empty listing, any other failed page a gap in
+    it). With IEM's own lag of
+    2026-11-10 its file of the frame's time was missing at 22:00Z, the one 2 min older
+    listed: the listing step is what keeps that run.
+  * What is read: a file counts only when it is MRMS's file of the product (GRIB2
+    discipline 209, parameter 8.8 for SeamlessHSR, 11.0 for MergedBaseReflectivityQC, read
+    from the bucket's files) and its own GRIB2 time is its name's to the second (they are
+    equal in the bucket's and IEM's files); a page instead of a file, a wrong product or
+    time, a broken PNG: the next file or source, never a guess.
+  * Bounds: 15-s attempts and one retry (a dead host ~31 s instead of ~80), no request
+    started after 60 s, two listed files per source (a host the circuit breaker gave up on
+    costs no try: the healthy one is still asked), the mirror only while 60 s of the run's
+    budget are left, each listing page once per lookup; "not looked up: ..." when nothing
+    could be sent (the budget spent), instead of claiming the files missing. Errors name
+    hosts, not URLs. A normal run still reads one file per domain.
+- The rule asked for on 2026-10-12 (a radar outage reads "no data", never "clear") now has
+  one exception, chosen by the user on 2026-11-10: while no file within 5 min of the frame's
+  time can be had, the newest one up to an hour older stands in
+  (`VLBA_RADAR_COVERAGE_MAX_LAG=3600`, 0..3600 s; 0 restores the strict rule). The review
+  set out the price: a radar that failed between that file and the frame reads "clear"
+  until a newer file shows it, up to an hour, and the islands' rings have one radar each
+  (St. Croix: TJUA). It is measured from the frame's time on the file's own time and checked
+  again in the verdict. An older file stands in only for a frame of known time that is no
+  reused copy, and only when every source listed the window around the frame completely
+  without a file in it (a failed listing page or a file there that could not be read is no
+  reason to widen the blind window); the check is marked stale and its detail says "a radar
+  that failed since would look the same", the footer pill turns amber, status.json lists
+  the coverage as "stale" (the vocabulary of the other stale copies) with `behind_s` and the
+  `note` of why, and the footer's account of the checks names the allowance.
+- The mirror's file is the frame's own: named in the footer pill, its `note` in status.json,
+  no problem.
+- Replayed against the 120 days (the bucket's S3 upload times; IEM's from its index pages,
+  to the minute): the coverage failed in 7 CONUS runs and 5 per island domain. Now CONUS
+  loses 1 (2026-10-07 16:00Z, whose newest file was 86 min older than the frame; the
+  mirror reads 2026-09-11's and 2026-11-10's files of the frame's time, older files stand
+  in for 2026-10-07 15:00Z and 15:30Z), each island domain 2 (2026-10-07 15:30Z, its newest
+  file 1-2 s more than an hour older, and 16:00Z); the islands' runs of 2026-11-10 read
+  files 12 and 24 min older.

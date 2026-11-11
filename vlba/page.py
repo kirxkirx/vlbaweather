@@ -29,6 +29,7 @@ import logging
 import os
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
+from urllib.parse import urlparse
 
 from weather import page as wp
 from weather import util
@@ -146,7 +147,10 @@ def cuts_text(cfg) -> str:
             cfg.radar_dbz, cfg.radar_km,
             "in one frame" if runs == 1 else "in %s consecutive frames" % ({2: "two", 3: "three"}.get(runs) or runs),
             util.fmt_age(cfg.radar_hold_s),
-            "; no echo is clear only where radar covers at least %g %% of the ring" % cfg.radar_min_coverage
+            "; no echo is clear only where radar covers at least %g %% of the ring%s" % (
+                cfg.radar_min_coverage,
+                " (in MRMS's file of the frame's time or, when none can be had, one up to %s older)"
+                % util.fmt_age(cfg.radar_coverage_max_lag_s) if cfg.radar_coverage_max_lag_s > 0 else "")
             if cfg.radar_coverage else ""))
     if cfg.check_enabled("glm"):
         checks.append("lightning (a GOES GLM flash within %g km, held %s)" % (cfg.glm_km, util.fmt_age(cfg.glm_hold_s)))
@@ -630,12 +634,16 @@ def _coverage_pills(cfg, run: dict, sites: List[dict]) -> List[str]:
         if c.get("ok"):
             ts = c.get("ts")
             txt = ts.astimezone(timezone.utc).strftime("%H:%MZ") if isinstance(ts, datetime) else "time unknown"
+            if c.get("older"):
+                txt += ", an older file (%s before the frame)" % util.fmt_age(wp._num(c.get("behind_s")))
+            if c.get("source") == "mirror":
+                txt += " from the mirror %s" % (urlparse(str(c.get("url") or "")).hostname or "")
             rings = c.get("sites") if _is_dict(c.get("sites")) else {}
             part = [(codes.get(slug, slug.upper()), float(r["covered_pct"])) for slug, r in sorted(rings.items())
                     if _is_dict(r) and wp._num(r.get("covered_pct")) is not None and float(r["covered_pct"]) < 100.0]
             txt += (" · " + ", ".join("%s ring %s %% covered" % (code, decision._num_txt(pct)) for code, pct in part)) \
                 if part else " · every ring fully covered"
-            dot = " warnc" if any(pct < float(cfg.radar_min_coverage) for _, pct in part) else ""
+            dot = " warnc" if c.get("older") or any(pct < float(cfg.radar_min_coverage) for _, pct in part) else ""
         else:
             dot, txt = " off", "unavailable · %s" % (c.get("error") or "no data")
         out.append('<span class="pill"><span class="dot%s"></span>Radar coverage (MRMS %s): %s</span>'
@@ -822,6 +830,8 @@ def status_doc(cfg, run: dict) -> dict:
     doc["radar_coverage"] = None if not cfg.radar_coverage else {
         domain: {"ok": bool(c.get("ok")), "error": c.get("error"),
                  "ts": c["ts"].isoformat() if isinstance(c.get("ts"), datetime) else None,
+                 "source": c.get("source"), "older": bool(c.get("older")), "behind_s": c.get("behind_s"),
+                 "note": c.get("note"),
                  "covered_pct": {slug: r.get("covered_pct") for slug, r in sorted((c.get("sites") or {}).items())
                                  if _is_dict(r)}}
         for domain, c in sorted(cov.items()) if _is_dict(c)}
@@ -829,6 +839,9 @@ def status_doc(cfg, run: dict) -> dict:
         if not c["ok"]:
             probs.append("radar coverage (MRMS %s): unavailable" % domain)
             continue
+        if c["older"]:
+            # usable, like a stale copy elsewhere (behind_s says how far, note why)
+            probs.append("radar coverage (MRMS %s): stale" % domain)
         for slug, pct in c["covered_pct"].items():
             if pct is not None and float(pct) < float(cfg.radar_min_coverage):
                 # a stable text (the percentage is in radar_coverage)

@@ -143,10 +143,39 @@ def test_state_file_path_is_expanded(monkeypatch, tmp_path):
     {"VLBA_GLM_TIMEOUT": "1"}, {"VLBA_GLM_WORKERS": "0"}, {"VLBA_NWSRADAR_URL": "ftp://x"},
     {"VLBA_VETO_ONSET_LEAD": "-1"}, {"VLBA_RADAR_MIN_COVERAGE": "101"}, {"VLBA_RADAR_MIN_COVERAGE": "-1"},
     {"VLBA_MRMS_URL": "s3://noaa-mrms-pds"},
+    {"VLBA_RADAR_COVERAGE_MAX_LAG": "-1"}, {"VLBA_RADAR_COVERAGE_MAX_LAG": "3601"},
+    {"VLBA_RADAR_COVERAGE_MAX_LAG": "1800.5"},
+    {"VLBA_MRMS_CONUS_MIRROR": "ftp://m.example/%Y/SeamlessHSR_00.00_%Y%m%d-%H%M%S.grib2.gz"},
+    {"VLBA_MRMS_CONUS_MIRROR": "https://m.example/%Y/SeamlessHSR_00.00_%Y%m%d-%H%M.grib2.gz"},      # no seconds
+    {"VLBA_MRMS_CONUS_MIRROR": "https://m.example/%j/SeamlessHSR_00.00_%Y%m%d-%H%M%S.grib2.gz"},    # %j
+    {"VLBA_MRMS_CONUS_MIRROR": "https://m.example/%M/SeamlessHSR_00.00_%Y%m%d-%H%M%S.grib2.gz"},    # dir by minute
+    {"VLBA_MRMS_CONUS_MIRROR": "https://m.example/%Y%m%d-%H%M%S/SeamlessHSR_00.00.grib2.gz"},       # time not in the name
+    {"VLBA_MRMS_CONUS_MIRROR": "https://m.example/%Y/SeamlessHSR_00.00_%Y%m%d-%H%M%S.grib2.gz%"},   # a last "%"
+    {"VLBA_MRMS_CONUS_MIRROR": "https://m.example/100%%/SeamlessHSR_00.00_%Y%m%d-%H%M%S.grib2.gz"},  # "%%"
+    {"VLBA_MRMS_CONUS_MIRROR": "https://m.example/%Y/PrecipFlag_00.00_%Y%m%d-%H%M%S.grib2.gz"},     # another product
 ])
 def test_bad_values_are_startup_errors(monkeypatch, tmp_path, env):
     with pytest.raises(ValueError):
         _cfg(monkeypatch, tmp_path, **env)
+
+
+def test_the_conus_mirror_and_the_coverage_lag(monkeypatch, tmp_path):
+    """The mirror is on by default and "none" switches it off (an empty value cannot: the cron
+    wrapper skips it and the parent reads it as unset). An older coverage file may lie up to
+    an hour before the frame (the user's choice of 2026-11-10); 0 keeps the strict rule."""
+    c = _cfg(monkeypatch, tmp_path)
+    assert c.radar_coverage_max_lag_s == 3600
+    assert _cfg(monkeypatch, tmp_path, VLBA_RADAR_COVERAGE_MAX_LAG="0").radar_coverage_max_lag_s == 0
+    assert c.mrms_conus_mirror == ("https://mtarchive.geol.iastate.edu/%Y/%m/%d/mrms/ncep/SeamlessHSR/"
+                                   "SeamlessHSR_00.00_%Y%m%d-%H%M%S.grib2.gz")
+    for off in ("none", "NONE", " none "):
+        assert _cfg(monkeypatch, tmp_path, VLBA_MRMS_CONUS_MIRROR=off).mrms_conus_mirror == ""
+    assert _cfg(monkeypatch, tmp_path, VLBA_MRMS_CONUS_MIRROR="").mrms_conus_mirror == c.mrms_conus_mirror
+    c = _cfg(monkeypatch, tmp_path, VLBA_MRMS_CONUS_MIRROR=" http://m.example/%Y/SeamlessHSR_00.00_%Y%m%d-%H%M%S.gz ",
+             VLBA_RADAR_COVERAGE_MAX_LAG="1800")
+    assert c.mrms_conus_mirror == "http://m.example/%Y/SeamlessHSR_00.00_%Y%m%d-%H%M%S.gz"
+    assert c.radar_coverage_max_lag_s == 1800
+    assert _cfg(monkeypatch, tmp_path, VLBA_RADAR_COVERAGE_MAX_LAG="3600").radar_coverage_max_lag_s == 3600
 
 
 def test_parse_helpers():

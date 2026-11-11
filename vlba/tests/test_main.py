@@ -7,8 +7,9 @@ from __future__ import annotations
 import io
 import json
 import os
+import re
 import sys
-from datetime import timedelta, timezone
+from datetime import datetime, timedelta, timezone
 from urllib.parse import urlencode
 
 import pytest
@@ -18,7 +19,7 @@ from weather import geo, http, util
 import make_vlba_page as mvp                     # noqa: E402  (conftest put vlbaweather on sys.path)
 from vlba import decision, glm, nwsradar
 from vlba.sites import SITES
-from vlba.tests.conftest import MK, PT, grib2_around
+from vlba.tests.conftest import ISLAND_PARAMETER, MK, PT, grib2_around
 
 UTC = timezone.utc
 TILE_RGB = (40, 44, 52)
@@ -209,9 +210,21 @@ def add_routes(fake_http, cfg, pt_obs=None, pt_grid=None, alerts=None, mk_blobs=
     fake_http.add("GetCapabilities", caps_doc())
     mk_frame = geo.MapFrame(MK["lat"], MK["lon"], cfg.map_km, cfg.map_px, cfg.tile_zoom)
     fake_http.add("GetMap", island_png(mk_frame, mk_blobs))
-    fake_http.add("CONUS/SeamlessHSR_00.00/", grib2_around(PT["lat"], PT["lon"], frame_ts(), holes=pt_holes))
+    # each file holds the data of the time its name gives, as MRMS's do (vlba.mrms checks it)
+    fake_http.add("CONUS/SeamlessHSR_00.00/", lambda url: grib2_around(PT["lat"], PT["lon"], _file_time(url),
+                                                                       holes=pt_holes))
     fake_http.add("HAWAII/MergedBaseReflectivityQC_00.50/",
-                  grib2_around(MK["lat"], MK["lon"], island_ts(), holes=mk_holes, cell_deg=0.005))
+                  lambda url: grib2_around(MK["lat"], MK["lon"], _file_time(url), holes=mk_holes, cell_deg=0.005,
+                                           parameter=ISLAND_PARAMETER))
+
+
+def _file_time(url):
+    """The time an MRMS file's name gives (a listing request gets no file: an empty listing
+    would not parse as one anyway)."""
+    m = re.search(r"_(\d{8}-\d{6})\.grib2(?:\.gz)?$", url)
+    if not m:
+        raise http.HttpError("fake: %s is no MRMS file" % url)
+    return datetime.strptime(m.group(1), "%Y%m%d-%H%M%S").replace(tzinfo=timezone.utc)
 
 
 def read_status(cfg):
@@ -923,6 +936,79 @@ def test_radar_coverage_that_cannot_be_read_is_no_data_and_a_problem(cfg, fake_h
     assert _radar_row(mk)["state"] == "ok"
     assert any(e.startswith("radar coverage (MRMS CONUS) unavailable: ") for e in run["errors"])
     assert "radar coverage (MRMS CONUS): unavailable" in read_status(cfg)["problems"]
+
+
+def test_a_late_bucket_is_covered_by_the_mirror(cfg, fake_http, quiet_sky):
+    """2026-11-10 22:30Z: NOAA's bucket 25-30 min late in every domain. The CONUS file of the
+    frame's time comes from the mirror (IEM's archive): the radar check reads "clear" as with
+    the bucket's file, and nothing is amiss. Hawaii has no mirror, and the bucket answers
+    nothing here, not even its listing: no older file can stand in, the check reads "no data"."""
+    add_routes(fake_http, cfg)
+    fake_http.routes[:0] = [
+        ("noaa-mrms-pds.s3.amazonaws.com/", None, False),               # the bucket has no file of these times
+        ("mtarchive.geol.iastate.edu/", lambda url: grib2_around(PT["lat"], PT["lon"], _file_time(url)), True)]
+    run = mvp.run_once(cfg)
+    pt, mk = run["sites"]
+    c = _radar_row(pt)
+    assert c["state"] == "ok" and not c["stale"] and "older" not in c["detail"]
+    assert pt["radar_check"]["coverage"]["source"] == "mirror" and not pt["radar_check"]["coverage"]["older"]
+    c = _radar_row(mk)
+    assert c["state"] == "unknown" and "radar coverage of the ring is unknown" in c["detail"]
+    st = read_status(cfg)
+    assert st["radar_coverage"]["CONUS"]["source"] == "mirror" and not st["radar_coverage"]["CONUS"]["older"]
+    assert st["radar_coverage"]["CONUS"]["note"].startswith("bucket: fake: no route for noaa-mrms-pds.s3.amazonaws.com")
+    assert not any("MRMS CONUS" in p for p in st["problems"]) and "radar coverage (MRMS HAWAII): unavailable" in st["problems"]
+    assert "from the mirror mtarchive.geol.iastate.edu" in read_page(cfg)
+
+
+def test_an_older_island_file_stands_in(cfg, fake_http, quiet_sky):
+    """The bucket late, at the default VLBA_RADAR_COVERAGE_MAX_LAG (an hour): Hawaii's newest
+    file, 20 min older than the frame, stands in. The check reads "clear" but stale, saying
+    what the older file cannot show; the footer is amber and status.json lists the coverage
+    as stale."""
+    add_routes(fake_http, cfg)
+    old = island_ts() - timedelta(minutes=20, seconds=30)           # 20 min whatever second ticks over meanwhile
+    old_key = "HAWAII/MergedBaseReflectivityQC_00.50/%s/MRMS_MergedBaseReflectivityQC_00.50_%s.grib2.gz" % (
+        old.strftime("%Y%m%d"), old.strftime("%Y%m%d-%H%M%S"))
+    fake_http.routes[:0] = [
+        ("list-type=2&prefix=HAWAII/", ("<ListBucketResult><Contents><Key>%s</Key></Contents></ListBucketResult>"
+                                        % old_key).encode(), True),
+        (old_key, grib2_around(MK["lat"], MK["lon"], old, cell_deg=0.005, parameter=ISLAND_PARAMETER), True),
+        ("HAWAII/MergedBaseReflectivityQC_00.50/", None, False)]       # no file of the frame's time
+    run = mvp.run_once(cfg)
+    mk = run["sites"][1]
+    c = _radar_row(mk)
+    assert c["state"] == "ok" and c["stale"] and not mk["verdict"]["incomplete"] and mk["radar_check"]["coverage"]["older"]
+    assert c["detail"].endswith(", 20 min before the frame): a radar that failed since would look the same")
+    st = read_status(cfg)
+    assert st["radar_coverage"]["HAWAII"]["older"] and 1225 <= st["radar_coverage"]["HAWAII"]["behind_s"] <= 1235
+    assert "radar coverage (MRMS HAWAII): stale" in st["problems"]
+    assert ", an older file (20 min before the frame)" in read_page(cfg)
+
+
+def test_a_reused_frame_takes_no_older_coverage_file(cfg, fake_http, monkeypatch):
+    """A frame reused after a failed fetch (stale) is older than it looks; with the bucket
+    late, an older coverage file on top of it would widen the blind window further: none
+    stands in, the check reads "no data" and the coverage is no stale copy in status.json."""
+    _quiet_glm(monkeypatch)
+    monkeypatch.setattr(mvp.mwp.radar, "load_frame", lambda cfg, cache: dict(_mrms_result(()), stale=True))
+    cfg.mrms_conus_mirror = ""
+    add_routes(fake_http, cfg)
+    old = frame_ts() - timedelta(minutes=20)
+    old_key = "CONUS/SeamlessHSR_00.00/%s/MRMS_SeamlessHSR_00.00_%s.grib2.gz" % (
+        old.strftime("%Y%m%d"), old.strftime("%Y%m%d-%H%M%S"))
+    fake_http.routes[:0] = [
+        ("list-type=2&prefix=CONUS/", ("<ListBucketResult><Contents><Key>%s</Key></Contents></ListBucketResult>"
+                                       % old_key).encode(), True),
+        (old_key, grib2_around(PT["lat"], PT["lon"], old), True),
+        ("CONUS/SeamlessHSR_00.00/", None, False)]                      # no file of the frame's time
+    run = mvp.run_once(cfg)
+    pt = run["sites"][0]
+    assert pt["radar_check"]["stale"] and not pt["radar_check"]["coverage"]["ok"]
+    assert _radar_row(pt)["state"] == "unknown"
+    st = read_status(cfg)
+    assert "radar coverage (MRMS CONUS): unavailable" in st["problems"]
+    assert "radar coverage (MRMS CONUS): stale" not in st["problems"]
 
 
 def test_radar_coverage_off_reads_nothing(cfg, fake_http, quiet_sky):
