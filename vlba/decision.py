@@ -1,11 +1,11 @@
 """The GOOD / BAD verdict for one antenna: the weather cuts of ttustatus (the TTU Alpaca
 SafetyMonitor), applied to what a site without local sensors can know.
 
-Inputs are the site entry built by ``make_vlba_page`` (DESIGN: PLAN.md section 5) and the
+Inputs are the site entry built by ``make_vlba_page`` and the
 persisted per-site state (holds and the radar streak). ``evaluate`` is pure apart from the
 state dict it is handed, which it updates in place; nothing here fetches anything.
 
-The checks (PLAN.md section 4; every threshold is a ``VlbaConfig`` field):
+The checks (README.md, "The verdict"; every threshold is a ``VlbaConfig`` field):
 
 * ``warning``: an NWS product of ``cfg.veto_event_names`` AT the site (the parent's
   classification: a polygon product contains the site, a zone product lists one of its

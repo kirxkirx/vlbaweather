@@ -187,7 +187,6 @@ deploy/
   apache-vlbaweather.conf  Alias /vlbaweather → output dir, no listings, short Cache-Control
 vlbaweather.env.example  every WEATHER_* and VLBA_* variable with its default
 run_local.sh             local preview: regenerate every 30 min and serve on port 8080
-PLAN.md                  the design and the decisions
 .github/workflows/ci.yml lint, tests and shell syntax on Python 3.9 and 3.12
 ```
 
