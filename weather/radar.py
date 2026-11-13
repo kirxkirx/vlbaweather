@@ -241,6 +241,8 @@ def _probe_frames(cfg, now: Optional[datetime] = None) -> Tuple[Optional[dict], 
         ts = start - timedelta(minutes=2 * i)
         try:
             url = ts.strftime(cfg.mrms_archive)
+            url.encode("ascii")     # a URL is ASCII (strftime lets a lone surrogate through
+            #                         from Python 3.12 on, where it raised before)
         except Exception as e:      # noqa: BLE001 - a bad pattern fails for every step alike
             log.warning("bad MRMS archive pattern %r: %s", cfg.mrms_archive, e)
             return None, "bad MRMS archive pattern (%s)" % _err_name(e)

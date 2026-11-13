@@ -107,6 +107,10 @@ RING_BOX_CELLS_MAX = 2000000
 # A gzip'ed file is inflated to at most this many bytes: the CONUS file is 1.05 MB inflated
 # (measured 2026-11-13), the islands' under 0.1 MB.
 INFLATED_MAX = 32 * 1024 * 1024
+# ... and inflated this much at a time, so that it holds at most INFLATED_MAX plus a step.
+# One call for the whole file would hold it twice from Python 3.10 on: zlib collects the
+# output in blocks there and copies them into one at the end.
+INFLATE_STEP = 1024 * 1024
 # A cell's value counts as radar coverage only within this range: -99 is "covered, no echo",
 # MRMS's echoes lie within about -30 .. 80 dBZ (the CONUS file of 2026-11-12 23:32Z: -30 to
 # 78.3), -999 is "no coverage". Anything else (another flag, a broken packing) is not coverage.
@@ -433,14 +437,21 @@ def _gunzip(body: bytes) -> bytes:
     """A gzip'ed file inflated, at most ``INFLATED_MAX`` bytes of it: ValueError for one that
     inflates to more, is cut short or has data after its end (zero padding aside)."""
     z = zlib.decompressobj(16 + zlib.MAX_WBITS)       # the gzip wrapper
-    raw = z.decompress(body, INFLATED_MAX)
-    if z.unconsumed_tail or (not z.eof and len(raw) >= INFLATED_MAX):
-        raise ValueError("the file inflates to more than %d MB" % (INFLATED_MAX // (1024 * 1024)))
+    parts, size, data = [], 0, body
+    while not z.eof:
+        piece = z.decompress(data, INFLATE_STEP)
+        data = z.unconsumed_tail
+        if not piece:                   # nothing more to inflate, and the stream not ended
+            break
+        size += len(piece)
+        if size > INFLATED_MAX:
+            raise ValueError("the file inflates to more than %d MB" % (INFLATED_MAX // (1024 * 1024)))
+        parts.append(piece)
     if not z.eof:
         raise ValueError("the gzip stream is cut short")
     if z.unused_data.strip(b"\0"):
         raise ValueError("%d bytes after the gzip stream" % len(z.unused_data))
-    return raw
+    return b"".join(parts)
 
 
 def _read(body: bytes, product: str, file_ts: datetime):

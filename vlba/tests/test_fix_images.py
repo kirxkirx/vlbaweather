@@ -328,9 +328,14 @@ def test_truncated_frame_is_refused_without_pillows_text(cfg, cache, fake_http):
     _clean(str(e.value))
 
 
-def test_bad_archive_pattern_is_named_by_class(cfg, fake_http):
-    # a lone surrogate cannot be encoded for strftime: the pattern fails before any request
-    cfg.mrms_archive = "https://example.org/%Y/\ud800.png?key=s3cret"
+@pytest.mark.parametrize("pattern", [
+    # a lone surrogate: strftime raised for it up to Python 3.11, and lets it through from 3.12
+    "https://example.org/%Y/\ud800.png?key=s3cret",
+    # a URL is ASCII: no request could carry this one, on any Python
+    "https://example.org/%Y/café_%Y%m%d-%H%M00.png?key=s3cret"])
+def test_bad_archive_pattern_is_named_by_class(cfg, fake_http, pattern):
+    """The pattern fails before any request, and the reason names no URL (nor its key)."""
+    cfg.mrms_archive = pattern
     found, why = radar._probe_frames(cfg)
     assert found is None and why == "bad MRMS archive pattern (UnicodeEncodeError)"
     assert fake_http.calls == []

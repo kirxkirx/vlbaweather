@@ -196,6 +196,22 @@ def test_a_gzip_bomb_is_not_inflated(cfg, fake_http):
     assert peak < mrms.INFLATED_MAX + (8 << 20)
 
 
+def test_gzip_is_inflated_in_steps():
+    """INFLATE_STEP at a time: a file of several steps comes out whole, one of exactly
+    INFLATED_MAX passes and one byte more does not, and a stream that stops at a step's end
+    without its trailer is cut short."""
+    raw = bytes(range(256)) * (mrms.INFLATE_STEP * 5 // 512 + 1)     # two and a half steps
+    assert mrms._gunzip(gzip.compress(raw)) == raw
+    full = b"\0" * mrms.INFLATED_MAX
+    assert len(mrms._gunzip(gzip.compress(full))) == mrms.INFLATED_MAX
+    with pytest.raises(ValueError, match="inflates to more than 32 MB"):
+        mrms._gunzip(gzip.compress(full + b"\0"))
+    z = zlib.compressobj(9, zlib.DEFLATED, 16 + zlib.MAX_WBITS)
+    open_ended = z.compress(b"\1" * (2 * mrms.INFLATE_STEP)) + z.flush(zlib.Z_SYNC_FLUSH)
+    with pytest.raises(ValueError, match="cut short"):
+        mrms._gunzip(open_ended)
+
+
 def test_gzip_is_read_whole_or_not_at_all():
     good = grib2_around(LAT, LON, TS)
     assert mrms._read(good + b"\0\0\0", mrms.PRODUCTS["CONUS"], TS)[0]["ts"] == TS     # zero padding

@@ -17,54 +17,50 @@ log = logging.getLogger("weather.util")
 _tz_warned = set()
 _iso_warned = set()
 
-# The spellings of ISO 8601 that Python 3.9's fromisoformat refuses although they are valid
-# and mean one instant: a lower-case "t" or "z", a fraction of other than 3 or 6 digits, an
-# offset without its colon (+0000) or without minutes (+00), blanks around the text.
-# (A fraction only after the seconds: "10:53.5" is a fraction of a minute, not 10:53:00.5.)
-_ISO_LOOSE = re.compile(r"^(\d{4}-\d{2}-\d{2})[Tt ](\d{2}:\d{2}(?::\d{2})?)(?:(?<=:\d{2}:\d{2})[.,](\d{1,12}))?"
-                        r"(?:([Zz])|([+-])(\d{2}):?(\d{2})?)?\Z")
+# The ISO 8601 times parse_iso reads: a date, alone or with a time of day to the hour, minute
+# or second; a fraction only after the seconds, of up to 12 digits (cut to microseconds); an
+# offset Z, +hh, +hhmm or +hh:mm. Also read: a lower-case "t" or "z", a blank for the "T",
+# blanks around the text. Matched here and not left to datetime.fromisoformat, which reads
+# more from Python 3.11 on, some of it wrongly ("10:53.5" as 10:53:00.5 where ISO 8601 means
+# half a minute past 10:53; 3.9 itself reads "10:53.500" so): the same text gives the same
+# time on every Python.
+_ISO = re.compile(r"(\d{4})-(\d{2})-(\d{2})"
+                  r"(?:[Tt ](\d{2})(?::(\d{2})(?::(\d{2})(?:[.,](\d{1,12}))?)?)?"
+                  r"(?:([Zz])|([+-])(\d{2})(?::?(\d{2}))?)?)?\Z", re.ASCII)
 
 
 # ---- time ----------------------------------------------------------------------
 def parse_iso(s: Optional[str]) -> Optional[datetime]:
-    """ISO-8601 with offset (NWS style, incl. trailing 'Z') -> aware datetime, or None.
+    """ISO 8601 time (NWS style, with an offset or a trailing 'Z') -> aware datetime, or None.
 
-    Also read, the same on every Python from 3.9 on: the spellings ``_ISO_LOOSE`` lists.
-    A text without an offset is taken as UTC, and a date alone as its midnight UTC: some
-    feeds (the road and storm reports) write UTC that way, and refusing it would cost them
-    their times. A text that is not a time is None, with one log line per distinct text."""
+    Read: the forms ``_ISO`` lists, alike on every Python from 3.9 on. A text without an
+    offset is taken as UTC, and a date alone as its midnight UTC: some feeds (the road and
+    storm reports) write UTC that way, and refusing it would cost them their times. A text
+    that is not such a time is None, with one log line per distinct text."""
     if not s or not isinstance(s, str):
         return None
-    try:
-        dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
-    except ValueError:
-        dt = _parse_iso_loose(s)
-        if dt is None:
-            if s not in _iso_warned and len(_iso_warned) < 100:
-                _iso_warned.add(s)
-                log.warning("not an ISO 8601 time: %.60r", s)
-            return None
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
+    dt = _iso_time(s.strip())
+    if dt is None and s not in _iso_warned and len(_iso_warned) < 100:
+        _iso_warned.add(s)
+        log.warning("not an ISO 8601 time: %.60r", s)
     return dt
 
 
-def _parse_iso_loose(s: str) -> Optional[datetime]:
-    """``parse_iso`` for the spellings of ``_ISO_LOOSE``, rewritten into the one form
-    fromisoformat reads on 3.9 (6-digit fraction, +hh:mm). None when it is none of them."""
-    m = _ISO_LOOSE.match(s.strip())
+def _iso_time(s: str) -> Optional[datetime]:
+    """``parse_iso`` of a stripped text, without its log line."""
+    m = _ISO.match(s)
     if not m:
         return None
-    day, clock, frac, zulu, sign, oh, om = m.groups()
-    text = "%sT%s" % (day, clock if clock.count(":") == 2 else clock + ":00")
-    if frac:
-        text += "." + (frac + "000000")[:6]
-    if zulu:
-        text += "+00:00"
-    elif sign:
-        text += "%s%s:%s" % (sign, oh, om or "00")
+    year, month, day, hh, mm, ss, frac, _z, sign, oh, om = m.groups()
+    tz = timezone.utc
     try:
-        return datetime.fromisoformat(text)
+        if sign:
+            if int(om or 0) > 59:
+                return None
+            off = timedelta(hours=int(oh), minutes=int(om or 0))
+            tz = timezone(-off if sign == "-" else off)
+        return datetime(int(year), int(month), int(day), int(hh or 0), int(mm or 0), int(ss or 0),
+                        int((frac or "")[:6].ljust(6, "0")), tzinfo=tz)
     except ValueError:                  # 25:00, February 30, an offset of 24 h or more
         return None
 

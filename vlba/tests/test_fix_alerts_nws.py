@@ -528,3 +528,27 @@ def test_parse_iso_reads_no_fraction_of_a_minute():
     assert util.parse_iso("2026-11-12 10:53.5") is None
     assert util.parse_iso("2026-11-12T10:53,5Z") is None
     assert util.parse_iso("2026-11-12T10:53:00,25+0530") == datetime(2026, 11, 12, 5, 23, 0, 250000, tzinfo=UTC)
+
+
+@pytest.mark.parametrize("text", [
+    "2026-11-12T10:53.500Z",                # a fraction of a minute (3.9's fromisoformat: 10:53:00.5)
+    "2026-11-12T10.5Z",                     # a fraction of an hour (likewise: 10:00:00.5)
+    "20261112T105300Z", "2026-W46-4", "2026-316",      # basic format, week and ordinal dates (3.11+)
+    "2026-11-12+00:00",                     # an offset on a date (3.9: its midnight, "+" taken as the "T")
+    "2026-11-12x10:53:00Z",                 # another separator
+    "2026-11-12T10:53:00+05:30:15",         # an offset with seconds
+    "2026-11-12T10:53:00+05:75",            # an offset of 75 minutes
+    "2026-11-12T24:00:00Z",                 # ISO 8601's end of the day: not read
+    "２０２６-11-12"])      # full-width digits
+def test_parse_iso_reads_the_same_on_every_python(text, monkeypatch):
+    """What datetime.fromisoformat reads besides the forms parse_iso lists, on one Python
+    version or all, is no time here on any: the CI runs 3.9 and a current Python, and a
+    production host may run either."""
+    monkeypatch.setattr(util, "_iso_warned", set())
+    assert util.parse_iso(text) is None
+
+
+def test_parse_iso_reads_a_time_to_the_hour():
+    """Read by fromisoformat on every Python, and kept: ISO 8601's reduced precision."""
+    assert util.parse_iso("2026-11-12T10") == datetime(2026, 11, 12, 10, tzinfo=UTC)
+    assert util.parse_iso("2026-11-12T03-07") == datetime(2026, 11, 12, 10, tzinfo=UTC)
