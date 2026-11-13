@@ -16,9 +16,10 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # 3.9 is the production floor (RHEL 9 / Debian 11 system python); a current
-        # release catches deprecations early.
-        python-version: ["3.9", "3.12"]
+        # 3.9 is the production floor (RHEL 9 / Debian 11 system python). 3.12 and 3.14 are
+        # newer releases a host may run: they catch what changed since 3.9 (fromisoformat,
+        # strftime and zlib did by 3.12) and deprecations early.
+        python-version: ["3.9", "3.12", "3.14"]
     steps:
       # Node 24 releases (checkout v4 and setup-python v5 run on the retired Node 20), pinned
       # by commit: a tag can be moved to other code, a commit hash cannot. To update, look up
@@ -32,9 +33,9 @@ jobs:
       # Pillow is the only runtime dependency; numpy and h5py are the optional GLM lightning
       # layer, installed so its granule-parser tests run (they are skipped without them);
       # netCDF4 is the layer's other reader, installed so its tests run too. Not pinned, on
-      # purpose: like the 3.12 leg, the current releases catch deprecations early. The
-      # tests block urllib outright and feed every module through the fake_http fixture, so
-      # this is the real environment the suite must pass in: no network, no fonts beyond
+      # purpose: like the 3.12 and 3.14 legs, the current releases catch deprecations early.
+      # The tests block urllib outright and feed every module through the fake_http fixture,
+      # so this is the real environment the suite must pass in: no network, no fonts beyond
       # Pillow's default. shellcheck-py puts a shellcheck binary on PATH, which turns on the
       # suite's shellcheck test for the deploy scripts (skipped where shellcheck is missing).
       - name: Install dependencies

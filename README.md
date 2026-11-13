@@ -205,7 +205,7 @@ deploy/
                          listings, short Cache-Control, security headers
 vlbaweather.env.example  every WEATHER_* and VLBA_* variable with its default
 run_local.sh             local preview: regenerate every 30 min and serve on port 8080
-.github/workflows/ci.yml lint, tests and shell syntax on Python 3.9 and 3.12
+.github/workflows/ci.yml lint, tests and shell syntax on Python 3.9, 3.12 and 3.14
 ```
 
 `weather/` is the parent's library as of 2026-10-15, with the origin notes at the top of
@@ -264,7 +264,7 @@ the page, the whole run with a CONUS and an island antenna and with every source
 CLI exit codes, and the deploy files (the env example against the real defaults, the cron
 wrapper against a stub generator, DRY_RUN renders of both installers). CI
 (`.github/workflows/ci.yml`) runs the lint, the suite and the shell syntax checks on Python
-3.9 and 3.12. The publish check reads private names from the git-ignored file
+3.9, 3.12 and 3.14. The publish check reads private names from the git-ignored file
 `.private-patterns` at the top of the checkout (or the file named by `LWA_PRIVATE_PATTERNS`);
 the installers' shared functions are compared with the parent's when `LWA_CHECKOUT` names a
 checkout of it.
