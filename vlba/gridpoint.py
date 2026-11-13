@@ -18,15 +18,22 @@ Why it looks the way it does:
   the old grid). Without usable metadata (NWS down) the last good copy is served for
   ``cfg.gridpoint_max_stale``, labelled stale, like every other NWS product.
 * Nothing here raises on data problems. A malformed entry is skipped with a log line; a
-  malformed series is listed in ``unusable`` (the verdict: "unknown"); a series NWS does
-  not produce for a grid (HFO and SJU have no probabilityOfThunder, SJU no snowfall or ice
-  accumulation: an empty ``values`` list) is listed in ``missing`` (the verdict: "not
-  provided"). Either way its column is None, never a fake 0: the distinction between
-  "0 %" and "not forecast" matters.
+  malformed series, or one in a unit this module does not know, is listed in ``unusable``
+  (the verdict: "unknown"); a series that is absent or has an empty ``values`` list is
+  listed in ``missing``. Empty is how an office sends what it does not produce (HFO and SJU
+  have no probabilityOfThunder, SJU no snowfall or ice accumulation), but a broken product
+  looks the same, so ``absent`` names the missing series the site's office is NOT known to
+  leave out (``vlba.sites.series_not_provided``): the verdict reads "not provided" for a
+  missing series only when it is not in ``absent``, and "unknown" otherwise. Either way its
+  column is None, never a fake 0: the distinction between "0 %" and "not forecast" matters.
 * Precipitation, snowfall and ice are amounts over each run (often 6 h): every hour of the
   run carries the run's total, and ``periods`` says which run, so a reason can name it.
-* Units are what the API sends (the raw gridpoint is always SI): percent, mm, km/h, degC,
-  metres. Values are floats or None; nothing is rounded here, the page formats.
+* The rows are in percent, mm, km/h and degC, which is what the raw gridpoint sends today
+  (checked 2026-11-12), but the unit of every series (``uom``) is read, not assumed
+  (``UNITS``): wind in m/s, knots or miles per hour is converted, anything else makes the
+  series ``unusable``. Values are floats or None; nothing is rounded here, the page formats.
+* The ``weather`` series says "nothing forecast" with an entry of nulls, which the rows
+  drop; ``weather_covered`` keeps the difference between that and an hour no run covers.
 """
 from __future__ import annotations
 
@@ -36,6 +43,8 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 from weather import nws, util
+
+from . import sites as _sites
 
 log = logging.getLogger("vlba.gridpoint")
 
@@ -58,6 +67,24 @@ WEATHER_KEYS = ("coverage", "weather", "intensity")     # what a row's weather e
 # repeated in every hour of the run): a row gives their run in ``periods``.
 ACCUMULATIONS = ("qpf_mm", "snow_mm", "ice_mm")
 
+# The units a series may come in (the ``uom`` without its namespace: "wmoUnit:km_h-1" ->
+# "km_h-1") and the factor to the unit of its row key. A series in another unit is unusable:
+# a wind in m/s read as km/h would pass the wind limit 3.6 times too easily. ``weather``
+# has no unit.
+_SPEED = {"km_h-1": 1.0, "m_s-1": 3.6, "kn": 1.852, "mi_h-1": util.mph_to_kmh(1.0)}
+_PERCENT = {"percent": 1.0}
+_MM = {"mm": 1.0}
+UNITS: Dict[str, Dict[str, float]] = {
+    "sky_cover_pct": _PERCENT, "pop_pct": _PERCENT, "thunder_pct": _PERCENT, "rh_pct": _PERCENT,
+    "qpf_mm": _MM, "snow_mm": _MM, "ice_mm": _MM,
+    "wind_kmh": _SPEED, "gust_kmh": _SPEED,
+    "temp_c": {"degC": 1.0},
+}
+# The series NWS sends without any ``uom``: probabilityOfThunder had none at the ten sites
+# whose office produces it (2026-11-12), every other series with values had one. Anywhere else a
+# missing unit is an unknown unit.
+UNIT_OPTIONAL = ("thunder_pct",)
+
 # A run longer than this is truncated: the grid covers about a week, and a corrupt
 # duration must not expand into millions of hours.
 MAX_RUN_HOURS = 24 * 14
@@ -66,6 +93,10 @@ MAX_RUN_HOURS = 24 * 14
 # blowing_snow, sleet, ice_pellets, freezing_rain, freezing_drizzle, and also freezing_fog,
 # freezing_spray, ice_fog and ice_crystals (rime / icing on the structure). Not hail, frost.
 WINTER_WORDS = frozenset(("snow", "sleet", "freezing", "ice"))
+
+# The error of a site whose /points answer has no forecast grid although the site is not
+# entered as gridless (public text: it reaches the page).
+NO_GRID = "NWS named no forecast grid for this site"
 
 _DURATION = re.compile(r"^P(?:(\d+)D)?(?:T(?:(\d+)H)?(?:(\d+)M)?)?$")
 _GRID_ID = re.compile(r"^[A-Za-z0-9_-]{1,16}$")        # goes into a URL path: keep it boring
@@ -188,18 +219,65 @@ def _weather_entries(value: Any) -> List[dict]:
     return out
 
 
+def unit_factor(key: str, series: Any) -> float:
+    """The factor that turns the values of a FIELDS series into the unit of its row key
+    (``UNITS``): 1.0 for km/h, percent, mm and degC, 3.6 for a wind in m/s, and so on.
+    ValueError for a unit that is not understood, and for a missing one except where NWS
+    sends none (``UNIT_OPTIONAL``): the caller lists the series as unusable."""
+    units = UNITS.get(key)
+    if units is None:
+        return 1.0
+    uom = series.get("uom") if isinstance(series, dict) else None
+    if uom is None or uom == "":
+        if key in UNIT_OPTIONAL:
+            return 1.0
+        raise ValueError("no unit (uom); expected %s" % " or ".join(sorted(units)))
+    unit = uom.rpartition(":")[2].strip() if isinstance(uom, str) else None
+    if unit not in units:
+        raise ValueError("unit %r not understood; expected %s" % (uom, " or ".join(sorted(units))))
+    return units[unit]
+
+
+def _scaled(m: Dict[datetime, Tuple[Any, datetime, int]],
+            factor: float) -> Dict[datetime, Tuple[Any, datetime, int]]:
+    """The expanded runs with every number multiplied by ``factor``; what is not a number
+    stays as it is (the rows make None of it)."""
+    out: Dict[datetime, Tuple[Any, datetime, int]] = {}
+    for hour, (v, start, hours) in m.items():
+        q = None if isinstance(v, bool) else util.quantity(v)
+        out[hour] = (v if q is None else q * factor, start, hours)
+    return out
+
+
+def _weather_said(value: Any) -> bool:
+    """Whether an hour's weather value is an answer: a list with at least one entry object.
+    NWS writes "nothing forecast" as one entry of nulls (every run of the twelve gridpoints
+    on 2026-11-12), so None (no run covers the hour, or a null run) and an empty list are
+    no statement about the hour."""
+    return isinstance(value, list) and any(isinstance(e, dict) for e in value)
+
+
 def _expand_all(props: dict, slug: str) -> Tuple[Dict[str, Dict[datetime, Tuple[Any, datetime, int]]],
                                                  List[str], List[str]]:
-    """Every FIELDS series expanded (``expand_runs``), the sorted row keys of the series
-    that are absent or empty (``missing``: what the office does not produce, like HFO's and
-    SJU's thunder probability) and of the ones that are malformed (``unusable``: logged, a
-    payload problem of this run, never a quiet "not produced")."""
+    """Every FIELDS series expanded (``expand_runs``) and in the unit of its row key
+    (``unit_factor``), the sorted row keys of the series that are absent or empty
+    (``missing``: how an office sends what it does not produce, like HFO's and SJU's thunder
+    probability, and what a broken product looks like too) and of the ones that are
+    malformed or in an unknown unit (``unusable``: logged, a payload problem of this run,
+    never a quiet "not produced")."""
     maps: Dict[str, Dict[datetime, Tuple[Any, datetime, int]]] = {}
     missing: List[str] = []
     unusable: List[str] = []
     for key, name in FIELDS.items():
         try:
             m, skipped = expand_runs(props.get(name))
+            if m:
+                # an empty series has no values to convert, and NWS sends it without a unit
+                factor = unit_factor(key, props.get(name))
+                if factor != 1.0:
+                    log.info("%s: gridpoint series %s is in %s: converted (factor %g)", slug, name,
+                             props[name].get("uom"), factor)
+                    m = _scaled(m, factor)
             if skipped:
                 log.warning("%s: gridpoint series %s: %d malformed entr%s skipped", slug, name, skipped,
                             "y" if skipped == 1 else "ies")
@@ -218,7 +296,7 @@ def _expand_all(props: dict, slug: str) -> Tuple[Dict[str, Dict[datetime, Tuple[
 def _result(status: dict, url: Optional[str]) -> dict:
     out = dict(status)
     out.update({"url": url, "updated": None, "update_age_min": None, "elevation_m": None,
-                "missing": [], "unusable": [], "hours": [], "now": None, "next": None})
+                "missing": [], "absent": [], "unusable": [], "hours": [], "now": None, "next": None})
     return out
 
 
@@ -228,20 +306,30 @@ def fetch(cfg, cache, site: dict, meta: Optional[dict], hours: int = 12,
     """The raw gridpoint of a site as hourly rows from the current UTC hour on. Keys:
 
     * ``ok / stale / error / age_s``: the parent's status keys (``http.cached_json``), plus
-      ``not_provided`` True when NWS has no forecast grid here (``meta["no_grid"]``);
+      ``not_provided`` True when NWS has no forecast grid here (``meta["no_grid"]``) AND the
+      site entry says so (``"gridless": True``, ``vlba/sites.py``). At any other site a
+      ``/points`` answer without a grid is a broken answer (it used to switch the forecast
+      checks to "n/a" for as long as the answer stayed cached): the last good gridpoint is
+      served while it may be, then the product is unavailable, as when NWS is down;
     * ``url``: the gridpoint URL, None without usable metadata;
     * ``updated``: the product's ``updateTime`` string, or None;
     * ``update_age_min``: minutes from ``updated`` to ``now`` (1 decimal; negative when the
       product is dated in the future), or None;
     * ``elevation_m``: the grid cell's elevation, or None;
-    * ``missing``: sorted row keys whose series is absent or empty, i.e. not produced for
-      this grid (meaningful only when ``ok``; an empty list otherwise);
-    * ``unusable``: sorted row keys whose series is malformed this run (logged);
+    * ``missing``: sorted row keys whose series is absent or empty (meaningful only when
+      ``ok``; an empty list otherwise);
+    * ``absent``: the ones of ``missing`` that the site's office is not known to leave out
+      (``sites.series_not_provided``): a gap of this run, where the rest of ``missing`` is
+      "not produced here";
+    * ``unusable``: sorted row keys whose series is malformed or in an unknown unit this
+      run (logged);
     * ``hours``: ``hours`` rows, one per hour from the hour containing ``now`` (UTC): ``start``
       (aware UTC datetime), ``local`` ("%a %H:%M" in the site's time zone, ``meta["tz"]``
       or UTC), every FIELDS key: a float or None, except ``weather``, a list of
-      ``{"coverage", "weather", "intensity"}`` entries (empty when nothing is forecast or
-      the series is missing: see ``missing``), and ``periods``: for the ACCUMULATIONS
+      ``{"coverage", "weather", "intensity"}`` entries (empty when nothing is forecast, when
+      no run covers the hour and when the series is missing), ``weather_covered``: True
+      when a run of the weather series has entries for the hour, so that an empty
+      ``weather`` means "nothing forecast" and not "no value", and ``periods``: for the ACCUMULATIONS
       keys, the run the hour's amount belongs to, ``{"start": aware UTC datetime,
       "hours": n}`` (the amount is the total of the whole run);
     * ``now`` / ``next``: ``hours[0]`` / ``hours[1]``, or None.
@@ -251,14 +339,25 @@ def fetch(cfg, cache, site: dict, meta: Optional[dict], hours: int = 12,
     ``util.utcnow()``. Never raises on network or data problems."""
     slug = str(site.get("slug") or "?")
     tz = nws._tz(meta)
-    if nws._not_provided(meta):
+    no_grid = nws._not_provided(meta)
+    if no_grid and _sites.is_gridless(site):
         return _result(nws._not_provided_status(), None)
     url = grid_url(meta)
     res = nws._fetch(cfg, cache, "gridpoint/%s" % nws._loc(site), url,
                      cfg.gridpoint_ttl, cfg.gridpoint_max_stale, _valid_gridpoint)
     out = _result(nws._status(res), url)
+    if no_grid:
+        # NWS has a grid for this site in every other run: an answer without one is no
+        # reason to call the forecast "not provided". With a grid id but no forecast link
+        # the gridpoint is fetched as usual; without one the last good copy is served
+        # while it may be, and the error says why there is no URL.
+        log.warning("%s: the NWS /points answer names no forecast grid, and the site is not "
+                    "entered as gridless: gridpoint %s", slug,
+                    "unavailable" if not res["ok"] else "from the last good copy" if url is None else url)
+        if url is None:
+            out["error"] = NO_GRID
     if not res["ok"]:
-        log.debug("%s: gridpoint unavailable: %s", slug, res["error"])
+        log.debug("%s: gridpoint unavailable: %s", slug, out["error"])
         return out
     now = _utc(now or util.utcnow())
     props = res["data"]["properties"]
@@ -269,6 +368,11 @@ def fetch(cfg, cache, site: dict, meta: Optional[dict], hours: int = 12,
         out["update_age_min"] = round((now - upd).total_seconds() / 60.0, 1)
     out["elevation_m"] = nws._distance_m(props.get("elevation"))
     maps, out["missing"], out["unusable"] = _expand_all(props, slug)
+    produced_elsewhere = [k for k in out["missing"] if k not in _sites.series_not_provided(site)]
+    out["absent"] = produced_elsewhere
+    if produced_elsewhere:
+        log.warning("%s: gridpoint has no values for %s, which this office is not known to leave out",
+                    slug, ", ".join(FIELDS[k] for k in produced_elsewhere))
     hour0 = now.replace(minute=0, second=0, microsecond=0)
     rows: List[dict] = []
     for k in range(max(0, int(hours))):
@@ -277,6 +381,8 @@ def fetch(cfg, cache, site: dict, meta: Optional[dict], hours: int = 12,
         for key in FIELDS:
             v, run_start, run_hours = maps[key].get(start) or (None, None, None)
             row[key] = _weather_entries(v) if key == "weather" else util.quantity(v)
+            if key == "weather":
+                row["weather_covered"] = _weather_said(v)
             if key in ACCUMULATIONS and run_start is not None:
                 row["periods"][key] = {"start": run_start, "hours": run_hours}
         rows.append(row)

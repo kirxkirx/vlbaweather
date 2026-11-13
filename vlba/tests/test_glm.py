@@ -126,6 +126,7 @@ class FakeS3:
         self.garbage_keys = set()       # keys that download as junk
         self.block = None               # an Event every granule download waits on
         self.lock = threading.Lock()
+        self.now = None                 # the run's time: later granules are not published yet
 
     def listing_calls(self) -> list:
         return [u for u, _ in self.calls if "?list-type=2" in u]
@@ -148,7 +149,8 @@ class FakeS3:
             if bucket in self.fail_listing:
                 raise OSError("listing down")
             return _listing_xml(bucket, prefix,
-                                [k for k in self.keys.get(bucket, []) if k.startswith(prefix)])
+                                [k for k in self.keys.get(bucket, []) if k.startswith(prefix)
+                                 and (self.now is None or glm.key_start(k) <= self.now)])
         key = urllib.parse.unquote(rest)
         if self.block is not None:
             self.block.wait(10)
@@ -192,7 +194,15 @@ def s3(h5):
 
 @pytest.fixture
 def fake_get(monkeypatch, s3):
+    """The fake S3 behind ``glm._get``; it lists only the granules that start by the time
+    ``glm.fetch`` is called for (a listing of later ones means a slow host clock)."""
     monkeypatch.setattr(glm, "_get", s3)
+    real_fetch = glm.fetch
+
+    def fetch(cfg, now=None, *args, **kwargs):
+        s3.now = now
+        return real_fetch(cfg, now, *args, **kwargs)
+    monkeypatch.setattr(glm, "fetch", fetch)
     return s3
 
 
@@ -334,8 +344,10 @@ def test_get_uses_urlopen_with_the_user_agent(cfg, monkeypatch):
         def __exit__(self, *a):
             return False
 
-        def read(self):
-            return b"body"
+        body = io.BytesIO(b"body")
+
+        def read(self, n=-1):          # read in chunks since the size and time caps
+            return self.body.read(n)
 
     def fake_urlopen(req, timeout=None):
         seen["url"] = req.full_url
@@ -351,7 +363,7 @@ def test_get_uses_urlopen_with_the_user_agent(cfg, monkeypatch):
 
 # ---- fetch ------------------------------------------------------------------------------------
 def test_fetch_both_satellites(cfg, fake_get):
-    res = glm.fetch(cfg, now=NOW)
+    res = glm.fetch(cfg, now=NOW, since=_steady(NOW))
     assert set(res) == set(glm._RESULT_KEYS)
     assert res["ok"] is True and res["stale"] is False and res["error"] is None
     assert res["age_s"] == 0.0 and res["partial"] is False and res["skipped"] is None
@@ -366,9 +378,12 @@ def test_fetch_both_satellites(cfg, fake_get):
     for sid, bucket, sub_lon, n in (("G19", EAST, -75.2, 3), ("G18", WEST, -137.0, 2)):
         s = res["sats"][sid]
         assert set(s) == {"bucket", "sub_lon", "ok", "error", "listed", "selected", "fetched",
-                          "failed", "flashes"}
+                          "failed", "flashes", "span_start", "span_end"}
         assert s["bucket"] == bucket and s["sub_lon"] == sub_lon and s["ok"] is True
-        assert s["error"] is None and s["listed"] == 180 and s["selected"] == 18
+        # hour 15 up to the run's time (15:00:00 .. 15:42:20)
+        assert s["error"] is None and s["listed"] == 128 and s["selected"] == 18
+        assert s["span_start"] == (NOW - timedelta(minutes=6)).timestamp()
+        assert s["span_end"] == NOW.timestamp()                     # the newest ends 15:42:40
         assert s["fetched"] == 18 and s["failed"] == 0 and s["flashes"] == n
     assert len(res["flashes"]) == 5
     assert {f["sat"] for f in res["flashes"]} == {"G19", "G18"}
@@ -382,18 +397,18 @@ def test_fetch_both_satellites(cfg, fake_get):
 
 def test_fetch_window_crossing_the_hour_lists_two_prefixes(cfg, fake_get):
     now = datetime(2026, 10, 8, 15, 2, 0, tzinfo=UTC)
-    res = glm.fetch(cfg, now=now)
+    res = glm.fetch(cfg, now=now, since=_steady(now))
     assert res["ok"] is True
     prefixes = sorted(u.rsplit("prefix=", 1)[1] for u in fake_get.listing_calls())
     assert prefixes == ["GLM-L2-LCFA/2026/281/14/", "GLM-L2-LCFA/2026/281/14/",
                         "GLM-L2-LCFA/2026/281/15/", "GLM-L2-LCFA/2026/281/15/"]
     for s in res["sats"].values():
-        assert s["listed"] == 360 and s["selected"] == 19 and s["fetched"] == 19   # 14:56:00..15:02:00
+        assert s["listed"] == 187 and s["selected"] == 19 and s["fetched"] == 19   # 14:56:00..15:02:00
 
 
 def test_fetch_stride_thins_the_granules(cfg, fake_get):
     cfg.glm_stride = 2
-    res = glm.fetch(cfg, now=NOW)
+    res = glm.fetch(cfg, now=NOW, since=_steady(NOW))
     assert res["ok"] is True
     for s in res["sats"].values():
         assert s["selected"] == 9 and s["fetched"] == 9
@@ -404,7 +419,7 @@ def test_fetch_stride_thins_the_granules(cfg, fake_get):
 
 def test_fetch_one_listing_fails_is_partial(cfg, fake_get):
     fake_get.fail_listing.add(WEST)
-    res = glm.fetch(cfg, now=NOW)
+    res = glm.fetch(cfg, now=NOW, since=_steady(NOW))
     assert res["ok"] is True and res["partial"] is True
     assert res["error"] and "G18" in res["error"] and "listing" in res["error"]
     assert res["sats"]["G19"]["ok"] is True and res["sats"]["G19"]["flashes"] == 3
@@ -420,7 +435,7 @@ def test_fetch_one_granule_fails_or_is_garbage(cfg, fake_get):
     fake_get.fail_keys.add(_key("G19", datetime(2026, 10, 8, 15, 41, 0, tzinfo=UTC)))
     fake_get.garbage_keys.add(_key("G19", datetime(2026, 10, 8, 15, 41, 20, tzinfo=UTC)))
     assert all(k in keys for k in fake_get.fail_keys | fake_get.garbage_keys)
-    res = glm.fetch(cfg, now=NOW)
+    res = glm.fetch(cfg, now=NOW, since=_steady(NOW))
     assert res["ok"] is True and res["partial"] is True
     g19 = res["sats"]["G19"]
     assert g19["ok"] is False and g19["fetched"] == 16 and g19["failed"] == 2
@@ -493,7 +508,7 @@ def test_fetch_deadline_abandons_slow_granules(cfg, fake_get):
     cfg.glm_timeout_s = 1
     fake_get.block = threading.Event()
     try:
-        res = glm.fetch(cfg, now=NOW)
+        res = glm.fetch(cfg, now=NOW, since=_steady(NOW))
     finally:
         fake_get.block.set()
     assert res["elapsed_s"] < 5.0
@@ -514,7 +529,7 @@ def test_fetch_result_without_any_satellite_in_sats_dict_keys(cfg, fake_get):
 # ---- the per-site view ---------------------------------------------------------------------
 VIEW_KEYS = {"covered", "sats", "available", "partial", "error", "count_window", "count_by_sat",
              "last_in_ring_t", "nearest_km", "nearest_bearing", "nearest_t", "nearest_sat", "flashes_on_map",
-             "window_min"}
+             "window_min", "span_start", "span_end", "window_end"}
 
 
 def _res(flashes, sats=None, ok=True, **extra):
@@ -530,12 +545,20 @@ def _res(flashes, sats=None, ok=True, **extra):
     return base
 
 
+def _steady(now: datetime) -> dict:
+    """``since`` of a run that follows a complete one by the window: the window as configured.
+    (Without a marker, a first run or one after a lost state file, a run reaches back over
+    the whole hold: #102.)"""
+    t = (now - timedelta(minutes=6)).timestamp()
+    return {"G19": t, "G18": t}
+
+
 def _fl(lat, lon, sat, t=None):
     return {"lat": lat, "lon": lon, "sat": sat, "t": t or NOW}
 
 
 def test_site_view_counts_nearest_and_map(cfg, fake_get):
-    res = glm.fetch(cfg, now=NOW)
+    res = glm.fetch(cfg, now=NOW, since=_steady(NOW))
     pt = glm.site_view(res, PT, cfg, now=NOW)
     assert set(pt) == VIEW_KEYS
     assert pt["covered"] is True and pt["sats"] == ["G19", "G18"]
@@ -738,8 +761,11 @@ def test_fetch_catches_up_on_what_the_last_run_could_not_see(cfg, fake_get):
     fake_get.keys = full
     late = NOW + timedelta(minutes=6, seconds=30)            # its own window starts 15:43:00
     fake_get.calls.clear()
-    glm.fetch(cfg, now=late)
+    glm.fetch(cfg, now=late, since=_steady(late))
     assert not any("_s20262811542" in u for u in fake_get.granule_calls())
+    fake_get.calls.clear()
+    glm.fetch(cfg, now=late)                  # no marker at all: the whole hold (#102)
+    assert all(any(k.rsplit("/", 1)[1] in u for u in fake_get.granule_calls()) for k in hidden)
     fake_get.calls.clear()
     res = glm.fetch(cfg, now=late, since=first["newest"])
     got = fake_get.granule_calls()
@@ -752,7 +778,9 @@ def test_fetch_catches_up_on_what_the_last_run_could_not_see(cfg, fake_get):
     assert res["window_start"] == late - timedelta(seconds=glm.max_catchup_s(cfg)) \
         == late - timedelta(seconds=cfg.glm_hold_s + glm.GRANULE_S)   # the whole hold, even at 5 min
     res = glm.fetch(cfg, now=late, since={"G19": 10 ** 400, "G18": True})
-    assert res["ok"] and res["window_start"] == late - timedelta(minutes=6) and set(res["newest"]) == {"G19", "G18"}
+    # (junk is no marker: the whole hold, #102)
+    assert res["ok"] and res["window_start"] == late - timedelta(seconds=glm.max_catchup_s(cfg))
+    assert set(res["newest"]) == {"G19", "G18"}
 
 
 def test_failed_granules_are_retried_by_the_next_run(cfg, fake_get):

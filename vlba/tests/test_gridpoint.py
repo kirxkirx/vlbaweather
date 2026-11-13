@@ -163,13 +163,14 @@ def test_fetch_end_to_end(cfg, cache, grid):
     assert r["missing"] == ["thunder_pct"]
     assert r["unusable"] == []
     assert set(r) == {"ok", "stale", "error", "age_s", "url", "updated", "update_age_min",
-                      "elevation_m", "missing", "unusable", "hours", "now", "next"}
+                      "elevation_m", "missing", "absent", "unusable", "hours", "now", "next"}
+    assert r["absent"] == []                    # HFO is known not to produce thunder
     assert len(r["hours"]) == 12
     assert r["now"] is r["hours"][0] and r["next"] is r["hours"][1]
     assert [h["start"] for h in r["hours"]] == [HOUR0 + timedelta(hours=k) for k in range(12)]
     assert r["hours"][0]["start"].tzinfo is not None and r["hours"][0]["start"] == HOUR0
     assert [h["local"] for h in r["hours"][:3]] == ["Thu 04:00", "Thu 05:00", "Thu 06:00"]
-    assert set(r["hours"][0]) == {"start", "local", "periods"} | set(gridpoint.FIELDS)
+    assert set(r["hours"][0]) == {"start", "local", "periods", "weather_covered"} | set(gridpoint.FIELDS)
     # an accumulation names the run it is the total of (the fixture's 12-hour run from 08Z)
     assert r["hours"][3]["periods"]["snow_mm"] == {"start": HOUR0 - timedelta(hours=6), "hours": 12}
     assert set(r["hours"][3]["periods"]) == {"qpf_mm", "snow_mm", "ice_mm"}
@@ -305,7 +306,7 @@ def test_fetch_labels_follow_site_timezone(cfg, cache, grid):
 def test_fetch_not_provided_without_a_grid(cfg, cache, fake_http):
     samoa = {"ok": True, "stale": False, "error": None, "age_s": 0.0, "grid_id": None,
              "grid_x": None, "grid_y": None, "tz": "Pacific/Pago_Pago", "no_grid": True}
-    r = gridpoint.fetch(cfg, cache, SITE, samoa, now=NOW)
+    r = gridpoint.fetch(cfg, cache, dict(SITE, gridless=True), samoa, now=NOW)
     assert not r["ok"] and not r["stale"] and r["not_provided"] is True
     assert r["error"] == nws.NOT_PROVIDED and r["age_s"] is None and r["url"] is None
     assert r["hours"] == [] and r["now"] is None and r["next"] is None

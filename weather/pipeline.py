@@ -48,8 +48,11 @@ usage: make_weather_page.py [--out DIR] [--cache DIR] [--verbose] [--skip-radar]
 from __future__ import annotations
 
 import argparse
+import errno
 import logging
 import os
+import re
+import ssl
 import sys
 import time
 from typing import Any, Dict, List, Optional, Sequence, Tuple
@@ -147,7 +150,96 @@ def _dict_list(value: Any) -> List[dict]:
 
 
 def _exc_text(e: BaseException) -> str:
+    """The text of an exception for the run's error list, which the page and status.json
+    publish. An OSError names its file (a temp file's name carries the process id) and so
+    the run user's home: only its errno name and message are given here; the log keeps the
+    full text. An OSError without an errno (a URLError, a timeout) says what it says."""
+    if (isinstance(e, OSError) and not isinstance(e, ssl.SSLError) and isinstance(e.errno, int)
+            and isinstance(e.strerror, str) and e.strerror):
+        return "%s: [%s] %s" % (type(e).__name__, errno.errorcode.get(e.errno, "Errno %d" % e.errno),
+                                e.strerror)
     return "%s: %s" % (type(e).__name__, e)
+
+
+# ---- what the published texts must not name ---------------------------------------------------
+# The page and status.json are public; a run error, a map caption or a site's error text
+# built from an exception can name the cache, state or output directory (by default under
+# the run user's home, so the account name too), a temp file's process id or an object's
+# memory address. They are kept in the log and replaced in what is published.
+_PID_SUFFIX = re.compile(r"(\.tmp)\.\d+\b")
+_MEM_ADDR = re.compile(r"\s+at 0x[0-9a-fA-F]{4,}\b")
+_URL_CREDENTIALS = re.compile(r"(\b[a-zA-Z][a-zA-Z0-9+.-]*://)[^/\s@'\"<>]+@")
+
+
+def _public_paths(cfg) -> List[Tuple[re.Pattern, str]]:
+    """(pattern, placeholder) for every local directory a published text must not name:
+    the cache, the output directory, the state file's directory and the home directory,
+    as configured and as resolved (a symlinked cache appears either way), longest first so
+    that the cache under the home reads "<cache>", not "~/.cache/...". A path matches only
+    as a whole path component sequence, never inside a URL ("/root" is no part of
+    "https://example.org/root/x")."""
+    pairs: List[Tuple[str, str]] = []
+    home = os.path.expanduser("~")
+    state_dir = os.path.dirname(str(getattr(cfg, "state_file", "") or ""))
+    for value, token in ((getattr(cfg, "cache_dir", None), "<cache>"), (getattr(cfg, "out_dir", None), "<out>"),
+                         (state_dir, "<state>"), (home, "~")):
+        if not isinstance(value, str) or not value:
+            continue
+        for p in {value, os.path.abspath(value), os.path.realpath(value)}:
+            p = p.rstrip("/")
+            # "/" or a one-letter directory would match half of every text: never replaced
+            if len(p) > 2 and p.startswith("/") and p not in ("/tmp", "/var", "/usr", "/home"):
+                pairs.append((p, token))
+    pairs.sort(key=lambda pt: -len(pt[0]))
+    seen = set()
+    out: List[Tuple[re.Pattern, str]] = []
+    for p, token in pairs:
+        if p in seen:
+            continue
+        seen.add(p)
+        # a whole path: not inside a longer name or a URL, but at the end of a sentence too
+        out.append((re.compile(r"(?<![\w.~-])" + re.escape(p) + r"(?![\w-]|\.\w)"), token))
+    return out
+
+
+def _public_text(text: str, subs: List[Tuple[re.Pattern, str]]) -> str:
+    """``text`` with the local paths of ``subs`` (``_public_paths``), temp-file process ids,
+    memory addresses and URL credentials replaced."""
+    if not text:
+        return text
+    for pat, token in subs:
+        text = pat.sub(token, text)
+    text = _PID_SUFFIX.sub(r"\1", text)
+    text = _MEM_ADDR.sub("", text)
+    return _URL_CREDENTIALS.sub(r"\1", text)
+
+
+def _scrub_run(cfg, run: Any, subs: Optional[List[Tuple[re.Pattern, str]]] = None) -> Any:
+    """Pass every string of the run dict (dicts and lists walked, in place) through
+    ``_public_text`` before the outputs are written. Returns ``run``."""
+    if subs is None:
+        subs = _public_paths(cfg)
+    stack = [run]
+    seen = set()
+    while stack:
+        node = stack.pop()
+        if id(node) in seen:
+            continue
+        seen.add(id(node))
+        if isinstance(node, dict):
+            items = list(node.items())
+        elif isinstance(node, list):
+            items = list(enumerate(node))
+        else:
+            continue
+        for k, v in items:
+            if isinstance(v, str):
+                clean = _public_text(v, subs)
+                if clean != v:
+                    node[k] = clean
+            elif isinstance(v, (dict, list)):
+                stack.append(v)
+    return run
 
 
 # ---- step guards --------------------------------------------------------------------------
@@ -277,7 +369,12 @@ def _load_radar(cfg, cache, run: dict, skip_radar: bool) -> Dict[str, Any]:
         why = "Pillow not installed"
     if why:
         log.info("radar frame not loaded: %s", why)
-        return _radar_fallback(why, stale=False)
+        d = _radar_fallback(why, stale=False)
+        if not skip_radar and not cfg.radar_enabled:
+            # switched off on purpose: "off, not missing", so status.json must not call the
+            # run degraded for it (--skip-radar, a one-off, stays a reported problem)
+            d["disabled"] = True
+        return d
     res = _source(run, "radar frame", _radar_fallback, radar.load_frame, cfg, cache)
     if res.get("ok"):
         ts = res.get("ts")
@@ -672,12 +769,46 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     return p.parse_args(argv)
 
 
+# Control characters of a log message, escaped: upstream text (a zone URL, a station id, an
+# event name) logged with %s must neither start a forged log line (cron.log, syslog through
+# logger(1)) nor send escape sequences to the terminal of whoever reads the log. C0 but tab,
+# DEL, C1 and the Unicode line and paragraph separators.
+_LOG_ESCAPES = {c: "\\x%02x" % c for c in list(range(0x20)) + list(range(0x7f, 0xa0)) if c != 0x09}
+_LOG_ESCAPES.update({0x0a: "\\n", 0x0d: "\\r", 0x2028: "\\u2028", 0x2029: "\\u2029"})
+
+
+class _SafeFormatter(logging.Formatter):
+    """``LOG_FORMAT`` with every control character of the message escaped (a newline becomes
+    ``\\n``, so one record is one line); a traceback (``log.exception``) keeps its line
+    breaks, with the other control characters escaped."""
+
+    @staticmethod
+    def _lines(text: str) -> str:
+        return "\n".join(line.translate(_LOG_ESCAPES) for line in text.split("\n"))
+
+    def format(self, record: logging.LogRecord) -> str:
+        record.message = record.getMessage()
+        if self.usesTime():
+            record.asctime = self.formatTime(record, self.datefmt)
+        s = self.formatMessage(record).translate(_LOG_ESCAPES)
+        if record.exc_info and not record.exc_text:
+            record.exc_text = self.formatException(record.exc_info)
+        if record.exc_text:
+            s += "\n" + self._lines(record.exc_text)
+        if record.stack_info:
+            s += "\n" + self._lines(self.formatStack(record.stack_info))
+        return s
+
+
 def setup_logging(verbose: bool) -> None:
-    """INFO (or DEBUG) to stderr in the DESIGN.md format. ``basicConfig`` is a no-op when a
-    handler already exists (pytest, an embedding program), so the level is set explicitly
-    on our own logger namespace as well."""
+    """INFO (or DEBUG) to stderr in the DESIGN.md format, control characters escaped
+    (``_SafeFormatter``). ``basicConfig`` is a no-op when a handler already exists (pytest,
+    an embedding program), so the level is set explicitly on our own logger namespace as
+    well."""
     level = logging.DEBUG if verbose else logging.INFO
-    logging.basicConfig(level=level, format=LOG_FORMAT, stream=sys.stderr)
+    handler = logging.StreamHandler(sys.stderr)
+    handler.setFormatter(_SafeFormatter(LOG_FORMAT))
+    logging.basicConfig(level=level, handlers=[handler])
     logging.getLogger("weather").setLevel(level)
     # Pillow logs every PNG chunk it parses at DEBUG (hundreds of lines per run): keep it quiet.
     logging.getLogger("PIL").setLevel(logging.INFO)

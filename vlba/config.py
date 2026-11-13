@@ -13,16 +13,22 @@ wrong without anyone noticing.
 """
 from __future__ import annotations
 
+import logging
 import math
 import os
 import re
+import urllib.parse
 from dataclasses import dataclass, fields
 from typing import List, Tuple
 
 from weather import alerts as _alerts
-from weather.config import Config, _env_float, _env_int, _env_str
+from weather.config import (MAX_AGE_S, Config, _env_bool, _env_float, _env_int, _env_str, check_not_published,
+                            expand_path)
 
+from . import glm as _glm
 from . import sites as _sites
+
+log = logging.getLogger("vlba.config")
 
 # NWS products that make an antenna's weather BAD while one is in effect over the site.
 # ttustatus's three (Tornado / Dust Storm / High Wind Warning) plus the other damaging-wind
@@ -51,6 +57,8 @@ MRMS_CONUS_PRODUCT = "SeamlessHSR_00.00"
 # VLBA_RADAR_COVERAGE_MAX_LAG's upper bound (s): coverage changes over hours, and every hour of
 # the lag is one more listing request when the frame's own file is missing.
 MAX_COVERAGE_LAG_S = 3600
+# WEATHER_ALERTS_MAX_STALE above this is reported on every run (VlbaConfig.doubtful_settings)
+DOUBTFUL_ALERTS_MAX_STALE_S = 3 * 3600
 _MIRROR_FIELDS = {"Y": r"\d{4}", "m": r"\d{2}", "d": r"\d{2}", "H": r"\d{2}", "M": r"\d{2}", "S": r"\d{2}"}
 
 
@@ -150,6 +158,60 @@ def parse_event_names(raw: str) -> Tuple[List[str], List[str]]:
     return out, unknown
 
 
+# Values of a switch: a name that is only one of these (or only digits) is a switch written
+# into the list (VLBA_VETO_EVENTS=1), never a product.
+_SWITCH_WORDS = ("on", "off", "true", "false", "yes", "no", "0", "1")
+
+
+def check_event_names(raw: str) -> None:
+    """ValueError for a VLBA_VETO_EVENTS name that cannot be an NWS product: one holding
+    ';' (another separator), '#' (a trailing comment), a quote or a backslash (quoting, or a
+    continued line, which the cron wrapper keeps as it is), or consisting only of digits or
+    of a switch word. Such a list matches no product, and the warning veto would be off
+    without anyone noticing. A name that is merely unknown stays (NWS renames products now
+    and then); the generator reports it on every run."""
+    for name in parse_event_names(raw)[0]:
+        bad = sorted(set(name) & set(";#\"'\\"))
+        if bad:
+            raise ValueError("VLBA_VETO_EVENTS: %r is not an NWS event name (it holds %s): the names are "
+                             "separated by commas, and the value takes no quotes, '#' comments or "
+                             "continued lines" % (name, " ".join(bad)))
+        if name.isdigit() or name.lower() in _SWITCH_WORDS:
+            raise ValueError("VLBA_VETO_EVENTS: %r is not an NWS event name: the value is a comma list of "
+                             "warning products such as Tornado Warning (none switches the warning check off)"
+                             % name)
+
+
+def _builtin_site(site: dict):
+    """The ``vlba.sites`` entry that ``site`` is (same slug, within 0.05 deg, the rule
+    ``VlbaConfig.from_env`` uses to keep a built-in site's code and height), else None."""
+    k = {s["slug"]: s for s in _sites.SITES}.get(site.get("slug"))
+    try:
+        if k is not None and abs(float(site["lat"]) - k["lat"]) < 0.05 and abs(float(site["lon"]) - k["lon"]) < 0.05:
+            return k
+    except (KeyError, TypeError, ValueError):
+        pass
+    return None
+
+
+def check_url_base(url: str, what: str) -> str:
+    """``url`` if it is an http(s) base URL with a host name, without white space, query,
+    fragment, user name or password (the run appends its own query, and a failed request's
+    text, which holds the URL, can reach the page), else ValueError."""
+    msg = ("%s must be an http:// or https:// base URL with a host name and without a query, fragment, "
+           "user name or password (or none)" % what)
+    if not isinstance(url, str) or any(c.isspace() for c in url) or "?" in url or "#" in url:
+        raise ValueError(msg)
+    try:
+        parts = urllib.parse.urlsplit(url)
+        parts.port                          # ValueError on a malformed port
+    except ValueError:
+        raise ValueError(msg)
+    if parts.scheme not in ("http", "https") or not parts.hostname or "@" in parts.netloc:
+        raise ValueError(msg)
+    return url
+
+
 def parse_glm_buckets(raw: str) -> List[Tuple[str, float]]:
     """``"noaa-goes19=-75.2;noaa-goes18=-137.0"`` -> ``[("noaa-goes19", -75.2), ...]``: the
     S3 bucket of each satellite's GLM-L2-LCFA granules and its sub-satellite longitude (east
@@ -187,6 +249,10 @@ class VlbaConfig(Config):
     refresh_seconds: int = 300
     user_agent: str = "vlbaweather (+https://github.com/kirxkirx/vlbaweather)"
     source_url: str = "https://github.com/kirxkirx/vlbaweather"     # the footer's source-code link
+    # A page older than this says so by itself (a banner, the verdicts greyed; vlba/page.py)
+    # and status.json carries the limit: two and a half run intervals of 30 min, so one
+    # failed or late run raises no alarm and a second one missed does.
+    page_stale_min: int = 75                    # VLBA_PAGE_STALE_MIN
     # A run fetches twelve sites, one radar frame per source (more where a ring shows an echo)
     # and ~185 GLM granules (the 30-minute window, 25-30 s, measured 2026-10-14); the first run
     # of a fresh cache also
@@ -252,6 +318,10 @@ class VlbaConfig(Config):
     obs_precip: bool = True                     # VLBA_OBS_PRECIP
     obs_max_km: float = 50.0                    # VLBA_OBS_MAX_KM
     obs_max_delev_m: float = 1000.0             # VLBA_OBS_MAX_DELEV_M
+    # NWS's API serves some stations' METARs late (St. Croix's TISX about 40 min, 2026-11-10):
+    # when it has no report with weather of the last 90 min, the precipitation check reads
+    # the stations' METARs from aviationweather.gov's data API; "none" switches that off.
+    metar_url: str = "https://aviationweather.gov/api/data/metar"   # VLBA_METAR_URL
     # The VLBA antennas stow in high wind; 45 mph asked for on 2026-10-08 (ttustatus has no
     # wind cut).
     wind_mph: float = 45.0                      # VLBA_WIND_MPH (0 = off)
@@ -272,6 +342,10 @@ class VlbaConfig(Config):
     glm_max_arc_deg: float = 62.0               # VLBA_GLM_MAX_ARC
     glm_timeout_s: int = 90                     # VLBA_GLM_TIMEOUT (184 granules: ~25 s measured)
     glm_workers: int = 4                        # VLBA_GLM_WORKERS
+    # A satellite's window is complete only when its newest granule ends at most this long
+    # before the run: granules are published 5-75 s after their end (measured 2026-11-12),
+    # so the newest one listed ends 10-95 s before the run on a healthy feed.
+    glm_max_lag_s: int = 300                    # VLBA_GLM_MAX_LAG
 
     # ---- radar for sites outside the MRMS grid ------------------------------------------
     island_radar: bool = True                   # VLBA_ISLAND_RADAR
@@ -306,6 +380,15 @@ class VlbaConfig(Config):
                 if near:
                     s.setdefault("code", k["code"])
                     s.setdefault("elev_m", k["elev_m"])
+        # the parent's switches that this page uses, read strictly (the parent's reading takes
+        # "n" or "disabled" for "on")
+        c.show_sun = _env_flag("WEATHER_SHOW_SUN", c.show_sun)
+        c.tile_dark_invert = _env_flag("WEATHER_TILE_DARK_INVERT", c.tile_dark_invert)
+        c.radar_enabled = _env_flag("WEATHER_RADAR", c.radar_enabled)
+        c.verbose = _env_flag("WEATHER_VERBOSE", c.verbose)
+        # road closures and storm reports are not part of this page (make_vlba_page never
+        # loads them): a request for them is said to be ignored, never silently dropped
+        roads_asked = [n for n in ("WEATHER_ROADS", "WEATHER_LSR") if _env_bool(n, False)]
         c.veto_events = _env_events("VLBA_VETO_EVENTS", c.veto_events)    # "none": no warning check
         c.veto_onset_lead_s = _env_int("VLBA_VETO_ONSET_LEAD", c.veto_onset_lead_s)
         c.radar_km = _env_float("VLBA_RADAR_KM", c.radar_km)
@@ -323,12 +406,14 @@ class VlbaConfig(Config):
         c.nws_thunder_max = _env_float("VLBA_NWS_THUNDER_MAX", c.nws_thunder_max)
         c.nws_winter = _env_flag("VLBA_NWS_WINTER", c.nws_winter)
         c.nws_stale_min = _env_int("VLBA_NWS_STALE_MIN", c.nws_stale_min)
+        c.page_stale_min = _env_int("VLBA_PAGE_STALE_MIN", c.page_stale_min)
         c.gridpoint_ttl = _env_int("VLBA_GRIDPOINT_TTL", c.gridpoint_ttl)
         c.gridpoint_max_stale = _env_int("VLBA_GRIDPOINT_MAX_STALE", c.gridpoint_max_stale)
         c.obs_humidity_max = _env_float("VLBA_OBS_HUMIDITY_MAX", c.obs_humidity_max)
         c.obs_precip = _env_flag("VLBA_OBS_PRECIP", c.obs_precip)
         c.obs_max_km = _env_float("VLBA_OBS_MAX_KM", c.obs_max_km)
         c.obs_max_delev_m = _env_float("VLBA_OBS_MAX_DELEV_M", c.obs_max_delev_m)
+        c.metar_url = _env_str("VLBA_METAR_URL", c.metar_url)
         c.wind_mph = _env_float("VLBA_WIND_MPH", c.wind_mph)
         c.state_file = _env_str("VLBA_STATE_FILE", c.state_file)
         c.glm_enabled = _env_flag("VLBA_GLM", c.glm_enabled)
@@ -340,6 +425,7 @@ class VlbaConfig(Config):
         c.glm_max_arc_deg = _env_float("VLBA_GLM_MAX_ARC", c.glm_max_arc_deg)
         c.glm_timeout_s = _env_int("VLBA_GLM_TIMEOUT", c.glm_timeout_s)
         c.glm_workers = _env_int("VLBA_GLM_WORKERS", c.glm_workers)
+        c.glm_max_lag_s = _env_int("VLBA_GLM_MAX_LAG", c.glm_max_lag_s)
         c.island_radar = _env_flag("VLBA_ISLAND_RADAR", c.island_radar)
         c.nwsradar_url = _env_str("VLBA_NWSRADAR_URL", c.nwsradar_url)
         c.nwsradar_max_stale = _env_int("VLBA_NWSRADAR_MAX_STALE", c.nwsradar_max_stale)
@@ -349,8 +435,17 @@ class VlbaConfig(Config):
             if k not in {f.name for f in fields(cls)}:
                 raise TypeError("unknown config override %r" % k)
             setattr(c, k, v)
+        c.roads_enabled = c.lsr_enabled = False
+        if roads_asked:
+            log.warning("%s: road closures and storm reports are not part of this page; ignored",
+                        " and ".join(roads_asked))
         c.validate_vlba()
         return c
+
+    def _validate_roads(self) -> None:
+        """The road layers are not part of this page (``from_env`` switches them off), so
+        their settings, which vlbaweather.env.example calls unused, are not checked: a value
+        left over from local-weather-awareness must not stop the page."""
 
     def validate_vlba(self) -> None:
         """The VLBA_* values (the parent's ``validate`` has already run)."""
@@ -359,10 +454,12 @@ class VlbaConfig(Config):
                     or not value > 0:
                 raise ValueError("%s must be a positive number%s" % (name, what))
 
-        parse_event_names(self.veto_events)
+        check_event_names(self.veto_events)
+        # the seconds settings end at 7 days (MAX_AGE_S): far above any sensible value, and far
+        # below the overflow of a date minus a huge lead in the middle of a run
         if isinstance(self.veto_onset_lead_s, bool) or not isinstance(self.veto_onset_lead_s, int) \
-                or self.veto_onset_lead_s < 0:
-            raise ValueError("VLBA_VETO_ONSET_LEAD must be a whole number of seconds >= 0")
+                or not (0 <= self.veto_onset_lead_s <= MAX_AGE_S):
+            raise ValueError("VLBA_VETO_ONSET_LEAD must be a whole number of seconds, 0..%d (7 days)" % MAX_AGE_S)
         positive("VLBA_RADAR_KM", self.radar_km, " (km)")
         if self.radar_km > 300:
             raise ValueError("VLBA_RADAR_KM must be <= 300 (km)")
@@ -400,8 +497,20 @@ class VlbaConfig(Config):
                             ("VLBA_GRIDPOINT_TTL", self.gridpoint_ttl),
                             ("VLBA_GRIDPOINT_MAX_STALE", self.gridpoint_max_stale),
                             ("VLBA_NWSRADAR_MAX_STALE", self.nwsradar_max_stale)):
-            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
-                raise ValueError("%s must be a whole number of seconds >= 0" % name)
+            if isinstance(value, bool) or not isinstance(value, int) or not (0 <= value <= MAX_AGE_S):
+                raise ValueError("%s must be a whole number of seconds, 0..%d (7 days)" % (name, MAX_AGE_S))
+        # an echo is confirmed by the scans before the newest frame, looked for up to
+        # VLBA_RADAR_STALE before it, and two frames further apart than that are not consecutive:
+        # the span must hold one scan per extra frame at the slowest cadence (a radar completes a
+        # volume scan every 4.5-10 min: 600 s each) plus 360 s for the frames' 2-minute grid and two
+        # frames missing from the archive. A shorter one could never confirm an echo: rain would
+        # read "unconfirmed" or "no data", never BAD
+        need_s = 360 + 600 * (self.radar_trigger_after - 1)
+        if self.radar_stale_s < need_s:
+            raise ValueError("VLBA_RADAR_STALE=%d is too short for VLBA_RADAR_TRIGGER_AFTER=%d: VLBA_RADAR_STALE "
+                             "must be >= %d (360 s, plus 600 s for every frame after the first: a radar completes "
+                             "a scan only every 4.5-10 min), or an echo could never be confirmed"
+                             % (self.radar_stale_s, self.radar_trigger_after, need_s))
         for name, value in (("VLBA_NWS_CLOUD_MAX", self.nws_cloud_max),
                             ("VLBA_NWS_PRECIP_MAX", self.nws_precip_max),
                             ("VLBA_NWS_THUNDER_MAX", self.nws_thunder_max),
@@ -411,8 +520,9 @@ class VlbaConfig(Config):
                 raise ValueError("%s must be a percentage (<= 100; negative switches the check off)"
                                  % name)
         if isinstance(self.nws_stale_min, bool) or not isinstance(self.nws_stale_min, int) \
-                or self.nws_stale_min < 1:
-            raise ValueError("VLBA_NWS_STALE_MIN must be a whole number of minutes >= 1")
+                or not (1 <= self.nws_stale_min <= MAX_AGE_S // 60):
+            raise ValueError("VLBA_NWS_STALE_MIN must be a whole number of minutes, 1..%d (7 days)"
+                             % (MAX_AGE_S // 60))
         positive("VLBA_OBS_MAX_KM", self.obs_max_km, " (km)")
         positive("VLBA_OBS_MAX_DELEV_M", self.obs_max_delev_m, " (m)")
         if isinstance(self.wind_mph, bool) or not isinstance(self.wind_mph, (int, float)) \
@@ -431,19 +541,87 @@ class VlbaConfig(Config):
         if not isinstance(self.glm_max_arc_deg, (int, float)) or isinstance(self.glm_max_arc_deg, bool) \
                 or not (0 < self.glm_max_arc_deg <= 90):
             raise ValueError("VLBA_GLM_MAX_ARC must be between 0 and 90 (degrees of arc)")
+        self._check_glm_coverage()
+        # the fetch also stops with the run budget (WEATHER_RUN_BUDGET, at most an hour)
         if isinstance(self.glm_timeout_s, bool) or not isinstance(self.glm_timeout_s, int) \
-                or self.glm_timeout_s < 5:
-            raise ValueError("VLBA_GLM_TIMEOUT must be a whole number of seconds >= 5")
+                or not (5 <= self.glm_timeout_s <= 3600):
+            raise ValueError("VLBA_GLM_TIMEOUT must be a whole number of seconds, 5..3600")
         if isinstance(self.glm_workers, bool) or not isinstance(self.glm_workers, int) \
                 or not (1 <= self.glm_workers <= 16):
             raise ValueError("VLBA_GLM_WORKERS must be a whole number, 1..16")
+        if isinstance(self.glm_max_lag_s, bool) or not isinstance(self.glm_max_lag_s, int) \
+                or not (60 <= self.glm_max_lag_s <= 1800):
+            raise ValueError("VLBA_GLM_MAX_LAG must be a whole number of seconds, 60..1800")
         if not isinstance(self.nwsradar_url, str) or not self.nwsradar_url.startswith(("http://", "https://")):
             raise ValueError("VLBA_NWSRADAR_URL must be an http:// or https:// URL")
         self.nwsradar_url = self.nwsradar_url.rstrip("/")
+        if not isinstance(self.metar_url, str):
+            raise ValueError("VLBA_METAR_URL must be an http:// or https:// URL, or none")
+        self.metar_url = "" if self.metar_url.strip().lower() in VETO_OFF else self.metar_url.strip().rstrip("/")
+        if self.metar_url:
+            check_url_base(self.metar_url, "VLBA_METAR_URL")
+        if isinstance(self.page_stale_min, bool) or not isinstance(self.page_stale_min, int) \
+                or not (10 <= self.page_stale_min <= 1440):
+            raise ValueError("VLBA_PAGE_STALE_MIN must be a whole number of minutes, 10..1440")
+        # from_env applies the keyword overrides (out_dir, cache_dir) again after the parent's
+        # validate(): expand and compare the paths once more, as for the environment's values
+        self._check_paths()
         if not self.state_file:
             self.state_file = os.path.join(self.cache_dir, "vlba_state.json")
         # "~/..." like WEATHER_CACHE_DIR; a relative path would land in the cron job's cwd
-        self.state_file = os.path.abspath(os.path.expanduser(self.state_file))
+        self.state_file = expand_path(self.state_file, "VLBA_STATE_FILE")
+        check_not_published("VLBA_STATE_FILE", self.state_file, self.out_dir)
+
+    def _check_glm_coverage(self) -> None:
+        """With GLM on, every built-in site (``vlba.sites``) among the configured ones must be
+        covered by a configured satellite (``vlba.glm.site_in_fov``, the rule the lightning
+        layer applies). An uncovered site's lightning check reads "off", which is not missing
+        data: a longitude without its minus sign or a small VLBA_GLM_MAX_ARC would switch
+        lightning off at those antennas with no error. Other sites (WEATHER_SITES, --sites)
+        may lie outside every satellite's view: their check is "off", as documented."""
+        if not self.glm_enabled:
+            return
+        sats = parse_glm_buckets(self.glm_buckets)
+        lost = []
+        for s in self.sites:
+            if _builtin_site(s) is not None and not any(
+                    _glm.site_in_fov(s["lat"], s["lon"], lon, self.glm_max_arc_deg) for _, lon in sats):
+                lost.append("%s (%s)" % (s["slug"], s.get("name") or s["slug"]))
+        if lost:
+            raise ValueError("VLBA_GLM_BUCKETS / VLBA_GLM_MAX_ARC: no configured satellite covers %s, so "
+                             "lightning would be off there; the longitudes are east positive (GOES-East "
+                             "-75.2, GOES-West -137.0) and GLM sees about 62 degrees of arc from the "
+                             "sub-satellite point. VLBA_GLM=0 switches lightning off" % ", ".join(lost))
+
+    def doubtful_settings(self) -> List[str]:
+        """Values that are legal but look wrong for a verdict, one text each (the generator
+        logs a WARNING and records a run error for each on every run). A last good alert feed
+        reused for more than 3 h (six failed 30-minute runs; the default is 40 min) answers
+        "no warning in effect" for warnings NWS has issued since, and a tornado warning
+        typically lasts 30 to 60 min."""
+        out = []
+        if self.check_enabled("warning") and self.alerts_max_stale > DOUBTFUL_ALERTS_MAX_STALE_S:
+            out.append("WEATHER_ALERTS_MAX_STALE=%d: an alert feed up to %.1f h old can answer \"no warning in "
+                       "effect\" (more than %d h looks like a typo; the default is 2400 s)"
+                       % (self.alerts_max_stale, self.alerts_max_stale / 3600.0, DOUBTFUL_ALERTS_MAX_STALE_S // 3600))
+        return out
+
+    def insecure_sources(self) -> List[str]:
+        """The settings whose plain http:// URL feeds a verdict check that is on: the radar
+        frames and coverage, the island composites, the METARs. Without TLS anyone on the path
+        can answer "no echo" or "no precipitation"; the generator warns and records a run
+        error for each on every run (http:// stays allowed for a local mirror)."""
+        radar = bool(self.radar_enabled)
+        coverage = bool(self.radar_coverage) and (radar or bool(self.island_radar))
+        out = []
+        for name, url, used in (("WEATHER_MRMS_ARCHIVE", self.mrms_archive, radar),
+                                ("VLBA_MRMS_URL", self.mrms_url, coverage),
+                                ("VLBA_MRMS_CONUS_MIRROR", self.mrms_conus_mirror, coverage and radar),
+                                ("VLBA_NWSRADAR_URL", self.nwsradar_url, self.island_radar),
+                                ("VLBA_METAR_URL", self.metar_url, self.obs_precip)):
+            if used and isinstance(url, str) and url.strip().lower().startswith("http://"):
+                out.append(name)
+        return out
 
     # ---- derived -----------------------------------------------------------------------
     @property

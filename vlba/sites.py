@@ -25,10 +25,32 @@ lower-case code, so the map files are ``radar_mk_dark.png`` and the page anchors
 their usual names (their VLBI station codes are Y and GB). The entries carry two keys beyond
 the parent's ``slug|name|lat|lon|tz``: ``code`` and ``elev_m``; everything in the parent
 ignores them.
+
+Two optional keys say what NWS does not forecast at a site, because only that may read
+"n/a" on the page; anything else that is absent from a forecast is a gap ("no data"):
+
+* ``not_provided``: a tuple of the raw gridpoint series (the row keys of
+  ``vlba/gridpoint.py``: ``thunder_pct``, ``snow_mm``, ``ice_mm``, ...) the site's forecast
+  office is known not to produce, i.e. to send with an empty ``values`` list in every run.
+  A check whose series is absent and listed here reads "not provided" (neither bad nor
+  missing); absent and not listed, it reads "no data" and the verdict is GOOD?. A built-in
+  entry without the key lacks nothing. The tuples were checked against api.weather.gov on
+  2026-11-12 (all twelve gridpoints, every verdict series): Honolulu (HFO) sent no
+  probabilityOfThunder, San Juan (SJU) no probabilityOfThunder, snowfallAmount or
+  iceAccumulation, Tucson (TWC) no iceAccumulation; every other verdict series had values
+  at every site. A wrong tuple is not harmless either way: a series listed here that the
+  office does produce hides its check when it is absent, and one not listed that the office
+  stops producing leaves the site at GOOD? until it is added. A site that is not in this
+  list (``WEATHER_SITES``) has no entry to say so and may lack ``thunder_pct`` only
+  (``DEFAULT_NOT_PROVIDED``: the two offices outside the contiguous states above).
+* ``gridless``: True for a place NWS has no forecast grid for at all (American Samoa: its
+  ``/points`` answer names zones and a time zone but no grid). Only then do the forecast
+  checks read "not provided"; at any other site an answer without a grid is a broken
+  answer, and the forecast checks read "no data". None of the twelve is gridless.
 """
 from __future__ import annotations
 
-from typing import List
+from typing import Any, List, Optional, Tuple
 
 SITES: List[dict] = [
     {"slug": "br", "code": "BR", "name": "Brewster, WA", "lat": 48.1312, "lon": -119.6833,
@@ -37,12 +59,13 @@ SITES: List[dict] = [
      "elev_m": 1606, "tz": "America/Chicago"},
     {"slug": "hn", "code": "HN", "name": "Hancock, NH", "lat": 42.9336, "lon": -71.9866,
      "elev_m": 296, "tz": "America/New_York"},
+    # Tucson (TWC) sent an empty iceAccumulation on 2026-11-12, its snowfallAmount had values
     {"slug": "kp", "code": "KP", "name": "Kitt Peak, AZ", "lat": 31.9563, "lon": -111.6124,
-     "elev_m": 1902, "tz": "America/Phoenix"},
+     "elev_m": 1902, "tz": "America/Phoenix", "not_provided": ("ice_mm",)},
     {"slug": "la", "code": "LA", "name": "Los Alamos, NM", "lat": 35.7751, "lon": -106.2456,
      "elev_m": 1962, "tz": "America/Denver"},
     {"slug": "mk", "code": "MK", "name": "Mauna Kea, HI", "lat": 19.8014, "lon": -155.4555,
-     "elev_m": 3763, "tz": "Pacific/Honolulu"},
+     "elev_m": 3763, "tz": "Pacific/Honolulu", "not_provided": ("thunder_pct",)},
     {"slug": "nl", "code": "NL", "name": "North Liberty, IA", "lat": 41.7714, "lon": -91.5741,
      "elev_m": 222, "tz": "America/Chicago"},
     {"slug": "ov", "code": "OV", "name": "Owens Valley, CA", "lat": 37.2316, "lon": -118.2771,
@@ -50,7 +73,7 @@ SITES: List[dict] = [
     {"slug": "pt", "code": "PT", "name": "Pie Town, NM", "lat": 34.3010, "lon": -108.1192,
      "elev_m": 2365, "tz": "America/Denver"},
     {"slug": "sc", "code": "SC", "name": "St. Croix, VI", "lat": 17.7566, "lon": -64.5836,
-     "elev_m": 16, "tz": "America/St_Thomas"},
+     "elev_m": 16, "tz": "America/St_Thomas", "not_provided": ("thunder_pct", "snow_mm", "ice_mm")},
     {"slug": "vla", "code": "VLA", "name": "Plains of San Agustin, NM", "lat": 34.0788,
      "lon": -107.6183, "elev_m": 2114, "tz": "America/Denver"},
     {"slug": "gbt", "code": "GBT", "name": "Green Bank, WV", "lat": 38.4331, "lon": -79.8398,
@@ -74,3 +97,49 @@ def site_elevation_m(site: dict):
     except (TypeError, ValueError, AttributeError):
         return None
     return v
+
+
+# What a site without a built-in entry may lack: the probability of thunder, which the
+# offices outside the contiguous states (HFO, SJU) do not produce.
+DEFAULT_NOT_PROVIDED: Tuple[str, ...] = ("thunder_pct",)
+# How near a configured site must lie to a built-in one to be that site (degrees; the rule
+# of ``VlbaConfig.from_env`` for ``code`` and ``elev_m``).
+_SAME_PLACE_DEG = 0.05
+
+
+def _builtin(site: dict) -> Optional[dict]:
+    """The built-in entry at the place of ``site`` (within ``_SAME_PLACE_DEG``), or None."""
+    try:
+        lat, lon = float(site["lat"]), float(site["lon"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    for s in SITES:
+        if abs(lat - s["lat"]) < _SAME_PLACE_DEG and abs(lon - s["lon"]) < _SAME_PLACE_DEG:
+            return s
+    return None
+
+
+def series_not_provided(site: Any) -> Tuple[str, ...]:
+    """The gridpoint series the forecast office of ``site`` is known not to produce (see the
+    module docstring): the entry's own ``not_provided``; without the key, that of the
+    built-in entry at the same place (a built-in site named through ``WEATHER_SITES`` has
+    the parent's keys only), where no key means nothing; ``DEFAULT_NOT_PROVIDED`` for a
+    site that is not built in, and for anything that is not a site entry. A ``not_provided``
+    that is not a list or tuple of strings exempts nothing."""
+    if not isinstance(site, dict):
+        return DEFAULT_NOT_PROVIDED
+    if "not_provided" not in site:
+        known = _builtin(site)
+        if known is None:
+            return DEFAULT_NOT_PROVIDED
+        site = known
+    names = site.get("not_provided", ())
+    if not isinstance(names, (list, tuple)):
+        return ()
+    return tuple(n for n in names if isinstance(n, str))
+
+
+def is_gridless(site: Any) -> bool:
+    """Whether the entry says NWS has no forecast grid here (``"gridless": True``, nothing
+    else counts): only then is a ``/points`` answer without a grid not a fault."""
+    return isinstance(site, dict) and site.get("gridless") is True

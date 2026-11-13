@@ -59,6 +59,8 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from weather import util
 
+from . import sites as _sites
+
 log = logging.getLogger("vlba.decision")
 
 GOOD, BAD, NO_DATA = "GOOD", "BAD", "NO DATA"      # NO DATA: no check is bad, none had data
@@ -92,10 +94,24 @@ _PRECIP_WORDS = re.compile(
 # ... but not these: precipitation near the station, not at it; snow moved along the ground.
 _NOT_PRECIP = re.compile(r"\b(no precipitation|in the vicinity|vicinity|recent|low drifting)\b", re.IGNORECASE)
 _TEXT_PARTS = re.compile(r",|;|\band\b|\bwith\b", re.IGNORECASE)
+# A phenomenon "in the vicinity" in words: METAR's VC goes only with TS, SH, FG, PO, FC, SS,
+# DS and BL.., never with an intensity or a precipitation type, so it is the word before
+# "in vicinity" ("Showers", "Thunderstorm") or a pair ("Blowing Snow", "Funnel Cloud", NWS's
+# "Rain Showers"). Only that phrase is taken out of a part: "Thunderstorm in Vicinity Light
+# Rain" still names rain at the station.
+_VICINITY = re.compile(r"(?:\b(?:blowing|funnel|rain|snow|dust|sand|dust/sand)\s+)?[\w/]{1,40}\s+in\s+(?:the\s+)?vicinity\b",
+                       re.IGNORECASE)
 # A METAR present-weather group with precipitation (or a thunderstorm) at the station: an
 # intensity, a descriptor (not DR, snow drifting along the ground), the precipitation types
 # (DZ RA SN SG IC PL GR GS UP), or TS alone. VC (in the vicinity) is no precipitation here.
 _METAR_PRECIP = re.compile(r"^[-+]?(?:MI|PR|BC|BL|SH|TS|FZ)?(?:DZ|RA|SN|SG|IC|PL|GR|GS|UP)+$|^[-+]?TS$")
+# A METAR is under 200 characters, remarks included, and rarely over 400; a longer text is no
+# METAR, and is not read (whatever its regular expressions would cost on it).
+METAR_MAX_LEN = 2000
+# The groups that show a METAR's instruments looked at the sky: a visibility (statute miles,
+# metres, CAVOK) or a sky condition (a layer, a vertical visibility, clear / no cloud).
+_METAR_VIS = re.compile(r"^(?:[PM]?\d+(?:/\d+)?SM|\d{4}(?:NDV)?|CAVOK)$")
+_METAR_SKY = re.compile(r"^(?:CLR|SKC|NSC|NCD|VV(?:\d{3}|///)|(?:FEW|SCT|BKN|OVC)(?:\d{3}|///)(?:CB|TCU|///)?)$")
 # NWS gridpoint "weather" types that are frozen precipitation.
 _WINTER_TYPES = ("snow", "sleet", "freezing_rain", "freezing_drizzle", "freezing_fog",
                  "freezing_spray", "ice_pellets", "ice_crystals", "snow_showers", "blowing_snow",
@@ -105,18 +121,27 @@ _WINTER_COVERAGE = ("likely", "definite", "occasional", "frequent", "periods", "
 
 
 # ---- the persisted state --------------------------------------------------------------
+# The state of twelve sites is a few kB; a file far larger is not one this program wrote.
+STATE_MAX_BYTES = 1 << 20
+
+
 def load_state(path: str) -> dict:
     """``{"sites": {slug: {...}}, "saved_ts": float|None}``; an unreadable or malformed file
     is an empty state (logged): a lost hold is the lesser evil next to a crashed run, and
-    the holds are at most 30 min long."""
+    the holds are at most 30 min long. That includes anything the parser can raise (a
+    deeply nested file: RecursionError) and a file above ``STATE_MAX_BYTES``."""
     empty: Dict[str, Any] = {"sites": {}, "saved_ts": None}
     try:
-        with open(path, encoding="utf-8") as f:
-            doc = json.load(f)
+        with open(path, "rb") as f:
+            raw = f.read(STATE_MAX_BYTES + 1)
+        if len(raw) > STATE_MAX_BYTES:
+            raise ValueError("larger than %d bytes" % STATE_MAX_BYTES)
+        doc = json.loads(raw.decode("utf-8"))
     except FileNotFoundError:
         return empty
-    except (OSError, ValueError) as e:
-        log.warning("state file %s unreadable (%s); starting from an empty state", path, e)
+    except Exception as e:  # noqa: BLE001 — RecursionError, MemoryError: never a failed run
+        log.warning("state file %s unreadable (%s); starting from an empty state", path,
+                    "%s: %s" % (type(e).__name__, str(e)[:200]))
         return empty
     if not isinstance(doc, dict) or not isinstance(doc.get("sites"), dict):
         log.warning("state file %s has an unexpected shape; starting from an empty state", path)
@@ -140,7 +165,7 @@ def save_state(path: str, state: dict, now: Optional[datetime] = None) -> Option
             f.flush()
             os.fsync(f.fileno())
         os.replace(tmp, path)
-    except OSError as e:
+    except Exception as e:  # noqa: BLE001 — OSError, or a value json cannot write (too deep)
         log.warning("could not write the state file %s: %s", path, e)
         try:
             os.unlink(tmp)
@@ -206,6 +231,17 @@ def _fmt_min(seconds: float) -> str:
     return util.fmt_age(seconds)
 
 
+def _ago(minutes: Optional[float], fmt: str) -> str:
+    """How old a report is, for a detail: ``fmt`` ("... %s ago") filled in, " just now" under
+    a minute (or up to 10 min ahead of this host's clock, the margin the station checks allow
+    clocks), ", time ahead of the clock" further ahead, "" when unknown."""
+    if minutes is None:
+        return ""
+    if minutes < -10:
+        return ", time ahead of the clock"
+    return " just now" if minutes < 1 else fmt % util.fmt_duration_minutes(minutes)
+
+
 # ---- the checks ------------------------------------------------------------------------
 def check_warning(cfg, entry: dict, now: datetime) -> Tuple[dict, List[str], List[str]]:
     """(check, reasons, scheduled texts). An alert AT the site whose event is a veto event.
@@ -251,6 +287,24 @@ def check_warning(cfg, entry: dict, now: datetime) -> Tuple[dict, List[str], Lis
         return (_check("warning", UNKNOWN, limit=limit,
                        detail="the site's NWS zones are unknown (point metadata unavailable): zone-based "
                               "warnings cannot be matched"), [], scheduled)
+    # An alert the classification could neither place at the site nor rule out (no usable
+    # polygon and no zone list, or a test that failed; alerts.site_alerts "skipped") may be
+    # one of the vetoes: "none in effect" would be a guess. An event without a readable
+    # name may be any product. Other products cannot veto, so they do not matter here.
+    skipped = entry.get("alerts_skipped")
+    for ev in (skipped if isinstance(skipped, (list, tuple)) else ()):
+        if not isinstance(ev, str) or not ev.strip() or ev.strip().lower() in names:
+            name = ev.strip()[:60] if isinstance(ev, str) and ev.strip() else "event name unreadable"
+            return (_check("warning", UNKNOWN, limit=limit,
+                           detail="an alert (%s) could not be placed: whether it covers the site is "
+                                  "unknown" % name), [], scheduled)
+    if (_is_dict(meta) and meta.get("ok") and not meta.get("not_provided")
+            and not meta.get("forecast_zone") and not meta.get("county_zone")):
+        # metadata that names neither the forecast zone nor the county (a broken /points
+        # reply, or a copy cached before nws required them): the same guess as above
+        return (_check("warning", UNKNOWN, limit=limit,
+                       detail="the site's NWS zones are unknown (point metadata names none): zone-based "
+                              "warnings cannot be matched"), [], scheduled)
     detail = "none of the %d warning products is in effect over the site" % len(names)
     if scheduled:
         detail += "; scheduled: " + "; ".join(scheduled)
@@ -261,8 +315,25 @@ def check_warning(cfg, entry: dict, now: datetime) -> Tuple[dict, List[str], Lis
 def check_radar(cfg, entry: dict, st: dict, now: datetime) -> Tuple[dict, List[str]]:
     """The ring check with the ttustatus confirmation and hold, on ``entry["radar_check"]``
     (``available``, ``stale``, ``frame_ts``, ``in_ring``, ``nearest_km``, ``count``,
-    ``max_dbz``, ``source``, ``error``, ``digest``). State keys: ``radar_streak``,
+    ``max_dbz``, ``source``, ``error``, ``digest``, and the optional ``age_s``, ``coverage``,
+    ``confirm``, ``confirm_reason``, ``confirms_ts``). State keys: ``radar_streak``,
     ``radar_last_hit_ts``, ``radar_last_frame_ts``, ``radar_last_digest``.
+
+    A frame is usable while it is younger than ``cfg.radar_stale_s`` and not dated more than
+    10 min ahead of this host's clock; a copy reused after a failed fetch (``stale``) is as old
+    as the older of its frame time and the copy's own age (``age_s``) say. A frame of unknown
+    time can count an echo but is never "clear": its age cannot be judged. The frames a run
+    fetches to confirm its newest one (``earlier``; each carries ``confirms_ts``, the newest
+    frame's time) are judged from that time instead of the clock: usable up to
+    ``cfg.radar_stale_s`` before a usable newest frame, so an archive that is late does not
+    put the scan before the newest out of reach.
+
+    An echo that is not confirmed is "unconfirmed" (watch) when the frame before it was
+    examined and showed none, the case the two-frame rule exists for. Where no earlier frame
+    could be examined (``confirm`` "unavailable": the fetch failed, none in range, the frame
+    time unknown, a reused copy) the answer is "no data": runs 30 min apart cannot confirm an
+    echo between themselves, so "unconfirmed" would read GOOD for as long as it rains and
+    the earlier frames cannot be had. A check without the key is "unconfirmed" as before.
 
     The streak counts radar SCANS, each once: a frame whose ring holds the same data as the
     frame counted last (``digest``, ``radarcheck.ring_digest``: the composites are written
@@ -283,7 +354,9 @@ def check_radar(cfg, entry: dict, st: dict, now: datetime) -> Tuple[dict, List[s
     No echo is "clear" only where radar covers the ring: the frames write "no coverage" like
     "no echo", so ``coverage`` (MRMS's own file, ``vlba.mrms.site_coverage``) must say radar
     covers at least ``cfg.radar_min_coverage`` % of it; less, or coverage that could not be
-    read, is "no data". A coverage from an older file (``older``: none of the frame's time
+    read, is "no data", and so is a ring in which that file itself holds an echo the frame
+    does not show (``echo_cells`` above zero, where the coverage gives it: the image may be
+    blank). A coverage from an older file (``older``: none of the frame's time
     could be had; only with VLBA_RADAR_COVERAGE_MAX_LAG > 0) counts while ``behind_s`` is
     within that bound, checked again here: the check is then marked stale and its detail
     names the file, how far it lies before the frame and that a radar which failed since
@@ -309,10 +382,29 @@ def check_radar(cfg, entry: dict, st: dict, now: datetime) -> Tuple[dict, List[s
     if rc.get("off"):               # switched off on purpose (WEATHER_RADAR=0, VLBA_ISLAND_RADAR=0)
         return _check("radar", OFF, limit=limit, detail=str(rc.get("error") or "radar switched off")), []
     frame_ts = _as_dt(rc.get("frame_ts"))
-    # a frame of unknown time is at least as old as the copy it came from (age_s)
-    age_s = (now - frame_ts).total_seconds() if frame_ts else _num(rc.get("age_s"))
-    usable = bool(rc.get("available")) and (age_s is None or age_s <= float(cfg.radar_stale_s))
     stale = bool(rc.get("stale"))
+    stale_s = float(cfg.radar_stale_s)
+    # a frame of unknown time is at least as old as the copy it came from (age_s), and so is
+    # a copy reused after a failed fetch, whatever time its frame gives
+    frame_age = (now - frame_ts).total_seconds() if frame_ts else None
+    copy_age = _num(rc.get("age_s"))
+    age_s = frame_age if frame_age is not None else copy_age
+    if stale and frame_age is not None and copy_age is not None:
+        age_s = max(frame_age, copy_age)
+    # a frame dated ahead of the clock (a wrong time upstream, a clock stepped back) would
+    # stay "fresh" until that time has passed. 10 min is the bound of the stored frame time
+    # above: the sources' clocks and this host's differ by seconds, not minutes
+    ahead_s = 600.0
+    ahead = frame_age is not None and frame_age < -ahead_s
+    usable = bool(rc.get("available")) and not ahead and (age_s is None or age_s <= stale_s)
+    anchor = _as_dt(rc.get("confirms_ts"))
+    if anchor is not None and frame_ts is not None:
+        # a frame fetched to confirm the newest one is judged from that frame's time, not from
+        # the clock: the newest must be usable itself, and this one before it by no more than
+        # the gap that still makes two frames consecutive
+        lead = (anchor - frame_ts).total_seconds()
+        usable = bool(rc.get("available")) and 0 < lead <= stale_s and \
+            -ahead_s <= (now - anchor).total_seconds() <= stale_s
     frame_key = frame_ts.timestamp() if frame_ts else None
     digest = rc.get("digest") if isinstance(rc.get("digest"), str) else None
     last_digest = st.get("radar_last_digest") if isinstance(st.get("radar_last_digest"), str) else None
@@ -373,8 +465,20 @@ def check_radar(cfg, entry: dict, st: dict, now: datetime) -> Tuple[dict, List[s
         reasons.append("recent rain on radar within %g km (hold, %s left)" % (cfg.radar_km, _fmt_min(left)))
         return _check("radar", BAD_STATE, value="recent echo", limit=limit, detail=detail, stale=stale), reasons
     if not usable:
-        why = rc.get("error") or ("frame %s old" % _fmt_min(age_s) if age_s is not None else "no frame")
+        why = rc.get("error") or (
+            "frame dated %s ahead of this host's clock" % _fmt_min(-frame_age) if ahead and frame_age is not None
+            else "frame %s old" % _fmt_min(age_s) if age_s is not None else "no frame")
         return _check("radar", UNKNOWN, limit=limit, detail="%s: %s" % (src, why), stale=stale), []
+    if rc.get("in_ring") and rc.get("confirm") == "unavailable":
+        # an echo, and nothing to tell a first one from one that has been there for hours
+        why = rc.get("confirm_reason")
+        detail = "%s: echo in the newest frame; no earlier frame could be read to confirm it%s%s%s" % (
+            src, " (%s)" % why if why and isinstance(why, str) else "", "; " + where if where else "",
+            "; " + frame_txt if frame_txt else "")
+        c = _check("radar", UNKNOWN, value="echo, not confirmed", limit=limit, detail=detail, stale=stale)
+        c["note"] = "echo on radar within %g km that could not be confirmed%s" % (
+            cfg.radar_km, " (nearest %s km)" % _num_txt(rc.get("nearest_km")) if rc.get("nearest_km") is not None else "")
+        return c, []
     if rc.get("in_ring"):
         if new_frame:
             count_txt = "frame %d of %d" % (streak, int(cfg.radar_trigger_after))
@@ -391,6 +495,11 @@ def check_radar(cfg, entry: dict, st: dict, now: datetime) -> Tuple[dict, List[s
         return c, []
     detail = "%s: no echo of %g dBZ or more within %g km%s" % (
         src, cfg.radar_dbz, cfg.radar_km, "; " + frame_txt if frame_txt else "")
+    if frame_ts is None:
+        # no time (the island composite's capabilities failed or no longer parse): the picture
+        # may be of any age, and "clear" from an old picture is a guess
+        return _check("radar", UNKNOWN, limit=limit, stale=stale, detail=(
+            "%s, but the frame time is unknown: its age cannot be judged" % detail)), []
     cov = rc.get("coverage") if _is_dict(rc.get("coverage")) else None
     if cov is not None and cov.get("off"):
         detail += "; radar coverage not checked (VLBA_RADAR_COVERAGE=0)"
@@ -419,6 +528,13 @@ def check_radar(cfg, entry: dict, st: dict, now: datetime) -> Tuple[dict, List[s
                 src, _num_txt(100.0 - pct), cfg.radar_km, cov_txt)
             why += " (clear needs %g %% covered)%s" % (cfg.radar_min_coverage, "; " + frame_txt if frame_txt else "")
             return _check("radar", UNKNOWN, limit=limit, stale=stale, detail=why), []
+        cells = _num(cov.get("echo_cells"))
+        if cells is not None and cells > 0:
+            # MRMS's own file holds an echo in the ring and the frame shows none: a blank or
+            # incomplete image (or an older file, of rain since gone) must not read "clear"
+            return _check("radar", UNKNOWN, limit=limit, stale=stale, detail=(
+                "%s, but the MRMS file shows an echo the image does not (%d ring cell(s) of %g dBZ or "
+                "more%s): the image may be blank or incomplete" % (detail, int(cells), cfg.radar_dbz, cov_txt))), []
         if older:
             detail += "; radar covers %s%s: a radar that failed since would look the same" % (
                 "the ring" if pct >= 100.0 else "%s %% of the ring" % _num_txt(pct), cov_txt)
@@ -426,6 +542,25 @@ def check_radar(cfg, entry: dict, st: dict, now: datetime) -> Tuple[dict, List[s
         if pct < 100.0:
             detail += "; radar covers %s %% of the ring%s" % (_num_txt(pct), cov_txt)
     return _check("radar", OK, value="clear", limit=limit, detail=detail, stale=stale), []
+
+
+def _glm_examined(g: dict, now: datetime) -> str:
+    """The minutes a lightning view speaks for, to follow "no flash within 50 km": " in the
+    last 31 min", or, when the span examined ends more than a minute before the run (the
+    newest granules were not published yet), that span: ", 14:02 to 14:29 UTC examined".
+    The run's time is the GLM fetch's (``window_end``), not ``now``: the antennas are
+    evaluated one after the other, minutes after the fetch, and must read alike."""
+    t0, t1 = g.get("span_start"), g.get("span_end")
+    ref = g.get("window_end")
+    ref = ref if isinstance(ref, datetime) and ref.tzinfo is not None else now
+    if isinstance(t1, datetime) and t1.tzinfo is not None and (ref - t1).total_seconds() > 60:
+        if not isinstance(t0, datetime) or t0.tzinfo is None:
+            minutes = _num(g.get("window_min"))
+            t0 = now - timedelta(minutes=minutes) if minutes is not None and 0 < minutes < 1440 else None
+        if t0 is not None and t0 < t1:
+            return ", %s to %s UTC examined" % (t0.astimezone(timezone.utc).strftime("%H:%M"),
+                                                t1.astimezone(timezone.utc).strftime("%H:%M"))
+    return " in the last %s min" % _num_txt(g.get("window_min"))
 
 
 def check_glm(cfg, entry: dict, st: dict, now: datetime) -> Tuple[dict, List[str]]:
@@ -472,8 +607,8 @@ def check_glm(cfg, entry: dict, st: dict, now: datetime) -> Tuple[dict, List[str
         if near is not None:
             where = "nearest %s km %s" % (_num_txt(near), bearing or "")
         if hit:
-            detail = "%d flash(es) within %g km in the last %s min%s" % (
-                int(count), cfg.glm_km, _num_txt(g.get("window_min")), "; " + where if where else "")
+            detail = "%d flash(es) within %g km%s%s" % (
+                int(count), cfg.glm_km, _glm_examined(g, now), "; " + where if where else "")
             reasons.append("lightning within %g km%s" % (cfg.glm_km, " (%s)" % where.strip() if where else ""))
         else:
             # what this run's window says: flashes past the hold, nothing (when the window does
@@ -484,7 +619,7 @@ def check_glm(cfg, entry: dict, st: dict, now: datetime) -> Tuple[dict, List[str
                 opening = "%d flash(es) within %g km, the newest %s ago: past the %s hold; " % (
                     past_hold[0], cfg.glm_km, _fmt_min(past_hold[1]), _fmt_min(hold_s))
             elif not window_s or ago >= window_s:
-                opening = "no flash within %g km in the last %s min; " % (cfg.glm_km, _num_txt(g.get("window_min")))
+                opening = "no flash within %g km%s; " % (cfg.glm_km, _glm_examined(g, now))
             else:
                 opening = ""
             detail = "%sheld %s after the last one (%s ago%s)" % (
@@ -497,7 +632,7 @@ def check_glm(cfg, entry: dict, st: dict, now: datetime) -> Tuple[dict, List[str
         why = g.get("error") or "no GLM data this run"
         return _check("glm", UNKNOWN, limit=limit, detail=str(why)), []
     near = g.get("nearest_km")
-    detail = "no flash within %g km in the last %s min" % (cfg.glm_km, _num_txt(g.get("window_min")))
+    detail = "no flash within %g km%s" % (cfg.glm_km, _glm_examined(g, now))
     if past_hold:
         detail = "%d flash(es) within %g km, the newest %s ago: past the %s hold" % (
             past_hold[0], cfg.glm_km, _fmt_min(past_hold[1]), _fmt_min(hold_s))
@@ -528,10 +663,16 @@ VERDICT_SERIES = {"forecast_cloud": ("sky_cover_pct",), "forecast_precip": ("pop
 
 
 def forecast_unreadable(cfg, gp: Any) -> List[str]:
-    """The series that the checks switched on read and that could not be read this run."""
+    """The series that the checks switched on read and that could not be read this run:
+    malformed ones (``unusable``) and absent ones the site's office is not known to leave
+    out (``absent``, ``vlba.gridpoint.fetch``)."""
     gp = gp if _is_dict(gp) else {}
     used = {f for key, fields in VERDICT_SERIES.items() if cfg.check_enabled(key) for f in fields}
-    return [str(x) for x in (gp.get("unusable") or []) if x in used]
+    out: List[str] = []
+    for what in ("unusable", "absent"):
+        seq = gp.get(what) if isinstance(gp.get(what), (list, tuple)) else []
+        out.extend(str(x) for x in seq if x in used and str(x) not in out)
+    return out
 
 
 def forecast_fitness(cfg, gp: Any) -> Optional[str]:
@@ -578,6 +719,20 @@ def _forecast_rows(cfg, entry: dict, now: datetime) -> Tuple[Optional[dict], Opt
     return this_h, next_h, None, bool(gp.get("stale")), missing, unusable
 
 
+def _not_produced(entry: dict) -> Tuple[str, ...]:
+    """The ``missing`` series of ``entry["gridpoint"]`` that may read "not provided": those
+    the site's forecast office is known not to produce (``vlba.sites.series_not_provided``).
+    The gridpoint names the others (``absent``); a result without that key is judged by
+    the site entry. Every other absent series a check reads is a gap: unknown."""
+    gp = entry.get("gridpoint") if _is_dict(entry.get("gridpoint")) else {}
+    missing = [str(m) for m in (gp.get("missing") or [])]
+    absent = gp.get("absent")
+    if isinstance(absent, (list, tuple)):
+        return tuple(m for m in missing if m not in absent)
+    known = _sites.series_not_provided(entry.get("site"))
+    return tuple(m for m in missing if m in known)
+
+
 def _merge_hours(items: List[Tuple[str, Optional[str]]]) -> List[str]:
     """``[(text, "this hour" | "next hour" | None)]`` -> one reason per text, the hours
     joined: "likely snow forecast (this hour and next)" instead of two reasons."""
@@ -597,15 +752,22 @@ def _merge_hours(items: List[Tuple[str, Optional[str]]]) -> List[str]:
 
 
 def _pct_check(key: str, field: str, limit: float, rows: List[Tuple[str, dict]], stale: bool,
-               missing: List[str], age_txt: str = "", unusable: Tuple[str, ...] = ()) -> Tuple[dict, List[str]]:
+               missing: List[str], age_txt: str = "", unusable: Tuple[str, ...] = (),
+               not_produced: Tuple[str, ...] = ()) -> Tuple[dict, List[str]]:
+    """One percentage cut on ``rows`` (this hour first, then the next one if any). A value
+    over the limit in any of them is bad; clear needs a value for this hour, the one
+    operators act on: no value there is unknown, unless the series is one the office does
+    not produce (``not_produced``: "not provided")."""
     what = dict(CHECK_LABELS)[key].split(" (")[0].lower()
     limit_txt = "> %g %%" % limit
     worst = None
     over: List[Tuple[float, str]] = []
+    read: List[str] = []                    # the hours that hold a value
     for label, row in rows:
         v = _num(row.get(field))
         if v is None:
             continue
+        read.append(label)
         if worst is None or v > worst[0]:
             worst = (v, label)
         if v > limit:
@@ -619,21 +781,33 @@ def _pct_check(key: str, field: str, limit: float, rows: List[Tuple[str, dict]],
             reason = "%s %s > %g %%" % (what, ", ".join("%g %% (%s)" % o for o in over), limit)
         return _check(key, BAD_STATE, value="%g %% (%s)" % worst, limit=limit_txt,
                       detail=reason + age_txt, stale=stale), [reason]
-    if worst is None:
+    this_read = bool(rows) and rows[0][0] in read
+    if worst is None or not this_read:
         if field in unusable:
             return _check(key, UNKNOWN, limit=limit_txt,
                           detail="the NWS gridpoint series is unreadable this run"), []
         if field in missing:
-            return _check(key, NOT_PROVIDED, limit=limit_txt,
-                          detail="not in this NWS office's gridpoint product"), []
-        return _check(key, UNKNOWN, limit=limit_txt, detail="no value for this hour or next"), []
+            if field in not_produced:
+                return _check(key, NOT_PROVIDED, limit=limit_txt,
+                              detail="not in this NWS office's gridpoint product"), []
+            # the office sends this series in every other run: a gap, never "not provided"
+            return _check(key, UNKNOWN, limit=limit_txt,
+                          detail="the forecast has no %s this run (NWS gridpoint)" % what), []
+        if worst is None:
+            return _check(key, UNKNOWN, limit=limit_txt, detail="no value for this hour%s" % (
+                " or next" if len(rows) > 1 else "")), []
+        # the next hour alone says nothing about this one
+        return _check(key, UNKNOWN, value="%g %% (%s)" % worst, limit=limit_txt, stale=stale,
+                      detail="no value for this hour; %s at or below %g %%%s" % (worst[1], limit, age_txt)), []
     return _check(key, OK, value="%g %% (%s)" % worst, limit=limit_txt,
-                  detail="this hour and next at or below %g %%%s" % (limit, age_txt), stale=stale), []
+                  detail="%s at or below %g %%%s" % ("this hour and next" if len(read) > 1 else read[0],
+                                                     limit, age_txt), stale=stale), []
 
 
 def check_forecast(cfg, entry: dict, now: datetime) -> Tuple[List[dict], List[str]]:
     """The three ttustatus forecast cuts and the winter cut on the raw gridpoint."""
     this_h, next_h, why, stale, missing, unusable = _forecast_rows(cfg, entry, now)
+    not_produced = _not_produced(entry)
     checks: List[dict] = []
     reasons: List[str] = []
     specs = (("forecast_precip", "pop_pct", cfg.nws_precip_max),
@@ -649,7 +823,7 @@ def check_forecast(cfg, entry: dict, now: datetime) -> Tuple[List[dict], List[st
             continue
         rows = [("this hour", this_h)] + ([("next hour", next_h)] if next_h else [])
         c, r = _pct_check(key, field, float(limit), rows, stale, missing, forecast_age_text(entry),
-                          tuple(unusable))
+                          tuple(unusable), not_produced)
         c["reasons"] = r
         checks.append(c)
         reasons.extend(r)
@@ -659,7 +833,8 @@ def check_forecast(cfg, entry: dict, now: datetime) -> Tuple[List[dict], List[st
         state = NOT_PROVIDED if why and why.startswith("not provided") else UNKNOWN
         checks.append(_check("forecast_winter", state, limit="snow or ice > 0", detail=why or "no forecast", stale=stale))
     else:
-        c, r = _winter_check(this_h, next_h, stale, missing, entry.get("tz") or "UTC", unusable)
+        c, r = _winter_check(this_h, next_h, stale, missing, entry.get("tz") or "UTC", unusable,
+                             not_produced=not_produced)
         c["reasons"] = r
         checks.append(c)
         reasons.extend(r)
@@ -697,21 +872,21 @@ def _amount(what: str, mm: float, row: dict, key: str, label: str, tz: str) -> T
 
 
 def _winter_check(this_h: dict, next_h: Optional[dict], stale: bool, missing: List[str], tz: str = "UTC",
-                  unusable: Optional[List[str]] = None) -> Tuple[dict, List[str]]:
+                  unusable: Optional[List[str]] = None,
+                  not_produced: Tuple[str, ...] = ()) -> Tuple[dict, List[str]]:
+    """Snow or ice this hour or next (an amount above 0, or a frozen type of at least likely
+    coverage) is bad; "none" needs an answer for this hour (see below); ``not_produced``:
+    the ``missing`` series the office is known not to produce."""
     items: List[Tuple[str, Optional[str]]] = []
-    seen = False
     for label, row in (("this hour", this_h), ("next hour", next_h)):
         if row is None:
             continue
         snow, ice = _num(row.get("snow_mm")), _num(row.get("ice_mm"))
-        if snow is not None or ice is not None:
-            seen = True
         if snow is not None and snow > 0:
             items.append(_amount("snowfall", snow, row, "snow_mm", label, tz))
         if ice is not None and ice > 0:
             items.append(_amount("ice accumulation", ice, row, "ice_mm", label, tz))
         for txt in winter_entries(row):
-            seen = True
             items.append(("%s forecast" % txt, label))
     parts = _merge_hours(items)
     if parts:
@@ -727,27 +902,127 @@ def _winter_check(this_h: dict, next_h: Optional[dict], stale: bool, missing: Li
         return _check("forecast_winter", UNKNOWN, limit="snow or ice > 0",
                       detail="the NWS gridpoint's %s series %s unreadable this run" % (
                           " and ".join(bad), "is" if len(bad) == 1 else "are")), []
-    if not seen and all(f in missing for f in fields):
+    # "no snow" needs an answer for this hour: an amount, or a weather run that covers it
+    # (the frozen types are read from it). An amount series the office does not produce,
+    # or one absent this run while the weather covers the hour, is no gap; an amount series
+    # without a value for this hour is, like a weather series that does not cover it.
+    # (a weather series that is missing covers nothing, whatever a row without
+    # ``weather_covered`` holds in ``weather``)
+    wx_this = "weather" not in missing and _weather_covered(this_h)
+    gaps: List[str] = []
+    skipped: List[str] = []
+    for f in ("snow_mm", "ice_mm"):
+        name = _WINTER_NAMES[f]
+        if _num(this_h.get(f)) is not None:
+            continue
+        if f in missing and f in not_produced:
+            skipped.append(name)
+        elif f in missing and wx_this:
+            continue
+        elif f in missing:
+            gaps.append("the forecast has no %s series this run" % name)
+        else:
+            gaps.append("no %s value for this hour" % name)
+    if not wx_this and "weather" not in missing:
+        gaps.append("no weather entry for this hour")
+    answered = wx_this or any(_num(this_h.get(f)) is not None for f in ("snow_mm", "ice_mm"))
+    if not answered and all(f in missing and f in not_produced for f in fields):
         return _check("forecast_winter", NOT_PROVIDED, limit="snow or ice > 0",
                       detail="no snowfall, ice or weather fields in this gridpoint product"), []
+    if not answered and "weather" in missing:
+        gaps.append("the forecast has no weather series this run")
+    if gaps:
+        return _check("forecast_winter", UNKNOWN, limit="snow or ice > 0", stale=stale,
+                      detail="; ".join(gaps) + " (NWS gridpoint)"), []
     return _check("forecast_winter", OK, value="none", limit="snow or ice > 0",
-                  detail="no snow or ice in the forecast for this hour or next", stale=stale), []
+                  detail="no snow or ice in the forecast for this hour%s%s" % (
+                      " or next" if next_h is not None else "",
+                      " (no %s in this NWS office's product)" % " or ".join(skipped) if skipped else ""),
+                  stale=stale), []
+
+
+# The amount series of the winter check by their words in a detail.
+_WINTER_NAMES = {"snow_mm": "snowfall", "ice_mm": "ice accumulation"}
+
+
+def _weather_covered(row: dict) -> bool:
+    """Whether a weather run covers the row's hour (``weather_covered`` of
+    ``vlba.gridpoint.fetch``: NWS writes "nothing forecast" as an entry of nulls, which the
+    rows drop). A row without that key: whether ``weather`` is a list."""
+    if "weather_covered" in row:
+        return row.get("weather_covered") is True
+    return isinstance(row.get("weather"), list)
 
 
 def metar_precipitation(metar: Any) -> List[str]:
     """The present-weather groups of a raw METAR that mean precipitation (or a thunderstorm)
     at the station, e.g. ["-RA"], ["TSRA", "BR"] -> ["TSRA"]; the remarks (after RMK) are
     not read (their RE.. groups are recent weather, not current)."""
-    if not isinstance(metar, str):
-        return []
-    body = re.split(r"\sRMK\b", metar, 1)[0]
-    return [g for g in body.split()[2:] if _METAR_PRECIP.match(g)]
+    split = metar_groups(metar)
+    return [g for g in split[0] if _METAR_PRECIP.match(g)] if split else []
+
+
+def metar_groups(metar: Any) -> Optional[Tuple[List[str], List[str]]]:
+    """(the groups of a raw METAR after its station and time, the groups of its remarks), the
+    METAR / SPECI word left out; None for no text or one too long to be a METAR. Split once,
+    at the first RMK, so nothing here costs more than the text's length."""
+    if not isinstance(metar, str) or len(metar) > METAR_MAX_LEN:
+        return None
+    groups = metar.split()
+    if groups and groups[0] in ("METAR", "SPECI"):
+        groups = groups[1:]
+    at = groups.index("RMK") if "RMK" in groups else len(groups)
+    return groups[2:at] if at >= 2 else [], groups[at + 1:]
 
 
 def metar_pwino(metar: Any) -> bool:
     """Whether a raw METAR says its present-weather sensor is out of service (PWINO in the
     remarks): then the absence of weather groups says nothing about precipitation."""
-    return isinstance(metar, str) and bool(re.search(r"\sRMK\b.*\sPWINO\b", metar))
+    split = metar_groups(metar)
+    return bool(split) and "PWINO" in split[1]
+
+
+def metar_observes(metar: Any) -> bool:
+    """Whether a raw METAR's body has a visibility or a sky group: a METAR with neither (a
+    temperature and pressure, say) has not looked at the weather."""
+    split = metar_groups(metar)
+    return bool(split) and any(_METAR_VIS.match(g) or _METAR_SKY.match(g) for g in split[0])
+
+
+def metar_blind(metar: Any) -> Optional[str]:
+    """Why a raw METAR cannot show precipitation, so that the absence of weather groups in it
+    says nothing (only the precipitation it does show counts), or None (also for no raw
+    METAR at all: then the record's other fields speak). Its present-weather sensor out
+    (PWINO); a station without a precipitation discriminator (AO1, AO1A: it never codes
+    RA, SN, ...); a report that is missing (NIL), has nothing after its time, or marks its
+    present weather as not observed (//); a text too long to be a METAR."""
+    if not isinstance(metar, str) or not metar.strip():
+        return None
+    split = metar_groups(metar)
+    if split is None:
+        return "raw METAR too long to read"
+    body, remarks = split
+    if "NIL" in body:
+        return "report missing (NIL)"
+    if not [g for g in body if g not in ("AUTO", "COR", "$")]:
+        return "nothing after the report time"
+    if "//" in body:
+        return "present weather not observed (//)"
+    if "PWINO" in remarks:
+        return "present-weather sensor out (PWINO)"
+    if "AO1" in remarks or "AO1A" in remarks:
+        return "no precipitation sensor (AO1)"
+    return None
+
+
+def _precip_named(s: str) -> bool:
+    """Whether a text names precipitation at the station: a phenomenon "in the vicinity" is
+    taken out first (only that one: other precipitation named with it still counts). A text
+    longer than any station's (``METAR_MAX_LEN``) is read whole, as before: the phrase search
+    costs too much on megabytes of it."""
+    if len(s) <= METAR_MAX_LEN:
+        s = _VICINITY.sub(" ", s)
+    return bool(_PRECIP_WORDS.search(s)) and not _NOT_PRECIP.search(s)
 
 
 def observed_precipitation(obs_raw: Optional[dict], text: str) -> Optional[str]:
@@ -756,12 +1031,14 @@ def observed_precipitation(obs_raw: Optional[dict], text: str) -> Optional[str]:
     decode has only those), or precipitation in the last hour; None when nothing."""
     raw = obs_raw if _is_dict(obs_raw) else {}
     for w in raw.get("present_weather") or []:
+        # one entry is one METAR group, all of it in the vicinity or none ("showers rain in the
+        # vicinity" is NWS's VCSH decoded): an entry in the vicinity is no precipitation here
         s = str(w)
         if _PRECIP_WORDS.search(s) and not _NOT_PRECIP.search(s):
             return "present weather: %s" % s
     # a description may join phenomena ("Light Rain and Fog/Mist", "Thunderstorm in Vicinity,
     # Light Rain"): each part on its own, so a vicinity part does not hide rain at the station
-    if text and any(_PRECIP_WORDS.search(p) and not _NOT_PRECIP.search(p) for p in _TEXT_PARTS.split(text)):
+    if text and any(_precip_named(p) for p in _TEXT_PARTS.split(text)):
         return "station reports %s" % text.strip()
     groups = metar_precipitation(raw.get("metar"))
     if groups:
@@ -782,7 +1059,7 @@ def check_observation(cfg, entry: dict, now: datetime) -> Tuple[List[dict], List
     reasons: List[str] = []
     sid = str(obs.get("station_id") or station.get("id") or "station")
     age_min = _num(obs.get("age_min"))
-    ago = (" %s ago" % util.fmt_duration_minutes(age_min)) if age_min is not None else ""
+    ago = _ago(age_min, " %s ago")
     # No station of NWS's list lies within the limits (Mauna Kea, Pie Town): the checks do
     # not apply to this antenna at all, in every run, which is not a gap of this run.
     qual = station.get("qualifying")
@@ -822,10 +1099,21 @@ def check_observation(cfg, entry: dict, now: datetime) -> Tuple[List[dict], List
             psid, text = str(raw.get("report_station") or sid), str(raw.get("text") or "")
             age = _num(raw.get("report_age_min"))
             p_stale = bool(raw.get("report_stale")) if report else stale
-            precip_reason = "%s report%s (%s)" % (
-                psid, "" if age is None else " of %s ago" % util.fmt_duration_minutes(age),
-                "its newest with weather" if psid == sid else
-                str(raw.get("report_passed") or "%s's latest has no weather" % sid))
+            src = str(raw.get("report_source") or "")     # a METAR NWS did not have yet
+            # a newer report of that station that cannot show precipitation (PWINO, ...):
+            # only rain in this one counts, and the detail says why it is not the newest
+            blind = str(raw.get("report_blind") or "")
+            if psid == sid and not src:
+                note = blind or "its newest with weather"
+            else:
+                note = str(raw.get("report_passed") or "%s's latest has no weather" % sid)
+                # (not twice: "<station>'s newest report: ..." in the note says it already)
+                if blind and blind not in note and blind.replace("'s newer report: ", "'s newest report: ") not in note:
+                    note += "; " + blind
+            precip_reason = "%s %s%s%s (%s)" % (
+                psid, "METAR" if src else "report",
+                _ago(age, " of %s ago"),
+                " from %s" % src if src else "", note)
         found = observed_precipitation(raw, text)
         if found:
             why_bad = "precipitation at %s (%s)" % (psid, found)
@@ -892,7 +1180,12 @@ def check_wind(cfg, entry: dict, now: datetime) -> Tuple[dict, List[str]]:
     ``cfg.wind_mph`` (the antennas stow in high wind; off when it is 0). The observation
     counts only while the station is usable for the antenna, as for the other observation
     checks: a valley station says nothing about a ridge. One reason per source (the
-    strongest observed value, the strongest forecast hour), so the summary stays short."""
+    strongest observed value, the strongest forecast hour), so the summary stays short.
+    Clear needs both halves: a qualifying station without a usable report (where no
+    station qualifies, the forecast is the check), a forecast that is unavailable or has
+    no wind for this hour, or a wind or gust series that is unreadable or absent this run
+    leaves the check unknown unless a value already reaches the limit. A report without a
+    wind value is the exception: named in the detail, the forecast then decides alone."""
     if not cfg.check_enabled("wind"):
         return _check("wind", OFF, detail="no wind threshold configured (VLBA_WIND_MPH)"), []
     limit = float(cfg.wind_mph)
@@ -903,10 +1196,18 @@ def check_wind(cfg, entry: dict, now: datetime) -> Tuple[dict, List[str]]:
     details: List[str] = []
     worst: List[Tuple[float, str]] = []         # the strongest value of each source
     windless: Optional[int] = None              # the detail of a report without a wind value
+    gaps: List[str] = []                        # a source that should have answered and did not
+    # no station of NWS's list suits the antenna (Mauna Kea, Pie Town): the forecast alone
+    # is the check there, in every run; anywhere else a missing report is a gap of this run
+    no_station = isinstance(station.get("qualifying"), list) and not station.get("qualifying")
     if not obs.get("ok"):
         details.append(_no_obs(obs))
+        if not no_station:
+            gaps.append("no observed wind")
     elif not station.get("usable", True):
         details.append("%s not used: %s" % (sid, station.get("why") or "station too far from the antenna"))
+        if not no_station:
+            gaps.append("no observed wind")
     else:
         got = [(what, _num(obs.get(key))) for key, what in (("wind_mph", "wind"), ("gust_mph", "gust"))]
         got = [(what, v) for what, v in got if v is not None]
@@ -918,7 +1219,8 @@ def check_wind(cfg, entry: dict, now: datetime) -> Tuple[dict, List[str]]:
             # a report without a wind value (NWS's decoding left it out): said, not skipped
             details.append("%s: no wind value in its report" % sid)
             windless = len(details) - 1
-    this_h, next_h, why, stale, _, unusable = _forecast_rows(cfg, entry, now)
+    this_h, next_h, why, stale, missing, unusable = _forecast_rows(cfg, entry, now)
+    not_produced = _not_produced(entry)
     hours: List[str] = []
     best_fc: Optional[Tuple[float, str]] = None
     for label, row in (("this hour", this_h), ("next hour", next_h)):
@@ -927,7 +1229,14 @@ def check_wind(cfg, entry: dict, now: datetime) -> Tuple[dict, List[str]]:
         got = [(what, _num(row.get(key))) for key, what in (("wind_kmh", "wind"), ("gust_kmh", "gust"))]
         got = [(what, util.kmh_to_mph(v)) for what, v in got if v is not None]
         if not got:
+            if label == "this hour":
+                gaps.append("no forecast wind for this hour")
             continue
+        if (label == "this hour" and "gust_kmh" in row and _num(row.get("gust_kmh")) is None
+                and "gust_kmh" not in missing and "gust_kmh" not in unusable):
+            # the gust series is there but says nothing about this hour: the sustained wind
+            # alone is no answer (the gusts are what usually reach the limit)
+            gaps.append("no forecast gust for this hour")
         hours.append("%s %s" % (label, ", ".join("%s %s mph" % (w, _num_txt(v)) for w, v in got)))
         what, v = max(got, key=lambda wv: wv[1])
         if best_fc is None or v > best_fc[0]:
@@ -939,23 +1248,39 @@ def check_wind(cfg, entry: dict, now: datetime) -> Tuple[dict, List[str]]:
             details[windless] += ", the forecast decides alone"
     elif this_h is None and why:
         details.append(why if why.startswith("forecast") else "forecast: %s" % why)
+    if this_h is None and not (why and why.startswith("not provided")):
+        gaps.append("no forecast wind")
     stale = bool(stale or (obs.get("ok") and obs.get("stale")))
     if not worst:
         return _check("wind", UNKNOWN, limit=limit_txt,
                       detail="no wind value: " + "; ".join(details) if details else "no wind value"), []
-    reasons = [txt for v, txt in worst if v >= limit]
+    reasons = [txt for v, txt in worst if _wind_reaches(v, limit)]
     top = max(worst, key=lambda vt: vt[0])[1]
     if reasons:
         return _check("wind", BAD_STATE, value=top, limit=limit_txt, detail="; ".join(details),
                       stale=stale), reasons
-    bad = [f for f in ("wind_kmh", "gust_kmh") if f in unusable]
-    if bad and this_h is not None:
-        # the gusts are what usually reach the limit: no answer without them
+    if this_h is not None:
+        # the gusts are what usually reach the limit: no answer without them (nor without
+        # the sustained wind), whether the series is malformed or absent this run
+        for what, why_txt in (("unusable", "unreadable"), ("missing", "absent")):
+            bad = [f for f in ("wind_kmh", "gust_kmh")
+                   if f in (unusable if what == "unusable" else missing) and f not in not_produced]
+            if bad:
+                gaps.append("the NWS gridpoint's %s series %s this run"
+                            % (" and ".join("gust" if f == "gust_kmh" else "wind" for f in bad), why_txt))
+    if gaps:
+        # one source below the limit is no answer while another that should speak is silent
         return _check("wind", UNKNOWN, value=top, limit=limit_txt, stale=stale,
-                      detail="; ".join(details + ["the NWS gridpoint's %s series unreadable this run"
-                                                  % " and ".join("gust" if f == "gust_kmh" else "wind"
-                                                                 for f in bad)])), []
+                      detail="; ".join(details + [g for g in gaps if g not in ("no observed wind", "no forecast wind")])
+                      or "; ".join(gaps)), []
     return _check("wind", OK, value=top, limit=limit_txt, detail="; ".join(details), stale=stale), []
+
+
+def _wind_reaches(v: float, limit: float) -> bool:
+    """At or above the wind limit, as the value is shown (``_num_txt``, one decimal): a
+    44.96 mph gust reads "45 mph" and must not read clear beside ">= 45 mph"; the rounding
+    errs toward BAD by at most 0.05 mph."""
+    return v >= limit or round(v, 1) >= limit
 
 
 def _num_txt(v: Any, nd: int = 1) -> str:
@@ -1024,14 +1349,18 @@ def evaluate(cfg, entry: dict, st: dict, now: Optional[datetime] = None) -> dict
     res = guarded("forecast", check_forecast, cfg, entry, now)
     if res is None:
         for key in ("forecast_precip", "forecast_thunder", "forecast_cloud", "forecast_winter"):
-            checks[key] = _check(key, UNKNOWN, detail="check failed (see the log)")
+            # a sibling switched off stays off: only a check in use lacks its answer
+            checks[key] = (_check(key, UNKNOWN, detail="check failed (see the log)") if cfg.check_enabled(key)
+                           else _check(key, OFF, detail="switched off"))
     else:
         for c in res[0]:
             checks[c["key"]] = c
     res = guarded("observation", check_observation, cfg, entry, now)
     if res is None:
         for key in ("obs_precip", "obs_humidity"):
-            checks[key] = _check(key, UNKNOWN, detail="check failed (see the log)")
+            # a sibling switched off stays off: only a check in use lacks its answer
+            checks[key] = (_check(key, UNKNOWN, detail="check failed (see the log)") if cfg.check_enabled(key)
+                           else _check(key, OFF, detail="switched off"))
     else:
         for c in res[0]:
             checks[c["key"]] = c
@@ -1041,6 +1370,17 @@ def evaluate(cfg, entry: dict, st: dict, now: Optional[datetime] = None) -> dict
     else:
         checks["wind"], r = res
         checks["wind"]["reasons"] = r
+    # clock guard: this host's clock far from the data sources' (vlba/clock.py) means every
+    # answer may be about the wrong time (an old radar frame or GLM window read as current, a
+    # warning in effect read as scheduled): only a BAD stands, everything else is no data
+    from vlba import clock
+    if clock.is_off(entry.get("clock")):
+        why = clock.off_by(entry.get("clock"))
+        for c in checks.values():
+            if c.get("state") in (OK, WATCH, SCHEDULED):
+                c.update(state=UNKNOWN, detail=why, reasons=[])
+                c.pop("note", None)
+        scheduled = []      # "scheduled from ..." was judged by the wrong clock: not shown
 
     reasons = [r for k in REASON_ORDER for r in (checks.get(k, {}).get("reasons") or [])]
     ordered = [checks[k] for k in CHECK_KEYS if k in checks]

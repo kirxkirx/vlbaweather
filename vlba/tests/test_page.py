@@ -159,7 +159,7 @@ def test_page_renders_the_layout(cfg, run):
     assert '<span class="vbadge caution sm" title="inputs missing: Lightning (GOES GLM)">GOOD?</span>' in html
     assert "rain on radar within 30 km" in html and "+" not in html.split("<table class=\"sum\">")[1].split("</table>")[0].split("humidity 97")[0][-5:]
     assert "Sun up 35" in html and "Sun down -12" in html
-    assert "<b>1</b> of 2 sites GOOD, <b>1</b> BAD, 1 with inputs missing." in html
+    assert "2 sites: <b>0</b> GOOD, <b>1</b> GOOD? (inputs missing), <b>1</b> BAD." in html
     assert html.count("UTC") >= 2 and "local times in each row" in html
     # at phone width the summary's local-time column is hidden, and so is the note about it
     assert '<span class="lt"> · local times in each row</span>' in html
@@ -211,7 +211,7 @@ def test_status_json_carries_verdicts(cfg, run):
     assert doc["page_written"] is True
     assert doc["verdicts"]["pt"]["status"] == "BAD" and doc["verdicts"]["pt"]["checks"]["radar"] == "bad"
     assert doc["verdicts"]["mk"]["incomplete"] is True and doc["verdicts"]["mk"]["missing"] == ["Lightning (GOES GLM)"]
-    assert doc["summary"] == {"good": 1, "bad": 1, "no_data": 0, "incomplete": 1}
+    assert doc["summary"] == {"good": 1, "bad": 1, "no_data": 0, "incomplete": 1, "good_incomplete": 1}
     assert doc["sites"]["mk"]["island_radar_ok"] is True and doc["sites"]["pt"]["sun_up"] is True
     assert doc["sites"]["mk"]["verdict"] == "GOOD"
     assert doc["glm"]["partial"] is True and doc["glm"]["flashes"] == 12
@@ -245,7 +245,7 @@ def test_older_and_partial_run_dicts_render(cfg, run):
     html = page.render_html(cfg, run)
     assert "could not be rendered" not in html
     assert "NO VERDICT" in html and "No GLM result this run" in html
-    assert "<b>0</b> of 2 sites GOOD, <b>0</b> BAD, 2 without data." in html
+    assert "2 sites: <b>0</b> GOOD, <b>0</b> GOOD? (inputs missing), <b>0</b> BAD, <b>2</b> without data." in html
 
 
 def test_garbage_never_raises(cfg):

@@ -35,8 +35,10 @@ import json
 import logging
 import math
 import re
+import time
 import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta, timezone
+from xml.parsers import expat
 from email.utils import parsedate_to_datetime
 from typing import Any, Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
 
@@ -64,6 +66,35 @@ DEFAULT_LSR_URL = ("https://mesonet.agron.iastate.edu/geojson/lsr.geojson"
                    "?hours={hours}&states=NM")
 NM_TZ = "America/Denver"                   # NMRoads writes local wall-clock times
 CAUSE_MAX = 400
+# Longest feed texts read, in characters. Several of the patterns below (the lane-closure
+# scan _PARTIAL, the title clean-up, tag stripping) cost up to the square of a text's
+# length, and nothing else bounds what a feed sends. An NMDOT title is one line, a
+# description a short paragraph, a storm-report remark a few sentences, and the page shows
+# at most CAUSE_MAX characters of any of them, so these limits leave a wide margin.
+TITLE_MAX = 1000            # a title (cleaned text)
+TEXT_MAX = 4000             # a whole narrative (all its segments) or one storm-report remark
+RAW_MAX = 16000             # one raw RSS description, HTML markup included, before cleaning
+# Most events and storm reports read per run. Each costs a little classification and a
+# list entry on every map it touches; NMDOT lists a few hundred events state-wide and New
+# Mexico files far fewer storm reports in a week (the longest window, 168 h). Past these the
+# feed is broken or hostile: the rest is left out and the feed reported incomplete.
+NM_MAX_EVENTS = 5000
+NM_MAX_LISTED = 500         # emergency events kept (most important first, see _event_order)
+LSR_MAX_FEATURES = 2000
+# Seconds of classification per run, the last bound on hostile text: a live feed takes well
+# under a second, and a run must leave time for everything else before the wrapper's timeout.
+NM_TIME_BUDGET = 20.0
+# A date this far ahead of the run is a clock or data error, not a time (NTP-synchronised
+# clocks differ by well under a second; this also absorbs a feed written a few minutes
+# "early" by a host whose clock is off).
+FUTURE_SLACK = timedelta(minutes=10)
+# An NMDOT event this long past its "Expiration Date" is a leftover, left out (counted as
+# "expired"): the hour absorbs a feed that is refreshed late.
+EXPIRED_GRACE = timedelta(hours=1)
+# rss.xml and nmroads.json describe the same events; when more than this many (and more
+# than this share) of them are in one file only, the join between the two is broken.
+ORPHAN_MIN = 3
+ORPHAN_SHARE = 0.1
 _NS = {"geo": "http://www.w3.org/2003/01/geo/wgs84_pos#", "osow": "http://nmroads.com/osow/"}
 
 # ---- classification ------------------------------------------------------------------
@@ -242,7 +273,10 @@ def _sentences(text: str) -> List[str]:
     for m in _BOUNDARY.finditer(text):
         if m.group(1) is not None:
             nxt = text[m.end():m.end() + 1]
-            if m.group(1) == "." and _is_abbrev(text[start:m.start() + 1]):
+            # only the end of the sentence so far: the longest abbreviation is 5 letters,
+            # and a longer word is no abbreviation whether seen whole or cut (scanning the
+            # whole prefix at every period made this quadratic)
+            if m.group(1) == "." and _is_abbrev(text[max(start, m.start() - 11):m.start() + 1]):
                 continue
             if m.group(1) in ".!?" and nxt.islower():
                 continue
@@ -315,9 +349,9 @@ def classify_event(category: str, title: str, narrative: str,
        (cause known: the conditions, or an emergency), water when it reports flooding /
        standing water / water over the road, else excluded.
     Water items are produced only when ``water`` is True."""
-    cat = " ".join((category or "").split())
-    title = title or ""
-    narrative = narrative or ""
+    cat = " ".join((category or "")[:TITLE_MAX].split())
+    title = (title or "")[:TITLE_MAX]
+    narrative = (narrative or "")[:TEXT_MAX]
     title_rest = re.sub(r"^\s*%s\s*[,:-]?\s*" % re.escape(cat), "", title, flags=re.I) if cat \
         else title
     sents = _sentences(narrative)
@@ -374,7 +408,7 @@ def clean_text(s: Optional[str]) -> str:
     whitespace collapsed."""
     if not s:
         return ""
-    s = _DELIM_RE.sub(" ", s)
+    s = _DELIM_RE.sub(" ", s[:RAW_MAX])
     s = _BR.sub(" ", s)
     s = _TAG.sub(" ", s)
     s = html.unescape(s).replace(" ", " ")
@@ -394,8 +428,14 @@ def _clip(s: str, n: int = CAUSE_MAX) -> str:
 def _segments(raw_description: str) -> List[str]:
     """The narrative split at NMDOT's delimiter token (the first segment is NMDOT's
     templated condition, e.g. "Standing water on roadway.", the rest free text), cleaned."""
-    parts = _DELIM_RE.split(raw_description or "")
-    return [p for p in (clean_text(x) for x in parts) if p]
+    parts = _DELIM_RE.split((raw_description or "")[:RAW_MAX])
+    out: List[str] = []
+    budget = TEXT_MAX
+    for p in (clean_text(x) for x in parts):
+        if p and budget > 0:
+            out.append(p[:budget])
+            budget -= len(out[-1])
+    return out
 
 
 def _norm(s: str) -> str:
@@ -408,12 +448,25 @@ def make_cause(segments: Sequence[str], title: str) -> str:
     dropped, repeated sentences removed, at most ``CAUSE_MAX`` characters."""
     out: List[str] = []
     seen = set()
-    nt = _norm(re.sub(r"[.\s]+$", "", title or ""))
+    nt = _norm(re.sub(r"[.\s]+$", "", (title or "")[:TITLE_MAX]))
+    budget = TEXT_MAX
     for seg in segments:
+        if budget <= 0:
+            break
+        seg = seg[:budget]
+        budget -= len(seg)
         if nt and _norm(seg).startswith(nt):
             # "Closure, NM 273 ... State Line., due to flooding." -> "Due to flooding."
+            # Cut after the title's last word, counting words the way _norm does: a
+            # regex such as (?:\W*\w+){N} counts "aña" as one word where _norm sees two,
+            # and backtracks exponentially when the counts disagree.
             words = len(nt.split())
-            m = re.match(r"(?:\W*\w+){%d}" % words, seg)
+            m = None
+            for i, m in enumerate(re.finditer(r"[A-Za-z0-9]+", seg), 1):
+                if i == words:
+                    break
+            else:
+                m = None
             rest = seg[m.end():] if m else seg
             if re.match(r"^\s*[.,;:]", rest):
                 rest = rest.lstrip(" .,;:")
@@ -526,15 +579,20 @@ def _pt(p: Any) -> Optional[List[float]]:
 
 def clean_geometry(g: Any) -> Optional[dict]:
     """A GeoJSON Point / MultiPoint / LineString / MultiLineString with valid lon/lat
-    (2-D, rounded to 1e-6 degrees), or None. Invalid vertices are dropped."""
+    (2-D, rounded to 1e-6 degrees), or None. Invalid vertices are dropped, and so is a line
+    part that is not a list; coordinates that are not a list make the geometry None (the
+    feature is then skipped like any other without a usable geometry, instead of one bad
+    feature failing the whole file)."""
     if not isinstance(g, dict):
         return None
     t, c = g.get("type"), g.get("coordinates")
+    if not isinstance(c, (list, tuple)):
+        return None
     if t == "Point":
         p = _pt(c)
         return {"type": "Point", "coordinates": p} if p else None
     if t in ("LineString", "MultiPoint"):
-        pts = [q for q in (_pt(p) for p in (c or [])) if q]
+        pts = [q for q in (_pt(p) for p in c) if q]
         if not pts:
             return None
         if t == "LineString" and len(pts) == 1:
@@ -542,8 +600,10 @@ def clean_geometry(g: Any) -> Optional[dict]:
         return {"type": t, "coordinates": pts}
     if t == "MultiLineString":
         lines = []
-        for line in c or []:
-            pts = [q for q in (_pt(p) for p in (line or [])) if q]
+        for line in c:
+            if not isinstance(line, (list, tuple)):
+                continue
+            pts = [q for q in (_pt(p) for p in line) if q]
             if pts:
                 lines.append(pts)
         if not lines:
@@ -644,13 +704,31 @@ def _rss_sections(raw: str) -> Dict[str, str]:
     return out
 
 
+def _refuse_dtd(data: bytes) -> None:
+    """``ValueError`` if the document declares a DOCTYPE or an entity in whatever encoding the
+    parser reads it in. The byte search in ``parse_rss`` sees ASCII-compatible text only: in a
+    UTF-16 document "<!DOCTYPE" has other bytes. The parser stops at the declaration, before
+    any entity is defined."""
+    def refuse(*_args):
+        raise ValueError("rss.xml declares a DOCTYPE/ENTITY (refused)")
+    p = expat.ParserCreate()
+    p.StartDoctypeDeclHandler = refuse
+    p.EntityDeclHandler = refuse
+    try:
+        p.Parse(data or b"", True)
+    except expat.ExpatError as e:
+        raise ValueError("rss.xml is not XML: %s" % e)
+
+
 def parse_rss(data: bytes) -> Tuple[Dict[str, dict], Optional[datetime]]:
     """rss.xml -> ({guid: item}, lastBuildDate). Each item: {"guid", "category",
     "rss_title", "title", "segments", "posted", "updated", "updated_raw" (the "Update Date"
-    text, for spotting batch re-saves), "route_name", "route_number", "mm_from", "mm_to",
-    "direction", "point"}. Raises ValueError on unparseable XML."""
+    text, for spotting batch re-saves), "expires" (the "Expiration Date", None when not
+    given), "route_name", "route_number", "mm_from", "mm_to", "direction", "point"}.
+    Raises ValueError on unparseable XML."""
     if re.search(rb"<!(DOCTYPE|ENTITY)", data or b"", re.I):
         raise ValueError("rss.xml declares a DOCTYPE/ENTITY (refused)")    # no entity games
+    _refuse_dtd(data)
     try:
         root = ET.fromstring(data)
     except ET.ParseError as e:
@@ -671,14 +749,15 @@ def parse_rss(data: bytes) -> Tuple[Dict[str, dict], Optional[datetime]]:
         items[guid] = {
             "guid": guid,
             "category": " ".join((it.findtext("category") or "").split()),
-            "rss_title": clean_text(it.findtext("title")),
-            "title": clean_text(sec.get("title")),
+            "rss_title": clean_text(it.findtext("title"))[:TITLE_MAX],
+            "title": clean_text(sec.get("title"))[:TITLE_MAX],
             "segments": _segments(sec["description"] if "description" in sec
                                   else ("" if sec else raw)),
             "posted": (parse_nm_date(clean_text(sec.get("post date")))
                        or parse_nm_date(it.findtext("pubDate"))),
             "updated": parse_nm_date(clean_text(sec.get("update date"))),
             "updated_raw": clean_text(sec.get("update date")),
+            "expires": parse_nm_date(clean_text(sec.get("expiration date"))),
             "route_name": (it.findtext("osow:routeName", namespaces=_NS) or "").strip(),
             "route_number": (it.findtext("osow:routeNumber", namespaces=_NS) or "").strip(),
             "mm_from": _num(it.findtext("osow:mileMarkerFrom", namespaces=_NS)),
@@ -717,7 +796,7 @@ def parse_json(data: bytes) -> List[dict]:
         out.append({
             "id": str(fid).strip(),
             "category": " ".join(str(core.get("name") or core.get("event_type") or "").split()),
-            "title": clean_text(desc if isinstance(desc, str) else ""),
+            "title": clean_text(desc if isinstance(desc, str) else "")[:TITLE_MAX],
             "road_names": [n for n in names if isinstance(n, str)],
             "direction": direction if isinstance(direction, str) else "",
             "geometry": clean_geometry(f.get("geometry")),
@@ -770,7 +849,7 @@ def _direction(item: Optional[dict], feat: Optional[dict]) -> Optional[str]:
 
 
 def _clean_title(t: str) -> str:
-    t = " ".join((t or "").split())
+    t = " ".join((t or "")[:TITLE_MAX].split())
     t = re.sub(r"\s+([.,;:])", r"\1", t)
     t = re.sub(r"(,\s*)+\.$", "", t)
     t = re.sub(r"\.{2,}", ".", t)
@@ -798,7 +877,8 @@ def batch_stamps(items: Iterable[dict]) -> set:
 
 
 def build_event(feat: Optional[dict], item: Optional[dict], water: bool = True,
-                batch: Iterable[str] = ()) -> Tuple[Optional[dict], Optional[str], str, str]:
+                batch: Iterable[str] = (), now: Optional[datetime] = None
+                ) -> Tuple[Optional[dict], Optional[str], str, str]:
     """One NMDOT event from its JSON feature and/or RSS item: ``(RoadEvent or None,
     category, reason, dedupe title)``. The RoadEvent is returned for kept AND excluded
     events (its ``kind`` is None when excluded); None only when there is no geometry.
@@ -809,7 +889,13 @@ def build_event(feat: Optional[dict], item: Optional[dict], water: bool = True,
     date and ``time_approx`` is True: those dates run 0 to 7 h behind the RSS post dates
     (live 2026-09-23), so the age is approximate (at most 7 h too old), but a stale event
     still gets its "may have reopened" flag. ``area_wide`` marks a condition reported for a
-    whole patrol area at one point: listed, never drawn as if it were on a road."""
+    whole patrol area at one point: listed, never drawn as if it were on a road.
+
+    A post or update time more than ``FUTURE_SLACK`` after ``now`` (default: the clock) is
+    no time the event was touched (a scheduled start, or a feed clock error): it is dropped,
+    so the page says "time not given" instead of "updated just now" for days. ``expires`` is
+    the RSS "Expiration Date" (None when not given); ``fetch_nm_roads`` leaves out events
+    past it."""
     geometry = (feat or {}).get("geometry")
     if geometry is None and item and item.get("point"):
         geometry = {"type": "Point", "coordinates": item["point"]}
@@ -850,6 +936,15 @@ def build_event(feat: Optional[dict], item: Optional[dict], water: bool = True,
         ev["updated"] = None
     if item is None and feat and isinstance(feat.get("created"), datetime):
         ev["posted"], ev["time_approx"] = feat["created"], True
+    ahead = (now or util.utcnow()) + FUTURE_SLACK
+    for k in ("updated", "posted"):
+        if isinstance(ev[k], datetime) and ev[k] > ahead:
+            log.debug("NMRoads %s: %s time %s is in the future, ignored", ev["id"], k,
+                      ev[k].isoformat())
+            ev[k] = None
+    if not isinstance(ev["posted"], datetime):
+        ev["time_approx"] = False
+    ev["expires"] = (item or {}).get("expires")
     return ev, category, reason, title
 
 
@@ -949,20 +1044,53 @@ def _fetch_nm_roads(cfg, cache) -> Dict[str, Any]:
         pairs = [(f, (items or {}).get(f["id"])) for f in feats or []]
     else:
         pairs = [(by_id.get(g), it) for g, it in (items or {}).items()]
+    if len(pairs) > NM_MAX_EVENTS:
+        log.warning("NMRoads lists %d events; only the first %d read", len(pairs), NM_MAX_EVENTS)
+        errors.append("feed lists %d events, only the first %d read"
+                      % (len(pairs), NM_MAX_EVENTS))
+        pairs = pairs[:NM_MAX_EVENTS]
+    # Events in only one of the two files (both read): the join on feature id == RSS guid
+    # failed for them. A feature without its RSS text is classified from its templated title
+    # alone, so planned work filed as "Closure" would be listed as a closure.
+    both = feats is not None and items is not None
+    orphans = {id(f if json_first else it) for f, it in pairs
+               if both and (it is None if json_first else f is None)}
 
     excluded: Dict[str, int] = {}
     in_region: List[Tuple[dict, str, str]] = []
+    # id(ev) -> ev: holding the event keeps its id from being reused by a later event once
+    # an orphan outside the region (never kept) is freed
+    orphan_evs: Dict[int, dict] = {}
+    now = util.utcnow()
     batch = batch_stamps((items or {}).values())
     if batch:
         log.debug("NMRoads: %d batch re-save stamp(s) ignored as update times: %s",
                   len(batch), ", ".join(sorted(batch)))
-    for feat, item in pairs:
-        ev, category, reason, _ = build_event(feat, item, water=water, batch=batch)
+    started = time.monotonic()
+    for n, (feat, item) in enumerate(pairs):
+        if time.monotonic() - started > NM_TIME_BUDGET:
+            log.warning("NMRoads: classification stopped after %.0f s, %d of %d events read",
+                        NM_TIME_BUDGET, n, len(pairs))
+            errors.append("processing stopped after %.0f s: only %d of %d events read"
+                          % (NM_TIME_BUDGET, n, len(pairs)))
+            break
+        ev, category, reason, _ = build_event(feat, item, water=water, batch=batch, now=now)
+        if ev is not None and id(feat if json_first else item) in orphans:
+            orphan_evs[id(ev)] = ev
         if ev is None:
             log.debug("NMRoads %s: skipped (%s)", (feat or item or {}).get("id")
                       or (item or {}).get("guid"), reason)
             continue
         if not geo.bbox_intersects(ev["bbox"], NM_BOX):
+            continue
+        if (ev["kind"] is not None and isinstance(ev.get("expires"), datetime)
+                and ev["expires"] < now - EXPIRED_GRACE
+                and not _ts(_when(ev)) > _ts(ev["expires"])):
+            # before the duplicate check, so a leftover never hides a live copy of itself;
+            # an event updated after its expiration date was extended, and stays listed
+            excluded["expired"] = excluded.get("expired", 0) + 1
+            log.debug("NMRoads %s: expired %s, left out (%s)", ev["id"],
+                      ev["expires"].isoformat(), ev["title"])
             continue
         in_region.append((ev, category, reason))
     # duplicates (same title, same place): keep the most recently updated one
@@ -987,6 +1115,21 @@ def _fetch_nm_roads(cfg, cache) -> Dict[str, Any]:
         log.debug("NMRoads %s kept as %s: %s (%s)", ev["id"], ev["kind"], reason, ev["title"])
         events.append(ev)
     events.sort(key=_event_order)
+    if orphans:
+        untold = sum(1 for ev in events if id(ev) in orphan_evs) if json_first else 0
+        if untold or len(orphans) > max(ORPHAN_MIN, ORPHAN_SHARE * len(pairs)):
+            msg = ("%d of %d events not found in %s (ids do not match)"
+                   % (len(orphans), len(pairs), "rss.xml" if json_first else "nmroads.json"))
+            if untold:
+                msg += ("; %d listed without the rss.xml text: cause unknown, may be planned "
+                        "work" % untold)
+            log.warning("NMRoads: %s", msg)
+            errors.append(msg)
+    if len(events) > NM_MAX_LISTED:
+        log.warning("NMRoads: %d emergency events; only the first %d listed", len(events),
+                    NM_MAX_LISTED)
+        errors.append("%d events, only the first %d listed" % (len(events), NM_MAX_LISTED))
+        events = events[:NM_MAX_LISTED]
     feed_time = (_http_date(jres.get("last_modified") if feats is not None else None)
                  or _http_date(rres.get("last_modified") if items is not None else None)
                  or built)
@@ -1074,7 +1217,7 @@ def _lsr_parse(f: Any) -> Optional[dict]:
     state = p.get("state") or p.get("st")
     if not isinstance(state, str) or state.strip().upper() != "NM":
         return None
-    remark = " ".join(str(p.get("remark") or "").split())
+    remark = " ".join(str(p.get("remark") or "")[:TEXT_MAX].split())
     if not remark:
         return None
     t = util.parse_iso(p.get("valid")) if isinstance(p.get("valid"), str) else None
@@ -1135,7 +1278,10 @@ def _lsr_corrected(r: dict, kept: Sequence[dict]) -> Optional[dict]:
              and ((r["_pplace"] and _norm(o["place"]) == r["_pplace"]) or _lsr_near(o, r))]
     if not cands:
         return None
-    scored = sorted(((difflib.SequenceMatcher(None, o["_core"], r["_core"]).ratio(), i, o)
+    # the first kilobyte is plenty to tell two remarks apart; difflib costs up to the
+    # product of the two lengths
+    scored = sorted(((difflib.SequenceMatcher(None, o["_core"][:1000], r["_core"][:1000]).ratio(),
+                      i, o)
                      for i, o in enumerate(cands)), key=lambda x: (x[0], x[1]))
     if scored[-1][0] >= 0.6:
         return scored[-1][2]
@@ -1218,11 +1364,24 @@ def _fetch_storm_reports(cfg, cache) -> Dict[str, Any]:
            "age_s": res.get("age_s"), "reports": []}
     if not res.get("ok"):
         return out
+    feats = (res.get("data") or {}).get("features") or []
+    if len(feats) > LSR_MAX_FEATURES:
+        log.warning("storm reports: %d features; only the first %d read", len(feats),
+                    LSR_MAX_FEATURES)
+        out["error"] = "; ".join(x for x in (out["error"], "%d storm reports, only the first "
+                                             "%d read" % (len(feats), LSR_MAX_FEATURES)) if x)
+        feats = feats[:LSR_MAX_FEATURES]
     # re-issues are folded in before the time window is applied (a correction may move
     # the time), also on a stale copy
-    reports = lsr_road_reports((res.get("data") or {}).get("features") or [])
-    cutoff = util.utcnow() - timedelta(hours=hours)
-    out["reports"] = [r for r in reports if r["time"] >= cutoff]
+    reports = lsr_road_reports(feats)
+    now = util.utcnow()
+    cutoff = now - timedelta(hours=hours)
+    # a report dated ahead of the clock is an error, and would pass the window for ever
+    ahead = [r for r in reports if r["time"] > now + FUTURE_SLACK]
+    if ahead:
+        log.warning("storm reports: %d dated in the future, left out (%s)", len(ahead),
+                    ", ".join(r["time"].isoformat() for r in ahead[:5]))
+    out["reports"] = [r for r in reports if cutoff <= r["time"] <= now + FUTURE_SLACK]
     return out
 
 

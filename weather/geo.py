@@ -7,6 +7,7 @@ Pure Python, no numpy/shapely. All lon/lat are WGS84 decimal degrees. GeoJSON or
 from __future__ import annotations
 
 import math
+import numbers
 from typing import Iterable, Iterator, List, Optional, Sequence, Tuple
 
 MI_TO_KM = 1.609344
@@ -187,22 +188,32 @@ class MapFrame:
 Ring = Sequence[Sequence[float]]
 
 
+def _rings(v) -> bool:
+    """A polygon as GeoJSON writes it: a non-empty list whose first member (the outer ring)
+    is a non-empty list. Anything else (a number, a string, an object) is no polygon."""
+    return (isinstance(v, (list, tuple)) and bool(v)
+            and isinstance(v[0], (list, tuple)) and bool(v[0]))
+
+
 def iter_polygons(geometry: Optional[dict]) -> Iterator[List[Ring]]:
     """Yield each polygon of a GeoJSON geometry as a list of rings (outer first). Supports
-    Polygon, MultiPolygon, GeometryCollection; anything else yields nothing."""
+    Polygon, MultiPolygon, GeometryCollection; anything else yields nothing, and so does a
+    member that is not a list of rings (never raises on a wrongly shaped geometry)."""
     if not geometry or not isinstance(geometry, dict):
         return
     t = geometry.get("type")
     if t == "Polygon":
-        rings = geometry.get("coordinates") or []
-        if rings and rings[0]:
+        rings = geometry.get("coordinates")
+        if _rings(rings):
             yield rings
     elif t == "MultiPolygon":
-        for rings in geometry.get("coordinates") or []:
-            if rings and rings[0]:
+        polys = geometry.get("coordinates")
+        for rings in polys if isinstance(polys, (list, tuple)) else []:
+            if _rings(rings):
                 yield rings
     elif t == "GeometryCollection":
-        for g in geometry.get("geometries") or []:
+        members = geometry.get("geometries")
+        for g in members if isinstance(members, (list, tuple)) else []:
             for rings in iter_polygons(g):
                 yield rings
 
@@ -245,8 +256,74 @@ def point_in_geometry(lon: float, lat: float, geometry: Optional[dict]) -> bool:
     return any(point_in_polygon(lon, lat, rings) for rings in iter_polygons(geometry))
 
 
+def _finite(v) -> bool:
+    # numbers.Real, not (int, float): a caller's numpy scalar is a number too
+    return isinstance(v, numbers.Real) and not isinstance(v, bool) and math.isfinite(v)
+
+
+def _position(p) -> bool:
+    """A GeoJSON position: a list that starts with two finite numbers (lon, lat). Numbers
+    sent as strings, nulls, NaN and a ring nested one level too deep are not positions."""
+    return isinstance(p, (list, tuple)) and len(p) >= 2 and _finite(p[0]) and _finite(p[1])
+
+
+def ring_ok(ring) -> bool:
+    """A ring the point test can work with: at least 3 positions, each two finite numbers."""
+    return (isinstance(ring, (list, tuple)) and len(ring) >= 3
+            and all(_position(p) for p in ring))
+
+
+_NOT_AREAS = ("Point", "MultiPoint", "LineString", "MultiLineString")
+
+
+def _all_polygons(geometry) -> Optional[list]:
+    """Every polygon of a geometry, or None when any member is not one that can be read:
+    unlike ``iter_polygons``, which passes over such a member, this tells it apart (a
+    MultiPolygon with one member "x", a collection holding a string)."""
+    if not isinstance(geometry, dict):
+        return None
+    t = geometry.get("type")
+    if t == "Polygon":
+        rings = geometry.get("coordinates")
+        return [rings] if _rings(rings) else None
+    if t == "MultiPolygon":
+        polys = geometry.get("coordinates")
+        if not isinstance(polys, (list, tuple)) or not all(_rings(p) for p in polys):
+            return None
+        return list(polys)
+    if t == "GeometryCollection":
+        members = geometry.get("geometries")
+        if not isinstance(members, (list, tuple)):
+            return None
+        out: list = []
+        for g in members:
+            if isinstance(g, dict) and g.get("type") in _NOT_AREAS:
+                continue                # a point or a line is no area, as in iter_polygons
+            sub = _all_polygons(g)
+            if sub is None:
+                return None
+            out.extend(sub)
+        return out
+    return []
+
+
+def geometry_ok(geometry: Optional[dict]) -> bool:
+    """Whether a geometry holds at least one polygon, every member of it can be read as a
+    polygon (``_all_polygons``) and every ring of every polygon (the holes too) is
+    ``ring_ok``. One bad ring or member spoils the whole geometry: a shape of which a part
+    cannot be read answers neither "inside" nor "outside" reliably. Never raises."""
+    try:
+        polys = _all_polygons(geometry)
+    except RecursionError:
+        return False
+    return bool(polys) and all(all(ring_ok(r) for r in rings) for rings in polys)
+
+
 def ring_bbox(ring: Ring) -> Optional[Tuple[float, float, float, float]]:
-    if not ring:
+    """Box of a ring; None for an empty ring and for one that holds anything but positions
+    of finite numbers (never raises: a box of strings would only fail later, in a
+    comparison far from here)."""
+    if not ring or not isinstance(ring, (list, tuple)) or not all(_position(p) for p in ring):
         return None
     xs = [p[0] for p in ring]
     ys = [p[1] for p in ring]
@@ -254,19 +331,27 @@ def ring_bbox(ring: Ring) -> Optional[Tuple[float, float, float, float]]:
 
 
 def geometry_bbox(geometry: Optional[dict]) -> Optional[Tuple[float, float, float, float]]:
+    """Box of the outer rings of a geometry, or None ("no box") when it has no polygon or
+    when one of its outer rings has no box (see ``ring_bbox``)."""
     box = None
     for rings in iter_polygons(geometry):
         b = ring_bbox(rings[0])
         if b is None:
-            continue
+            return None
         box = b if box is None else (min(box[0], b[0]), min(box[1], b[1]),
                                      max(box[2], b[2]), max(box[3], b[3]))
     return box
 
 
+def _box(b) -> bool:
+    return isinstance(b, (list, tuple)) and len(b) == 4 and all(_finite(v) for v in b)
+
+
 def bbox_intersects(a: Optional[Tuple[float, float, float, float]],
                     b: Optional[Tuple[float, float, float, float]]) -> bool:
-    if a is None or b is None:
+    """Whether two boxes overlap. False when either is missing or is not four finite
+    numbers: "no box" intersects nothing."""
+    if not _box(a) or not _box(b):
         return False
     return not (a[2] < b[0] or b[2] < a[0] or a[3] < b[1] or b[3] < a[1])
 

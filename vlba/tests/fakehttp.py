@@ -39,7 +39,7 @@ class FakeHttp:
                 return (body(url) if callable(body) else body), ok
         return None, False
 
-    def get_bytes(self, url, cfg, accept=None, timeout=None, retries=None, method="GET"):
+    def get_bytes(self, url, cfg, accept=None, timeout=None, retries=None, method="GET", max_bytes=None):
         self.calls.append(url)
         body, ok = self._lookup(url)
         if not ok or body is None:
@@ -57,7 +57,7 @@ class FakeHttp:
         self.no_cache.append(fragment)
 
     def fetch_cacheable(self, url, cfg, etag=None, last_modified=None, accept=None,
-                        timeout=None):
+                        timeout=None, max_bytes=None):
         """Stand-in for ``http.fetch_cacheable``: 200 + the registered body (the plain URL is
         recorded in ``.calls``, like ``get_bytes``)."""
         self.calls.append(url)
@@ -73,7 +73,7 @@ class FakeHttp:
         self.cond_meta.append((fragment, etag, last_modified))
 
     def fetch_conditional(self, url, cfg, etag=None, last_modified=None, accept=None,
-                          timeout=None):
+                          timeout=None, max_bytes=None):
         """Stand-in for ``http.fetch_conditional``: 200 + the registered body (recorded as
         ``"COND <url>"`` in ``.calls``), or 304 when ``validators()`` gave the URL an ETag
         and the caller sent it back."""

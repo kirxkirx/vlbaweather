@@ -36,12 +36,14 @@ Why it is built this way:
 """
 from __future__ import annotations
 
+import errno
 import hashlib
 import io
 import logging
 import math
 import os
 import re
+import warnings
 from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Sequence, Tuple
 
@@ -111,11 +113,22 @@ MRMS_LAST_KEY = "mrms_last"
 MRMS_META_KEY = "mrms_last_meta"
 TILE_REFUSED_BACKOFF = 6 * 3600   # after the tile server refuses us, no tile requests
 #                                  for this long (unless the User-Agent / tile URL changes)
+# After a 5xx the pause is shorter: the server is failing, not turning us away. One hour is
+# two runs of the 30 min timer skipped, so a tile server that stays broken costs one tile
+# (with http's retries) an hour instead of every tile of every map on every run, and one
+# that had a bad minute while a basemap was being built is asked again the same morning.
+TILE_ERROR_BACKOFF = 3600
 REFUSED_KEY = "tiles_refused"
+# HTTP answers that mean "do not ask again for a while": blocked (403, 418) and rate limited
+# (429) for TILE_REFUSED_BACKOFF, any 5xx for TILE_ERROR_BACKOFF.
+TILE_REFUSED_CODES = (403, 418, 429)
 
 
 class TileRefused(Exception):
-    """The tile server refused us (blocked tile, 403/418/429): stop asking for a while."""
+    """The tile server refused us (blocked tile, 403/418/429, or a 5xx): stop asking for
+    ``backoff_s`` seconds."""
+
+    backoff_s = TILE_REFUSED_BACKOFF
 
 
 HEAD_TIMEOUT = 8.0          # s per frame probe: a static-file HEAD answers in well under 1 s
@@ -140,6 +153,49 @@ _DASH_DRAWN = (ROAD_DASH[0] - 1.0, ROAD_DASH[1] + 1.0)
 
 class RadarError(Exception):
     """A frame or tile that cannot be used (bad bytes, wrong mode/size, nothing found)."""
+
+
+def _err_name(e: BaseException) -> str:
+    """What the page may show of an exception this module did not write: the errno name of
+    an ``OSError`` ("ENOSPC", "EACCES"), else the class name. The text of an ``OSError``
+    carries the absolute path of the file (the run user's cache or the web root, with the
+    process id in the temporary name) and Pillow's carries the address of a buffer: those go
+    to the log, never into a result's ``error``, a note or a caption."""
+    code = getattr(e, "errno", None)
+    name = errno.errorcode.get(code) if isinstance(code, int) else None
+    return name or type(e).__name__
+
+
+# ---- bytes from a server (or from the cache, which holds such bytes) -> image -------------
+# The first bytes of the only formats this module decodes. They are compared before Pillow
+# sees the data, so which codec runs never depends on what a server chose to send.
+_MAGIC = {"PNG": b"\x89PNG\r\n\x1a\n", "JPEG": b"\xff\xd8\xff"}
+FRAME_FORMATS = ("PNG",)            # the MRMS frame, and the basemap this module caches
+TILE_FORMATS = ("PNG", "JPEG")      # what tile servers send
+# A tile is 256 px square, or 512 px for a "@2x" tile; nothing else is decoded.
+TILE_SIDES = (geo.TILE_SIZE, 2 * geo.TILE_SIZE)
+
+
+def _open_image(data, formats: Sequence[str]):
+    """Open (NOT decode) image bytes that must be in one of ``formats``; ``RadarError``
+    otherwise. Left to itself Pillow picks the codec from the bytes: an EPS reply would be
+    handed to Ghostscript, and every other plugin would be within reach of a tile server.
+    The caller compares ``size`` (and ``mode``) of the result with what it expects BEFORE
+    ``load()``: a PNG of a few kB may declare 13000 x 13000 pixels, and decoding it takes
+    most of a GB. Pillow's warning for a header beyond 89 million pixels (nothing here
+    comes near: the frame has 24.5 million) is an error, not a line on stderr."""
+    head = bytes(data[:8]) if isinstance(data, (bytes, bytearray)) else b""
+    if not any(head.startswith(_MAGIC[f]) for f in formats):
+        raise RadarError("not a %s image" % " or ".join(formats))
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", Image.DecompressionBombWarning)
+        try:
+            img = Image.open(io.BytesIO(data), formats=list(formats))
+        except TypeError:           # a Pillow without formats=: refuse, never let it pick the codec
+            raise RadarError("this Pillow cannot restrict the image format; upgrade Pillow") from None
+    if img.format not in formats:   # e.g. "MPO": a JPEG start with further pictures behind it
+        raise RadarError("not a %s image" % " or ".join(formats))
+    return img
 
 
 def deps_available() -> bool:
@@ -187,7 +243,7 @@ def _probe_frames(cfg, now: Optional[datetime] = None) -> Tuple[Optional[dict], 
             url = ts.strftime(cfg.mrms_archive)
         except Exception as e:      # noqa: BLE001 - a bad pattern fails for every step alike
             log.warning("bad MRMS archive pattern %r: %s", cfg.mrms_archive, e)
-            return None, "bad MRMS archive pattern: %s" % e
+            return None, "bad MRMS archive pattern (%s)" % _err_name(e)
         try:
             there = http.head_ok(url, cfg, timeout=HEAD_TIMEOUT)
         except Exception as e:      # noqa: BLE001 - head_ok should not raise; if it does,
@@ -220,16 +276,25 @@ def find_latest_frame(cfg, now: Optional[datetime] = None) -> Optional[dict]:
 
 def _open_frame(data: bytes):
     """Decode an MRMS PNG and insist on palette indices: the dBZ values ARE the indices
-    (-32 + i/2), so an RGB rendering of the same picture would be useless."""
+    (-32 + i/2), so an RGB rendering of the same picture would be useless. Format, mode and
+    size are checked on the header, before a pixel is decoded (see ``_open_image``)."""
     try:
-        img = Image.open(io.BytesIO(data))
-        img.load()
+        img = _open_image(data, FRAME_FORMATS)
+    except RadarError:
+        raise
     except Exception as e:
-        raise RadarError("bad MRMS image: %s" % e)
+        # Pillow's text names a buffer by its address: the class says as much for the page
+        log.debug("MRMS image not opened: %s", e)
+        raise RadarError("bad MRMS image (%s)" % _err_name(e))
     if img.mode not in ("P", "L"):
         raise RadarError("unusable MRMS image mode %r (need palette indices)" % img.mode)
     if img.size != (geo.MRMS_W, geo.MRMS_H):
         raise RadarError("unexpected MRMS frame size %dx%d" % img.size)
+    try:
+        img.load()
+    except Exception as e:
+        log.debug("MRMS image not decoded: %s", e)
+        raise RadarError("bad MRMS image (%s)" % _err_name(e))
     return img
 
 
@@ -243,6 +308,7 @@ def load_frame(cfg, cache) -> dict:
     if not deps_available():
         res["error"] = "Pillow not installed"
         return res
+    found = None
     try:
         found, why_not = _probe_frames(cfg)
         if not found:
@@ -261,17 +327,27 @@ def load_frame(cfg, cache) -> dict:
         if img is None:
             data = http.get_bytes(found["url"], cfg, accept="image/png")
             img = _open_frame(data)
-            cache.put_bytes(MRMS_LAST_KEY, ".png", data)
-            cache.put(MRMS_META_KEY, {"ts": found["ts"].isoformat(), "url": found["url"]})
+            try:
+                cache.put_bytes(MRMS_LAST_KEY, ".png", data)
+                cache.put(MRMS_META_KEY, {"ts": found["ts"].isoformat(), "url": found["url"]})
+            except Exception as e:  # noqa: BLE001 - the cache is an optimisation: a frame
+                # that was downloaded and decoded is used although it could not be kept
+                # (full disk, quota, unwritable cache), as http.cached_json does
+                log.warning("could not cache the MRMS frame (%s); using it uncached", e)
             age = 0.0
         res.update(ok=True, age_s=age if age is not None else 0.0,
                    ts=found["ts"], url=found["url"], image=img)
         return res
-    except (http.HttpError, RadarError) as e:
-        err = str(e)
+    except RadarError as e:
+        full = err = str(e)     # written in this module: no path, no address
+    except http.HttpError as e:
+        # the archive URL is configuration (it may carry a query string): the log has it
+        full = str(e)
+        err = full.replace(found["url"], "the MRMS archive") if found else full
     except Exception as e:      # noqa: BLE001 - any surprise = unavailable, never a crash
-        err = "%s: %s" % (type(e).__name__, e)
-    log.warning("MRMS frame unavailable: %s", err)
+        full = "%s: %s" % (type(e).__name__, e)
+        err = "MRMS frame failed (%s)" % _err_name(e)
+    log.warning("MRMS frame unavailable: %s", full)
     res["error"] = err
 
     meta, age = cache.get_any(MRMS_META_KEY)
@@ -471,9 +547,33 @@ def mean_luminance(img) -> float:
 
 
 def _decode_tile(data: bytes):
-    tile = Image.open(io.BytesIO(data))
+    """A tile as RGB; ``RadarError`` (or Pillow's own error) for bytes that are no PNG or
+    JPEG or not of a tile's size, checked on the header before anything is decoded."""
+    tile = _open_image(data, TILE_FORMATS)
+    if tile.size[0] != tile.size[1] or tile.size[0] not in TILE_SIDES:
+        raise RadarError("unexpected tile size %dx%d" % tile.size)
     tile.load()
     return tile.convert("RGB")          # tile servers send palette PNGs (or JPEGs)
+
+
+def _tile_refusal(e: BaseException, url: str) -> Optional[Tuple[str, int]]:
+    """``(reason, pause in s)`` when a failed tile request means "do not ask again for a
+    while", else None. The status is ``HttpError.status`` where http provides it; without
+    the attribute it is read from the error text, which is "HTTP 403 for <url>" for an
+    answer that is not retried and "<url>: HTTP Error 429: ..." after the retries of a 429
+    or 5xx (the URL is cut out first: its tile numbers are no status). Between the two, the
+    ``code`` of the urllib error http raised it from is used."""
+    status = getattr(e, "status", None)
+    if not isinstance(status, int) or isinstance(status, bool):
+        status = getattr(e.__cause__, "code", None)
+    if not isinstance(status, int) or isinstance(status, bool):
+        m = re.search(r"\bHTTP (?:Error )?(\d{3})\b", str(e).replace(url, ""))
+        status = int(m.group(1)) if m else None
+    if status in TILE_REFUSED_CODES:
+        return "HTTP %d" % status, TILE_REFUSED_BACKOFF
+    if status is not None and 500 <= status <= 599:
+        return "HTTP %d" % status, TILE_ERROR_BACKOFF
+    return None
 
 
 # ---- road items: geometry ---------------------------------------------------------------
@@ -845,15 +945,18 @@ class SiteMap:
         if not data:
             return None
         try:
-            img = Image.open(io.BytesIO(data))
+            # what _basemap_from_tiles saves: an RGB PNG of the frame's size. The header is
+            # compared before the pixels are decoded (see _open_image).
+            img = _open_image(data, FRAME_FORMATS)
+            if img.size != self.frame.size:
+                log.info("cached basemap %s has size %s, want %s; rebuilding",
+                         key, img.size, self.frame.size)
+                return None
+            if img.mode != "RGB":
+                raise RadarError("mode %s, not RGB" % img.mode)
             img.load()
-            img = img.convert("RGB")
         except Exception as e:
             log.warning("cached basemap %s unreadable (%s); rebuilding", key, e)
-            return None
-        if img.size != self.frame.size:
-            log.info("cached basemap %s has size %s, want %s; rebuilding",
-                     key, img.size, self.frame.size)
             return None
         log.debug("basemap %s loaded from cache (tiles not fetched)", key)
         return img
@@ -870,8 +973,8 @@ class SiteMap:
         cache entry carries the "ok" meta counts: tiles cached by older versions may be the
         tile server's "Access blocked" image and are fetched once more. A reply the server
         marks ``no-cache`` / ``no-store`` (OpenStreetMap sends its blocked tile with HTTP 200
-        and ``Cache-Control: no-cache``) or a 403/418/429 raises ``TileRefused`` and is never
-        stored; bytes that do not decode are not stored either."""
+        and ``Cache-Control: no-cache``), a 403/418/429 or a 5xx raises ``TileRefused`` and is
+        never stored; bytes that do not decode are not stored either."""
         key = "tile_" + hashlib.sha1(url.encode("utf-8")).hexdigest()[:16]
         meta, _ = self.cache.get_any(key + "__meta")
         if isinstance(meta, dict) and meta.get("ok"):
@@ -884,8 +987,12 @@ class SiteMap:
         try:
             res = http.fetch_cacheable(url, self.cfg, accept="image/png")
         except http.HttpError as e:
-            if re.match(r"HTTP (403|418|429)\b", str(e)):
-                raise TileRefused(str(e))
+            refusal = _tile_refusal(e, url)
+            if refusal:
+                log.warning("tile request refused: %s", e)
+                err = TileRefused("%s from the tile server" % refusal[0])
+                err.backoff_s = refusal[1]
+                raise err
             raise
         if res["no_cache"]:
             raise TileRefused("the tile server sent a tile marked not cacheable "
@@ -907,7 +1014,8 @@ class SiteMap:
 
         When the tile server refuses us, the build stops at once (no further tile requests
         this run) and a back-off marker keeps every map of the next ``TILE_REFUSED_BACKOFF``
-        from asking again; the maps are drawn on a plain background with a note."""
+        (``TILE_ERROR_BACKOFF`` after a 5xx) from asking again; the maps are drawn on a plain
+        background with a note."""
         fr = self.frame
         canvas = Image.new("RGB", fr.canvas_size(), self.colors["bg"])
         got = expected = inverted = 0
@@ -932,7 +1040,7 @@ class SiteMap:
                         got += 1
                     except TileRefused as e:
                         refused = str(e)
-                        self._mark_refused(refused)
+                        self._mark_refused(refused, e.backoff_s)
                     except Exception as e:      # noqa: BLE001 - one tile must not kill the map
                         log.warning("tile z%d/%d/%d failed: %s", fr.zoom, tx, ty, e)
                 if refused:
@@ -964,21 +1072,35 @@ class SiteMap:
         return img
 
     def _refused(self) -> Optional[str]:
-        """The reason of a still-running back-off for this User-Agent + tile URL, else None."""
-        mark = self.cache.get(REFUSED_KEY, TILE_REFUSED_BACKOFF)
-        if isinstance(mark, dict) and mark.get("tag") == self._refusal_tag():
-            log.debug("%s/%s: tile requests paused: %s", self.slug, self.theme, mark.get("reason"))
-            return str(mark.get("reason") or "refused")
-        return None
+        """The reason of a still-running back-off for this User-Agent + tile URL, else None.
+        The marker says how long it holds (``backoff_s``); one without a usable value (an
+        older version's) holds for ``TILE_REFUSED_BACKOFF``, which is also the upper limit."""
+        mark, age = self.cache.get_any(REFUSED_KEY)
+        if not isinstance(mark, dict) or age is None or mark.get("tag") != self._refusal_tag():
+            return None
+        pause = mark.get("backoff_s")
+        if isinstance(pause, bool) or not isinstance(pause, (int, float)) \
+                or not 0 < pause <= TILE_REFUSED_BACKOFF:
+            pause = TILE_REFUSED_BACKOFF
+        if age > pause:
+            return None
+        log.debug("%s/%s: tile requests paused: %s", self.slug, self.theme, mark.get("reason"))
+        return str(mark.get("reason") or "refused")
 
-    def _mark_refused(self, reason: str) -> None:
-        log.error("tile server refused the map tiles (%s). No tile requests for the next %d h. "
-                  "OpenStreetMap blocks User-Agents that are a library default or carry a "
-                  "placeholder contact such as example.org: check WEATHER_USER_AGENT "
-                  "(https://osm.wiki/Blocked, https://operations.osmfoundation.org/policies/tiles/)",
-                  reason, TILE_REFUSED_BACKOFF // 3600)
+    def _mark_refused(self, reason: str, backoff_s: float = TILE_REFUSED_BACKOFF) -> None:
+        if backoff_s < TILE_REFUSED_BACKOFF:
+            log.error("tile server is failing (%s). No tile requests for the next %d min; "
+                      "maps without a cached basemap are drawn on a plain background",
+                      reason, backoff_s // 60)
+        else:
+            log.error("tile server refused the map tiles (%s). No tile requests for the next %d h. "
+                      "OpenStreetMap blocks User-Agents that are a library default or carry a "
+                      "placeholder contact such as example.org: check WEATHER_USER_AGENT "
+                      "(https://osm.wiki/Blocked, https://operations.osmfoundation.org/policies/tiles/)",
+                      reason, TILE_REFUSED_BACKOFF // 3600)
         try:
-            self.cache.put(REFUSED_KEY, {"tag": self._refusal_tag(), "reason": reason})
+            self.cache.put(REFUSED_KEY, {"tag": self._refusal_tag(), "reason": reason,
+                                         "backoff_s": backoff_s})
         except Exception as e:                  # noqa: BLE001
             log.warning("could not record the tile back-off: %s", e)
 
@@ -1417,7 +1539,9 @@ class SiteMap:
                 res["radar_drawn"] = True
             except Exception as e:                  # noqa: BLE001
                 log.warning("radar layer failed for %s: %s", self.slug, e)
-                radar = dict(radar, ok=False, error=str(e))
+                # a RadarError's text is written here (mode, size); anything else by class
+                radar = dict(radar, ok=False, error=str(e) if isinstance(e, RadarError)
+                             else "radar layer failed (%s)" % _err_name(e))
         elif radar.get("ok"):
             radar = dict(radar, ok=False, error="no image")
         if not radar.get("ok") and not radar.get("not_applicable"):
@@ -1431,7 +1555,7 @@ class SiteMap:
                 im, res["roads_drawn_ids"], road_kinds = self._draw_roads(im, roads)
             except Exception as e:                  # noqa: BLE001 - map without roads
                 log.warning("road layer failed for %s/%s: %s", self.slug, self.theme, e)
-                problems.append("road layer failed: %s" % e)
+                problems.append("road layer failed (%s)" % _err_name(e))
                 road_kinds = {}
 
         try:
@@ -1454,7 +1578,8 @@ class SiteMap:
             res["ok"] = True
         except Exception as e:                      # noqa: BLE001
             log.error("could not write %s: %s", out_path, e)
-            problems.insert(0, "write failed: %s" % e)
+            # the exception names the temporary and the final path: the log has them
+            problems.insert(0, "write failed (%s)" % _err_name(e))
             try:
                 os.remove(tmp)
             except OSError:

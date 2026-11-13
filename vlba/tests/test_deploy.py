@@ -196,9 +196,10 @@ def test_service_unit_shape():
     assert s["WorkingDirectory"] == ["__REPO__"]
     assert s["ExecStart"] == ["/usr/bin/python3 __REPO__/make_vlba_page.py"]
     assert s["SyslogIdentifier"] == ["vlbaweather"]
-    assert s["EnvironmentFile"] == ["-/etc/vlbaweather.env", "-__HOME__/vlbaweather.env"]
+    # only the root-owned file: the unit has a "+" command that starts as root (#29)
+    assert s["EnvironmentFile"] == ["-/etc/vlbaweather.env"]
     assert s["NoNewPrivileges"] == ["true"] and s["PrivateTmp"] == ["true"]
-    assert s["ProtectSystem"] == ["full"]
+    assert s["ProtectSystem"] == ["strict"]
     rw = " ".join(s["ReadWritePaths"])
     assert "__OUT_DIR__" in rw and "__CACHE_DIR__" in rw
     assert "WEATHER_OUT_DIR=__OUT_DIR__" in s["Environment"]
@@ -301,7 +302,7 @@ def test_installer_dry_run_renders(tmp_path):
     assert "WorkingDirectory=%s\n" % ROOT in service
     assert "ExecStart=/usr/bin/python3 %s/make_vlba_page.py" % ROOT in service
     assert "EnvironmentFile=-/etc/vlbaweather.env" in service
-    assert "EnvironmentFile=-%s/vlbaweather.env" % pwd.getpwnam(ME).pw_dir in service
+    assert "EnvironmentFile=-%s/vlbaweather.env" % pwd.getpwnam(ME).pw_dir not in service
     assert "Alias /vlbaweather %s" % (tmp_path / "www") in apache
     assert "systemctl enable --now vlbaweather.timer" in r.stdout
     assert "repo:      %s\n" % ROOT in r.stdout
@@ -361,7 +362,8 @@ def test_apache_snippet_shape():
     assert '<Directory "__OUT_DIR__">' in conf
     # the run user owns the directory: never follow a symlink it could plant there to a file
     # it does not own
-    assert "Options -Indexes -FollowSymLinks +SymLinksIfOwnerMatch" in conf
+    # absolute, so ExecCGI or Includes are never inherited from the server
+    assert "    Options SymLinksIfOwnerMatch\n" in conf
     assert "+FollowSymLinks" not in conf
     assert "Require all granted" in conf and "DirectoryIndex index.html" in conf
     # the page regenerates every 30 min and reloads every 5: 120 s for the page, its health JSON and the PNGs
@@ -392,7 +394,7 @@ def test_apache_snippet_header_lines_need_no_mod_headers():
         elif t.startswith("Header "):
             headers += 1
             assert depth == 1, "Header outside <IfModule mod_headers.c>: %r" % t
-    assert headers == 2 and depth == 0
+    assert headers == 5 and depth == 0          # Cache-Control twice, three security headers
     assert "/var/www/localhost/htdocs" in conf and "/etc/apache2/vhosts.d/vlbaweather.conf" in conf
     assert "/etc/vlbaweather/apache-vlbaweather.conf" in conf
 
@@ -866,7 +868,8 @@ def test_cron_installer_refuses_a_path_the_env_file_overrides(tmp_path):
 @needs_user
 def test_cron_installer_appends_to_the_env_file_without_clobbering(tmp_path):
     """Only the missing path line is appended (after a newline the file lacked), every
-    existing line stays as it was, the result is 0644, and the real file is untouched."""
+    existing line stays as it was, its mode is kept (never widened), and the real file is
+    untouched."""
     system = tmp_path / "system.env"
     original = ("# site settings\n"
                 "WEATHER_USER_AGENT=vlbaweather (https://wx.example.org/vlbaweather/; ops)\n"
@@ -883,8 +886,8 @@ def test_cron_installer_appends_to_the_env_file_without_clobbering(tmp_path):
     added = new[len(original) + 1:].splitlines()
     assert added[1:] == ["WEATHER_CACHE_DIR=%s/.cache/vlbaweather" % pwd.getpwnam(ME).pw_dir]
     assert new.count("WEATHER_OUT_DIR=") == 1
-    assert files["vlbaweather.env mode"] == 0o644
-    assert "600 -> 0644" in r.stdout
+    assert files["vlbaweather.env mode"] == 0o600
+    assert "-> 0644" not in r.stdout
     assert system.read_text() == original, "a dry run must not touch the real env file"
 
     complete = original + "\nWEATHER_CACHE_DIR=%s\n" % (tmp_path / "cache")
@@ -913,7 +916,8 @@ def test_cron_installer_cron_daemon_check_and_next_steps(tmp_path):
     # the first run goes through the wrapper as the run user, with cron's bare environment
     assert re.search(r"^\+ su -s /bin/sh %s -c 'cd / && exec env -i HOME=\S+ .*"
                      r"WEATHER_LOG=- %s'$" % (re.escape(ME), re.escape(WRAPPER)), r.stdout, re.M)
-    assert ("crontab -u %s -l | grep -v '# vlbaweather$' | crontab -u %s -" % (ME, ME)) in r.stdout
+    assert ("crontab -u %s -l | LC_ALL=C grep -a -v '# vlbaweather$' | crontab -u %s -"
+            % (ME, ME)) in r.stdout
     assert "every 30 minutes" in r.stdout
     assert "vlbaweather.env.example" in r.stdout and "/etc/local-weather-awareness.env is" in r.stdout
     assert "repo:      %s\n" % ROOT in r.stdout
@@ -1265,17 +1269,26 @@ def test_run_local_exits_with_the_server_status(run_local_env):
 # be published, so this repository does not list them either: they are regular expressions,
 # one per line ('#' comments), in the git-ignored file .private-patterns at the top of the
 # checkout (local-weather-awareness's test reads a file of the same name), or in the file named
-# by LWA_PRIVATE_PATTERNS. Without either, only the generic e-mail check below runs.
+# by LWA_PRIVATE_PATTERNS. Without either, only the generic e-mail check below runs, and the
+# test then reports itself skipped, not passed. A LWA_PRIVATE_PATTERNS that names a file
+# that cannot be read is an error (a mistyped path must not pass silently).
 PRIVATE_PATTERNS_FILE = os.environ.get("LWA_PRIVATE_PATTERNS") or os.path.join(
     ROOT, ".private-patterns")
 
 
-def _private_patterns():
+def _private_patterns(path=None, named=None):
+    """The compiled patterns, or None when there is no patterns file at the default place.
+    ``named`` (default: whether LWA_PRIVATE_PATTERNS is set) makes an unreadable file fail."""
+    path = path or PRIVATE_PATTERNS_FILE
+    if named is None:
+        named = bool(os.environ.get("LWA_PRIVATE_PATTERNS"))
     try:
-        with open(PRIVATE_PATTERNS_FILE, encoding="utf-8") as f:
+        with open(path, encoding="utf-8") as f:
             lines = f.read().splitlines()
-    except OSError:
-        return []
+    except OSError as e:
+        if named:
+            pytest.fail("LWA_PRIVATE_PATTERNS=%s cannot be read: %s" % (path, e.strerror))
+        return None
     return [re.compile(ln.strip()) for ln in lines if ln.strip() and not ln.lstrip().startswith("#")]
 
 
@@ -1300,7 +1313,8 @@ def _published_files():
 
 
 def test_published_files_have_no_private_hosts_paths_or_addresses():
-    private = _private_patterns()
+    patterns = _private_patterns()
+    private = patterns or []
     bad = []
     for path in _published_files():
         try:
@@ -1315,6 +1329,9 @@ def test_published_files_have_no_private_hosts_paths_or_addresses():
             if hits:
                 bad.append("%s:%d: %s" % (os.path.relpath(path, ROOT), i, hits))
     assert not bad, "\n".join(bad)
+    if patterns is None:
+        pytest.skip("no private patterns file (%s or LWA_PRIVATE_PATTERNS): only the e-mail "
+                    "check ran" % os.path.basename(PRIVATE_PATTERNS_FILE))
 
 
 def test_gitignore_keeps_local_files_out_but_publishes_the_example():
@@ -1410,7 +1427,7 @@ def test_installers_take_paths_only_from_files_nobody_else_can_change(tmp_path):
     assert r.returncode != 0
     assert "sets WEATHER_OUT_DIR, but that file or its directory belongs to another user or is" \
         in r.stderr and "writable by others" in r.stderr
-    assert "Move the WEATHER_OUT_DIR line to %s (owned by root, mode 0644)" \
+    assert "Move the WEATHER_OUT_DIR line to %s (owned by root, mode 0640," \
         % (tmp_path / "absent-system.env") in r.stderr
     r = _dry_run(tmp_path, ENV_FILES=str(envf))
     assert r.returncode != 0 and "sets WEATHER_OUT_DIR" in r.stderr
@@ -1451,8 +1468,8 @@ def test_installers_never_hand_over_system_or_foreign_directories(tmp_path):
     r, _ = _cron_dry_run(tmp_path, str(tmp_path / "www"), CACHE_DIR=str(tmp_path / "cache"))
     assert r.returncode == 0, r.stderr
     assert "+ install -d" not in r.stdout
-    assert "+ su -s /bin/sh %s -c 'mkdir -p %s && chmod 0755 %s'" % (
-        ME, tmp_path / "cache", tmp_path / "cache") in r.stdout
+    assert "+ su -s /bin/sh %s -c \"mkdir -p '%s' && chmod 0755 '%s' && test -w '%s'\"" % (
+        ME, tmp_path / "cache", tmp_path / "cache", tmp_path / "cache") in r.stdout
     # an existing directory that belongs to somebody else under a root-owned parent
     foreign = None
     for parent in ("/var/lib", "/var/cache", "/opt", "/var/empty"):
@@ -1500,6 +1517,6 @@ def test_refusal_names_the_unsafe_parent_and_the_fix(tmp_path, script):
     r = subprocess.run(["bash", "-c", harness], capture_output=True, text=True)
     assert r.returncode != 0
     assert "Its parent %s (owner " % parent in r.stderr, r.stderr
-    assert "mkdir -p %s && chown weather:weather %s && chmod 0755 %s" % (out, out, out) \
+    assert "mkdir -p '%s' && chown weather:weather '%s' && chmod 0755 '%s'" % (out, out, out) \
         in r.stderr, r.stderr
     assert "+ install -d" not in r.stdout      # root never created it

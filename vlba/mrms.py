@@ -21,8 +21,9 @@ on 2026-09-11, while IEM had the CONUS files within minutes (on 2026-10-07, 94 m
 files reached neither in time). In turn: the file of the frame's time from each source; the
 nearest file the sources list within ``MAX_SKEW_S`` of that time (coverage changes over
 hours, not minutes), or the newest of the last ``2 * MAX_SKEW_S`` when the frame's time is
-unknown (a listing page that fails leaves a gap, except a 404 for a period that began less
-than ``UNBORN_S`` ago: IEM makes a day's directory with its first file). Failing that too, where ``cfg.radar_coverage_max_lag_s`` allows it (one hour by
+unknown (a listing page that fails, or answers with no complete listing, leaves a gap, except
+a 404 for a mirror directory whose period began less than ``UNBORN_S`` ago: IEM makes a day's
+directory with its first file). Failing that too, where ``cfg.radar_coverage_max_lag_s`` allows it (one hour by
 default, the user's choice of 2026-11-10; 0 = never: a radar that failed after an older file
 reads "clear" until a newer one shows it), the frame's time is known, the frame is no reused
 copy and every source listed the window around that time completely without a file in it,
@@ -43,16 +44,17 @@ asked only while ``MIRROR_RESERVE_S`` of the run's budget is left.
 
 ``coverage`` never raises on network or data problems; it returns ``{"ok", "error",
 "domain", "ts", "url", "source", "older", "behind_s", "note", "sites": {slug: {"cells",
-"uncovered", "covered_pct"}}}``, where ``ts`` is the file's own time, ``source`` "bucket" or
-"mirror", ``behind_s`` how far the file's time lies before the frame's (before now when the
+"uncovered", "covered_pct", "echo_cells"}}}``, where ``ts`` is the file's own time,
+``source`` "bucket" or "mirror", ``behind_s`` how far the file's time lies before the frame's (before now when the
 frame's time is unknown), ``note`` why the bucket's file of the frame's time was not read
 when another one was, ``cells`` the grid cells whose centre lies within the ring (the radar
-ring check's own great-circle distance) and ``uncovered`` those of them no radar covers, a
-part of the ring beyond the grid's edge included.
+ring check's own great-circle distance), ``uncovered`` those of them no radar covers, a
+part of the ring beyond the grid's edge included, ``covered_pct`` rounded down to 0.1 %, and
+``echo_cells`` those with an echo of at least ``cfg.radar_dbz`` in the file itself (None
+without a limit): a raster that shows no echo where the file has one is no "clear".
 """
 from __future__ import annotations
 
-import gzip
 import io
 import logging
 import math
@@ -93,8 +95,26 @@ MIRROR_RESERVE_S = 60           # the run's budget the mirror leaves to the rest
 TRIES_PER_SOURCE = 2            # listed files fetched per source
 UNBORN_S = 900                  # a listing period this new may have no directory yet (IEM's new day)
 NO_COVERAGE_MAX = -998.0        # MRMS: -999 = no radar covers the cell (-99: covered, no echo)
+# What a file may hold. MRMS's grids are of 0.01 deg (CONUS, 7000 x 3500 = 24.5 million cells)
+# and 0.005 deg (the islands); anything finer than CELL_DEG_MIN or a grid of more than
+# GRID_CELLS_MAX cells is no MRMS file, and the ring's box is walked in Python cell by cell.
+CELL_DEG_MIN, CELL_DEG_MAX = 0.001, 0.1
+GRID_CELLS_MAX = 30000000
+# The cells of the box around a ring ring_stats may walk: the largest ring the settings allow
+# (VLBA_RADAR_KM 300) on the islands' 0.005 deg grid has about 1.25 million (about 1 s); a
+# hostile spacing would need hours.
+RING_BOX_CELLS_MAX = 2000000
+# A gzip'ed file is inflated to at most this many bytes: the CONUS file is 1.05 MB inflated
+# (measured 2026-11-13), the islands' under 0.1 MB.
+INFLATED_MAX = 32 * 1024 * 1024
+# A cell's value counts as radar coverage only within this range: -99 is "covered, no echo",
+# MRMS's echoes lie within about -30 .. 80 dBZ (the CONUS file of 2026-11-12 23:32Z: -30 to
+# 78.3), -999 is "no coverage". Anything else (another flag, a broken packing) is not coverage.
+COVERED_DBZ = (-100.0, 100.0)
 
 _KEY_RE = re.compile(r"<Key>([^<]+)</Key>")
+_TRUNCATED_RE = re.compile(r"<IsTruncated>\s*true\s*</IsTruncated>", re.IGNORECASE)
+_INDEX_RE = re.compile(r"<title>\s*(?:index of|directory listing)", re.IGNORECASE)
 _KEY_TIME_RE = re.compile(r"_(\d{8})-(\d{6})\.grib2(?:\.gz)?$")
 _URL_RE = re.compile(r"https?://([^/\s?;)]+)[^\s;)]*")
 _clock = time.monotonic         # the lookup's deadline (tests replace it)
@@ -151,6 +171,8 @@ def parse_grib2(raw: bytes) -> Dict[str, Any]:
                 raise ValueError("data template 5.%d (only 5.41, PNG, is read)" % tmpl)
             out["drs"] = {"R": struct.unpack(">f", sec[11:15])[0], "E": _sint(sec[15:17]),
                           "D": _sint(sec[17:19]), "nbits": sec[19]}
+            if not math.isfinite(out["drs"]["R"]):
+                raise ValueError("GRIB2 reference value %r" % out["drs"]["R"])
         elif num == 6:
             if ln < 6 or sec[5] != 255:
                 raise ValueError("a bitmap (only fields without one are read)")
@@ -162,7 +184,8 @@ def parse_grib2(raw: bytes) -> Dict[str, Any]:
     if missing:
         raise ValueError("GRIB2 message without %s" % ", ".join(missing))
     g = out["grid"]
-    if g["ni"] < 1 or g["nj"] < 1 or not g["di"] > 0 or not g["dj"] > 0:
+    if g["ni"] < 1 or g["nj"] < 1 or g["ni"] * g["nj"] > GRID_CELLS_MAX \
+            or not CELL_DEG_MIN <= g["di"] <= CELL_DEG_MAX or not CELL_DEG_MIN <= g["dj"] <= CELL_DEG_MAX:
         raise ValueError("GRIB2 grid of %d x %d cells of %g x %g deg" % (g["ni"], g["nj"], g["di"], g["dj"]))
     if g["scan"] not in (0x00, 0x40):
         raise ValueError("GRIB2 scanning mode 0x%02x (only 0x00 and 0x40 are read)" % g["scan"])
@@ -175,25 +198,39 @@ def decode(meta: Dict[str, Any]):
     if Image is None:
         raise ValueError("Pillow is not installed")
     g = meta["grid"]
-    im = Image.open(io.BytesIO(meta["payload"]))
+    # only Pillow's PNG reader sees the payload, and its size and mode are checked from the
+    # header before a pixel is decoded; Pillow's own error text holds a memory address
+    try:
+        im = Image.open(io.BytesIO(meta["payload"]), formats=["PNG"])
+    except Exception as e:
+        raise ValueError("payload is not PNG (%s)" % type(e).__name__)
     if im.format != "PNG":
         raise ValueError("payload is %s, not PNG" % im.format)
-    im.load()
     if im.size != (g["ni"], g["nj"]):
-        raise ValueError("PNG of %d x %d for a grid of %d x %d" % (im.size + (g["ni"], g["nj"])))
+        raise ValueError("PNG of %d x %d for a grid of %d x %d" % (tuple(im.size) + (g["ni"], g["nj"])))
     if im.mode not in ("I", "I;16", "I;16B", "L"):
         raise ValueError("PNG mode %s (a grey scale of 8 or 16 bits is read)" % im.mode)
+    im.load()
     return im
 
 
-def ring_stats(meta: Dict[str, Any], im, lat: float, lon: float, radius_km: float) -> Dict[str, Any]:
+def ring_stats(meta: Dict[str, Any], im, lat: float, lon: float, radius_km: float,
+               dbz_min: Optional[float] = None) -> Dict[str, Any]:
     """``{"cells", "uncovered", "covered_pct"}`` of the ring of ``radius_km`` around
-    (lat, lon). A ring cell beyond the grid's edge counts as uncovered."""
+    (lat, lon), with ``dbz_min`` also ``"echo_cells"``: the ring's covered cells of at least
+    ``dbz_min`` dBZ in the file itself. A ring cell beyond the grid's edge counts as
+    uncovered, and so does one whose value is no plausible reflectivity (``COVERED_DBZ``).
+    ``covered_pct`` is rounded down to 0.1 %, so that it never passes a limit the counts miss.
+    ValueError for a packing without finite values, or a ring whose box holds more than
+    ``RING_BOX_CELLS_MAX`` cells."""
     g, d = meta["grid"], meta["drs"]
     lo1 = g["lo1"] - 360.0 if g["lo1"] > 180.0 else g["lo1"]
     north_up = not (g["scan"] & 0x40)           # 0x00: rows run north to south
     di, dj, ni, nj = g["di"], g["dj"], g["ni"], g["nj"]
-    scale, offset = 2.0 ** d["E"] / 10.0 ** d["D"], d["R"] / 10.0 ** d["D"]
+    two_e, ten_d = 2.0 ** d["E"], 10.0 ** d["D"]
+    if not (math.isfinite(d["R"]) and 0 < two_e < math.inf and 0 < ten_d < math.inf):
+        raise ValueError("GRIB2 packing R %r, E %d, D %d gives no values" % (d["R"], d["E"], d["D"]))
+    low, high = COVERED_DBZ
     dlat = radius_km / 110.5 + dj
     dlon = radius_km / (111.3 * max(0.01, math.cos(math.radians(lat)))) + di
     if north_up:
@@ -201,12 +238,15 @@ def ring_stats(meta: Dict[str, Any], im, lat: float, lon: float, radius_km: floa
     else:
         j0, j1 = math.floor(((lat - dlat) - g["la1"]) / dj), math.ceil(((lat + dlat) - g["la1"]) / dj)
     i0, i1 = math.floor(((lon - dlon) - lo1) / di), math.ceil(((lon + dlon) - lo1) / di)
+    if (j1 - j0 + 1) * (i1 - i0 + 1) > RING_BOX_CELLS_MAX:
+        raise ValueError("the ring's box holds %d x %d cells of the grid (at most %d are read)"
+                         % (i1 - i0 + 1, j1 - j0 + 1, RING_BOX_CELLS_MAX))
     ci0, ci1, cj0, cj1 = max(0, i0), min(ni - 1, i1), max(0, j0), min(nj - 1, j1)
     vals: List[int] = []
     width = ci1 - ci0 + 1
     if ci0 <= ci1 and cj0 <= cj1:
         vals = radarcheck.pixels(im.crop((ci0, cj0, ci1 + 1, cj1 + 1)))
-    cells = uncovered = 0
+    cells = uncovered = echo = 0
     for j in range(j0, j1 + 1):
         clat = g["la1"] - j * dj if north_up else g["la1"] + j * dj
         for i in range(i0, i1 + 1):
@@ -215,10 +255,19 @@ def ring_stats(meta: Dict[str, Any], im, lat: float, lon: float, radius_km: floa
             cells += 1
             if not (cj0 <= j <= cj1 and ci0 <= i <= ci1):
                 uncovered += 1          # beyond the grid: no radar of this domain
-            elif offset + vals[(j - cj0) * width + (i - ci0)] * scale <= NO_COVERAGE_MAX:
-                uncovered += 1
-    pct = round(100.0 * (cells - uncovered) / cells, 1) if cells else None
-    return {"cells": cells, "uncovered": uncovered, "covered_pct": pct}
+                continue
+            # GRIB2's own formula, Y = (R + X * 2**E) / 10**D: a value of exactly the limit
+            # (MRMS: R -9990, D 1, so X 10190 is 20.0 dBZ) compares as exactly the limit
+            v = (d["R"] + vals[(j - cj0) * width + (i - ci0)] * two_e) / ten_d
+            if not low <= v <= high:
+                uncovered += 1          # -999 (no radar covers it), or no plausible value
+            elif dbz_min is not None and v >= dbz_min:
+                echo += 1
+    pct = (1000 * (cells - uncovered) // cells) / 10.0 if cells else None
+    out: Dict[str, Any] = {"cells": cells, "uncovered": uncovered, "covered_pct": pct}
+    if dbz_min is not None:
+        out["echo_cells"] = echo
+    return out
 
 
 # ---- the sources -------------------------------------------------------------------------------
@@ -261,6 +310,16 @@ def _bucket_files(cfg, body: str) -> List[Tuple[datetime, str]]:
     return out
 
 
+def _bucket_gap(body: str) -> Optional[str]:
+    """Why an S3 listing page that came back is no complete listing (None: it is one): an
+    error or portal page without S3's root element, or a page that says more keys follow."""
+    if "<ListBucketResult" not in body:
+        return "a listing page is no S3 listing"
+    if _TRUNCATED_RE.search(body):
+        return "a listing page is truncated"
+    return None
+
+
 def mirror_pattern(cfg, domain: str) -> str:
     """The strftime pattern of the domain's mirror, "" when it has none (only CONUS can)."""
     pattern = getattr(cfg, "mrms_conus_mirror", "") if domain == "CONUS" else ""
@@ -286,6 +345,32 @@ def _mirror_pages(pattern: str, start: datetime, end: datetime) -> List[Tuple[da
     return out
 
 
+def _dir_born(pattern: str, t: datetime) -> Optional[datetime]:
+    """The start of the period the directory part of a mirror ``pattern`` names for the hour
+    ``t`` (IEM's ``%Y/%m/%d``: its day), the time before which that directory cannot exist;
+    None when the directory names no period (it never is "not made yet")."""
+    head = pattern.rpartition("/")[0]
+    t = t.astimezone(timezone.utc).replace(minute=0, second=0, microsecond=0)
+    if "%H" in head:
+        return t
+    if "%d" in head or "%j" in head:
+        return t.replace(hour=0)
+    if "%m" in head or "%b" in head or "%B" in head:
+        return t.replace(day=1, hour=0)
+    if "%Y" in head or "%y" in head:
+        return t.replace(month=1, day=1, hour=0)
+    return None
+
+
+def _mirror_gap(pattern: str, page: str, body: str) -> Optional[str]:
+    """Why a mirror's page that came back is no listing (None: it is one): it names none of
+    the pattern's files and does not look like a directory index either (an empty body, an
+    error or portal page)."""
+    if _INDEX_RE.search(body) or mirror_name_regex(pattern.rpartition("/")[2]).search(body):
+        return None
+    return "a listing page is no directory index"
+
+
 def _mirror_files(pattern: str, page: str, body: str) -> List[Tuple[datetime, str]]:
     """``(time, url)`` of the files an index page names. Any page the server writes will do:
     only names the pattern gives are read, never the page's own dates (IEM writes them in US
@@ -306,17 +391,23 @@ def _mirror_files(pattern: str, page: str, body: str) -> List[Tuple[datetime, st
 
 def _sources(cfg, domain: str, product: str) -> List[Dict[str, Any]]:
     """Where a file is looked for, in this order: NOAA's bucket, then the domain's mirror if it
-    has one. Each ``{"name", "url": time -> url, "pages": (start, end) -> listing requests,
-    "files": (page, body) -> [(time, url)]}``."""
+    has one. Each ``{"name", "url": time -> url, "pages": (start, end) -> [(the time before
+    which the page's directory cannot exist, or None, listing request)], "files": (page, body)
+    -> [(time, url)], "gap": (page, body) -> why the page is no complete listing, or None}``.
+    S3 lists a prefix without keys as an empty page, so a bucket's page is never "not made
+    yet"; the mirror's directory is made with its period's first file."""
     out: List[Dict[str, Any]] = [
         {"name": "bucket", "url": lambda ts: "%s/%s" % (cfg.mrms_url, _key(domain, product, ts)),
-         "pages": lambda start, end: _bucket_pages(cfg, domain, product, start, end),
-         "files": lambda page, body: _bucket_files(cfg, body)}]
+         "pages": lambda start, end: [(None, p) for _, p in _bucket_pages(cfg, domain, product, start, end)],
+         "files": lambda page, body: _bucket_files(cfg, body),
+         "gap": lambda page, body: _bucket_gap(body)}]
     pattern = mirror_pattern(cfg, domain)
     if pattern:
         out.append({"name": "mirror", "url": lambda ts: ts.strftime(pattern),
-                    "pages": lambda start, end: _mirror_pages(pattern, start, end),
-                    "files": lambda page, body: _mirror_files(pattern, page, body)})
+                    "pages": lambda start, end: [(_dir_born(pattern, t), p)
+                                                 for t, p in _mirror_pages(pattern, start, end)],
+                    "files": lambda page, body: _mirror_files(pattern, page, body),
+                    "gap": lambda page, body: _mirror_gap(pattern, page, body)})
     return out
 
 
@@ -338,11 +429,25 @@ def _bad_data() -> Tuple[type, ...]:
             SyntaxError) + ((bomb,) if isinstance(bomb, type) else ())
 
 
+def _gunzip(body: bytes) -> bytes:
+    """A gzip'ed file inflated, at most ``INFLATED_MAX`` bytes of it: ValueError for one that
+    inflates to more, is cut short or has data after its end (zero padding aside)."""
+    z = zlib.decompressobj(16 + zlib.MAX_WBITS)       # the gzip wrapper
+    raw = z.decompress(body, INFLATED_MAX)
+    if z.unconsumed_tail or (not z.eof and len(raw) >= INFLATED_MAX):
+        raise ValueError("the file inflates to more than %d MB" % (INFLATED_MAX // (1024 * 1024)))
+    if not z.eof:
+        raise ValueError("the gzip stream is cut short")
+    if z.unused_data.strip(b"\0"):
+        raise ValueError("%d bytes after the gzip stream" % len(z.unused_data))
+    return raw
+
+
 def _read(body: bytes, product: str, file_ts: datetime):
     """``(meta, image)`` of a downloaded file when it is MRMS's ``product`` file of ``file_ts``
     (``PRODUCT_IDS``, its own GRIB2 time its name's to the second) and decodes; ValueError, or
     what gzip, zlib or Pillow raise, otherwise."""
-    meta = parse_grib2(gzip.decompress(body) if body[:2] == b"\x1f\x8b" else body)
+    meta = parse_grib2(_gunzip(body) if body[:2] == b"\x1f\x8b" else body)
     want = PRODUCT_IDS.get(product)
     got = (meta.get("discipline"),) + tuple(meta.get("parameter") or (None, None))
     if want is not None and got != want:
@@ -379,7 +484,9 @@ class _Lookup:
 
     def get(self, name: str, url: str) -> Optional[bytes]:
         """``url`` from source ``name``, within the lookup's bounds; None when it failed or was
-        not sent (noted; a source the run gave up on is asked nothing more)."""
+        not sent (noted; a source the run gave up on is asked nothing more). ``failed``: why
+        this request came back empty-handed, None when it was never sent."""
+        self.failed = None
         if name in self.down:
             return None
         left = self.deadline - _clock()
@@ -393,7 +500,6 @@ class _Lookup:
                 self.down[name] = "not asked, %d s left of the run's budget" % max(0, int(budget))
                 self.note(name, self.down[name])
                 return None
-        self.failed = None
         try:
             body = http.get_bytes(url, self.cfg, timeout=max(3.0, min(REQUEST_TIMEOUT_S, left)), retries=1)
         except http.HttpSkipped as e:
@@ -435,7 +541,7 @@ class _Lookup:
     def listed(self, start: datetime, end: datetime) -> Tuple[List[Tuple[int, datetime, str, str]], bool]:
         """``([(source order, time, url, source)], complete)`` of the files the sources list
         from ``start`` to ``end``, each listing page fetched once per lookup; ``complete``:
-        every page of every source answered."""
+        every page of every source answered with a complete listing."""
         out = []
         complete = True
         for order, src in enumerate(self.sources):
@@ -443,10 +549,16 @@ class _Lookup:
             for born, page in src["pages"](start, end):
                 if page not in self.pages:
                     body = self.get(name, page)
+                    text = None if body is None else body.decode("utf-8", "replace")
                     if body is None and _unborn(born, self.failed):
                         self.why.pop()          # IEM makes a day's directory with its first file
-                        body = b""
-                    self.pages[page] = False if body is None else body.decode("utf-8", "replace")
+                        text = ""
+                    elif text is not None:
+                        gap = src["gap"](page, text)
+                        if gap:
+                            self.note(name, gap)
+                            text = None
+                    self.pages[page] = False if text is None else text
                 if self.pages[page] is False:
                     complete = False
                     continue
@@ -459,11 +571,12 @@ class _Lookup:
         return any(s["name"] not in self.down and self.tries[s["name"]] < TRIES_PER_SOURCE for s in self.sources)
 
 
-def _unborn(born: datetime, failed: Optional[Exception]) -> bool:
-    """Whether a listing page that answered ``failed`` lists a period that began only minutes
-    ago (or is still to come), whose directory may not exist yet: a 404 then means "no files
-    yet", not a gap in the listing. Any other failure, or a 404 for an older period, is one."""
-    return isinstance(failed, http.HttpError) and not isinstance(failed, http.HttpSkipped) \
+def _unborn(born: Optional[datetime], failed: Optional[Exception]) -> bool:
+    """Whether a listing page that answered ``failed`` lists a directory whose period (``born``:
+    its start) began only minutes ago (or is still to come), so that it may not exist yet: a
+    404 then means "no files yet", not a gap in the listing. Any other failure, a 404 for an
+    older period, or a page of no period (None) is one."""
+    return born is not None and isinstance(failed, http.HttpError) and not isinstance(failed, http.HttpSkipped) \
         and str(failed).startswith("HTTP 404") \
         and (util.utcnow() - born).total_seconds() < UNBORN_S
 
@@ -538,13 +651,16 @@ def coverage(cfg, domain: str, frame_ts: Optional[datetime], sites: Iterable[dic
     if product is None:
         res["error"] = "no MRMS product for the domain %r" % (domain,)
         return res
+    dbz = getattr(cfg, "radar_dbz", None)             # the radar check's own limit
+    dbz = float(dbz) if isinstance(dbz, (int, float)) and not isinstance(dbz, bool) and math.isfinite(dbz) else None
     try:
         got = _find(cfg, domain, product, frame_ts, allow_older)
         meta, im = got["meta"], got["im"]
         res.update(url=got["url"], source=got["source"], ts=meta["ts"], older=bool(got["older"]),
                    behind_s=int(round((got["ref"] - meta["ts"]).total_seconds())), note=got["note"])
         for s in sites:
-            stats = ring_stats(meta, im, float(s["lat"]), float(s["lon"]), float(radius_km))
+            stats = ring_stats(meta, im, float(s["lat"]), float(s["lon"]), float(radius_km), dbz)
+            stats.setdefault("echo_cells", None)
             res["sites"][str(s.get("slug"))] = stats
         res["ok"] = True
         how = ""

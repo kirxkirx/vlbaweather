@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import logging
 import math
+import re
 import time
 from datetime import datetime, timedelta, timezone
 from typing import Optional
@@ -14,20 +15,58 @@ except Exception:                       # pragma: no cover - stdlib on 3.9+
 
 log = logging.getLogger("weather.util")
 _tz_warned = set()
+_iso_warned = set()
+
+# The spellings of ISO 8601 that Python 3.9's fromisoformat refuses although they are valid
+# and mean one instant: a lower-case "t" or "z", a fraction of other than 3 or 6 digits, an
+# offset without its colon (+0000) or without minutes (+00), blanks around the text.
+# (A fraction only after the seconds: "10:53.5" is a fraction of a minute, not 10:53:00.5.)
+_ISO_LOOSE = re.compile(r"^(\d{4}-\d{2}-\d{2})[Tt ](\d{2}:\d{2}(?::\d{2})?)(?:(?<=:\d{2}:\d{2})[.,](\d{1,12}))?"
+                        r"(?:([Zz])|([+-])(\d{2}):?(\d{2})?)?\Z")
 
 
 # ---- time ----------------------------------------------------------------------
 def parse_iso(s: Optional[str]) -> Optional[datetime]:
-    """ISO-8601 with offset (NWS style, incl. trailing 'Z') -> aware datetime, or None."""
+    """ISO-8601 with offset (NWS style, incl. trailing 'Z') -> aware datetime, or None.
+
+    Also read, the same on every Python from 3.9 on: the spellings ``_ISO_LOOSE`` lists.
+    A text without an offset is taken as UTC, and a date alone as its midnight UTC: some
+    feeds (the road and storm reports) write UTC that way, and refusing it would cost them
+    their times. A text that is not a time is None, with one log line per distinct text."""
     if not s or not isinstance(s, str):
         return None
     try:
         dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
     except ValueError:
-        return None
+        dt = _parse_iso_loose(s)
+        if dt is None:
+            if s not in _iso_warned and len(_iso_warned) < 100:
+                _iso_warned.add(s)
+                log.warning("not an ISO 8601 time: %.60r", s)
+            return None
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
     return dt
+
+
+def _parse_iso_loose(s: str) -> Optional[datetime]:
+    """``parse_iso`` for the spellings of ``_ISO_LOOSE``, rewritten into the one form
+    fromisoformat reads on 3.9 (6-digit fraction, +hh:mm). None when it is none of them."""
+    m = _ISO_LOOSE.match(s.strip())
+    if not m:
+        return None
+    day, clock, frac, zulu, sign, oh, om = m.groups()
+    text = "%sT%s" % (day, clock if clock.count(":") == 2 else clock + ":00")
+    if frac:
+        text += "." + (frac + "000000")[:6]
+    if zulu:
+        text += "+00:00"
+    elif sign:
+        text += "%s%s:%s" % (sign, oh, om or "00")
+    try:
+        return datetime.fromisoformat(text)
+    except ValueError:                  # 25:00, February 30, an offset of 24 h or more
+        return None
 
 
 def tzinfo_for(name: Optional[str]):
@@ -70,11 +109,25 @@ def age_minutes(dt: Optional[datetime], now: Optional[datetime] = None) -> Optio
     return (now - dt).total_seconds() / 60.0
 
 
+# How far ahead of this host's clock a time may be and still read "just now": clocks and
+# report stamps differ by seconds, and the observation and precipitation checks accept a
+# report up to 10 min ahead (nws.FUTURE_TOLERANCE_MIN, make_vlba_page._recent).
+FUTURE_SLACK_S = 600
+
+
 def fmt_age(seconds: Optional[float]) -> str:
     """'just now', '4 min', '2 h 10 min', '3 d' — for staleness labels."""
     if seconds is None:
         return "?"
-    s = max(0, int(seconds))
+    try:
+        s = int(seconds)
+    except (TypeError, ValueError, OverflowError):     # NaN, infinity, not a number
+        return "?"
+    if s < -FUTURE_SLACK_S:
+        # a time well ahead of this host's clock is not "just now": the clock or the
+        # source is wrong
+        return "in the future"
+    s = max(0, s)
     if s < 60:
         return "just now"
     m = s // 60
@@ -151,7 +204,7 @@ _CARDINALS = ["N", "NNE", "NE", "ENE", "E", "ESE", "SE", "SSE",
 
 def deg_to_cardinal(deg: Optional[float], points: int = 16) -> str:
     """Compass direction for a bearing in degrees ('' for None)."""
-    if deg is None or (isinstance(deg, float) and math.isnan(deg)):
+    if deg is None or (isinstance(deg, float) and not math.isfinite(deg)):
         return ""
     step = 16 // points
     idx = int((deg % 360) / (360.0 / points) + 0.5) % points
@@ -168,11 +221,15 @@ def quantity(q, convert=None) -> Optional[float]:
         return None
     try:
         v = float(v)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):  # OverflowError: an integer of 400 digits
         return None
-    if math.isnan(v):
+    if not math.isfinite(v):          # NaN, and 1e999, which the JSON reader makes infinity
         return None
-    return convert(v) if convert else v
+    if not convert:
+        return v
+    v = convert(v)
+    # a conversion of a value near the float limit (1e308 degC to degF) overflows to infinity
+    return None if isinstance(v, float) and not math.isfinite(v) else v
 
 
 def round_or_none(v: Optional[float], nd: int = 0):

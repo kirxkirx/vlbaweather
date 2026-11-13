@@ -10,6 +10,7 @@ transport (``vlba.glm``, which downloads GLM granules in threads) expose a modul
 """
 from __future__ import annotations
 
+import http.client as _httpclient
 import os
 import sys
 
@@ -36,6 +37,22 @@ def _no_network(monkeypatch):
     def _blocked(*a, **k):
         raise AssertionError("network access attempted in a test: %r" % (a[:1],))
     monkeypatch.setattr("urllib.request.urlopen", _blocked)
+
+
+_REAL_CONNECT = _httpclient.HTTPConnection.connect
+
+
+@pytest.fixture(autouse=True)
+def _no_network_connect(monkeypatch):
+    """``weather.http`` opens its requests with its own opener, not ``urlopen``: block every
+    connection ``http.client`` makes as well (https too, and a redirect followed inside an
+    opener), except to 127.0.0.1, where tests serve replies from a thread of their own (the
+    HTTP server of run_local.sh, the trickling servers of test_fix_transport.py)."""
+    def _connect(self):
+        if getattr(self, "host", None) != "127.0.0.1":
+            raise AssertionError("network access attempted in a test: %r" % (getattr(self, "host", None),))
+        return _REAL_CONNECT(self)
+    monkeypatch.setattr(_httpclient.HTTPConnection, "connect", _connect)
 
 
 @pytest.fixture

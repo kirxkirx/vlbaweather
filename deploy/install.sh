@@ -10,16 +10,16 @@
 # Usage:  sudo ./deploy/install.sh [OUT_DIR] [RUN_USER]         (in the checkout)
 #    or:  sudo OUT_DIR=/srv/www/vlbaweather RUN_USER=weather ./deploy/install.sh
 #   OUT_DIR   where index.html + PNGs go     (default: WEATHER_OUT_DIR from an existing
-#             /etc/vlbaweather.env or ~RUN_USER/vlbaweather.env, else /var/www/html/vlbaweather)
+#             /etc/vlbaweather.env, else /var/www/html/vlbaweather)
 #   CACHE_DIR (environment only) the generator's cache (default: WEATHER_CACHE_DIR from
-#             those env files, else ~RUN_USER/.cache/vlbaweather)
+#             that env file, else ~RUN_USER/.cache/vlbaweather)
 #   RUN_USER  unprivileged account that runs the generator (default: the sudo caller, else
 #             the owner of this checkout; root is refused)
 #   DRY_RUN=1 print what would be done (renders into a temp dir); no root needed.
 #
-# At run time the env files win over the unit's own Environment= lines, so an OUT_DIR or
-# CACHE_DIR given here that differs from WEATHER_OUT_DIR / WEATHER_CACHE_DIR in one of those
-# files is refused (the service would write somewhere this installer never prepared): edit
+# At run time the env file wins over the unit's own Environment= lines, so an OUT_DIR or
+# CACHE_DIR given here that differs from WEATHER_OUT_DIR / WEATHER_CACHE_DIR in it is
+# refused (the service would write somewhere this installer never prepared): edit
 # the env file instead, or drop the argument.
 #
 # Idempotent: rerun after a git pull / rsync to pick up unit-file changes, or after editing
@@ -42,6 +42,10 @@ DEFAULT_OUT_DIR="/var/www/html/vlbaweather"
 die() { echo "error: $*" >&2; exit 1; }
 run() {  # run CMD...: execute, or just print it in dry-run mode
     if [ -n "$DRY_RUN" ]; then echo "+ $*"; else "$@"; fi
+}
+printable() {  # printable TEXT: TEXT without control bytes, for printing a value read from an
+               # env file or a link (an escape sequence could hide or forge the lines around it)
+    printf '%s' "$1" | LC_ALL=C tr -d '\000-\037\177'
 }
 
 # The generator imports its copy of the weather package from the checkout itself.
@@ -71,10 +75,48 @@ id "$RUN_USER" >/dev/null 2>&1 || die "no such user: $RUN_USER"
 RUN_GROUP="$(id -gn "$RUN_USER")"
 RUN_HOME="$(getent passwd "$RUN_USER" | cut -d: -f6)"
 [ -n "$RUN_HOME" ] || die "cannot determine the home directory of $RUN_USER"
+# Root runs this script and installs files from the checkout, so whoever can change the
+# checkout chooses what root runs at the next rerun. A warning only (a check inside a script
+# that the same account can edit proves nothing), but it names the risk and the fix.
+checkout_writers() {  # prints the checkout paths the run user or others could change
+    local admin p owner mode
+    admin="${SUDO_USER:-$(id -un)}"
+    for p in "$REPO" "$REPO/deploy" "$REPO"/deploy/*; do
+        [ -e "$p" ] || continue
+        owner="$(stat -L -c %U -- "$p" 2>/dev/null)" || continue
+        mode="$(stat -L -c %a -- "$p" 2>/dev/null)" || continue
+        if { [ "$owner" = "$RUN_USER" ] && [ "$owner" != "$admin" ]; } \
+                || [ $((0$mode & 022)) -ne 0 ]; then
+            # printable: a file name the run user chose must not erase this warning
+            printf '           %s (owner %s, mode %s)\n' "$(printable "$p")" "$owner" "$mode"
+        fi
+    done
+}
+WRITERS="$(checkout_writers)"
+if [ -n "$WRITERS" ]; then
+    cat >&2 <<MSG
+WARNING: root runs this installer and installs files from the checkout, but $RUN_USER (the
+         account that runs the generator) or other accounts can change these:
+$WRITERS
+         Code running as $RUN_USER could then make the next installer run do anything as
+         root. Let root or your own admin account own the checkout, writable by nobody
+         else: chown -R root:root '$REPO' && chmod -R go-w '$REPO'
+MSG
+fi
 
 # ---- paths: argument / environment, else the env files, else the default ------------------
 # The unit's EnvironmentFile= list, in systemd's order (later wins); overridable for tests.
-ENV_FILES="${ENV_FILES:-/etc/vlbaweather.env $RUN_HOME/vlbaweather.env}"
+# Only the root-owned /etc/vlbaweather.env: the unit has a command that starts as root (the
+# "+" line), and systemd applies the environment files to every command of the unit, so a
+# file the run user can write (LD_PRELOAD=...) would run its code as root.
+ENV_FILES="${ENV_FILES:-$SYSTEM_ENV_FILE}"
+if [ -e "$RUN_HOME/vlbaweather.env" ]; then
+    cat >&2 <<MSG
+WARNING: $RUN_HOME/vlbaweather.env exists, but it is no longer read under systemd: the
+         unit reads only $SYSTEM_ENV_FILE. Move its settings to $SYSTEM_ENV_FILE
+         (owned by root, mode 0640, group $RUN_GROUP) and delete it.
+MSG
+fi
 env_lookup() {  # env_lookup KEY: last non-empty KEY=value across the env files, read the way
                 # the cron wrapper reads them (blanks around '=' and the value, a CR and one
                 # pair of surrounding quotes removed)
@@ -119,8 +161,8 @@ path_from_trusted_file() {  # path_from_trusted_file KEY: stop when the env file
        writable by others (file: owner $(stat -L -c %U "$src" 2>/dev/null || echo ?), mode
        $(stat -L -c %a "$src" 2>/dev/null || echo ?)). This installer runs as $(id -un), creates
        that directory and hands it to $RUN_USER, so it takes the path only from a file nobody
-       else can change. Move the $key line to $SYSTEM_ENV_FILE (owned by root, mode 0644)
-       and rerun."
+       else can change. Move the $key line to $SYSTEM_ENV_FILE (owned by root, mode 0640,
+       group $RUN_GROUP) and rerun."
 }
 canon() {  # canon PATH: ~ expanded (cache dir only; config.py does the same), no trailing
            # slash, // and /./ collapsed; symlinks are NOT resolved
@@ -167,38 +209,89 @@ for p in "$OUT_DIR" "$CACHE_DIR" "$REPO" "$RUN_HOME"; do
         *) die "path must be absolute: $p" ;;
     esac
     case "$p" in
-        *[!A-Za-z0-9._/+@,:=-]*) die "path may only contain letters, digits and . _ / + @ , : = -: $p" ;;
+        *[!A-Za-z0-9._/+@,:=-]*) die "path may only contain letters, digits and . _ / + @ , : = -: $(printable "$p")" ;;
     esac
 done
+# The output directory is public: Apache serves every file in it. So the cache (cached
+# replies, and by default the state file, the lock and the cron log) must not lie in it, nor
+# the output directory in the cache, and neither may a state, lock or log file set apart.
+inside() {  # inside A B: path A equals B or lies below it
+    case "$1/" in "${2%/}"/*) return 0 ;; esac
+    return 1
+}
+OUT_REAL="$(realpath -m -- "$OUT_DIR")"
+CACHE_REAL="$(realpath -m -- "$CACHE_DIR")"
+if inside "$CACHE_DIR" "$OUT_DIR" || inside "$OUT_DIR" "$CACHE_DIR" \
+        || inside "$CACHE_REAL" "$OUT_REAL" || inside "$OUT_REAL" "$CACHE_REAL"; then
+    die "the cache directory $CACHE_DIR and the output directory $OUT_DIR overlap.
+       Apache serves everything in the output directory, so the cached replies, the state
+       file, the lock and the log would be public. Give the cache a directory of its own
+       outside it (the default is ~$RUN_USER/.cache/vlbaweather) and rerun."
+fi
+not_public() {  # not_public KEY: stop when the file KEY names in the env files is in the output dir
+    local key="$1" f
+    f="$(env_lookup "$key")"
+    case "$f" in "" | -) return 0 ;; esac
+    f="$(canon "$f" tilde)"
+    case "$f" in /*) ;; *) f="$REPO/$f" ;; esac       # relative: to the checkout, the run's cwd
+    if inside "$f" "$OUT_DIR" || inside "$(realpath -m -- "$f")" "$OUT_REAL"; then
+        die "$key=$(printable "$f") lies in the output directory $OUT_DIR, which Apache
+       serves to anyone. Leave $key unset (it then lives in the cache directory) or
+       point it outside $OUT_DIR, and rerun."
+    fi
+}
+not_public WEATHER_LOCK_FILE
+not_public VLBA_STATE_FILE
 
 echo "repo:      $REPO"
 echo "user:      $RUN_USER ($RUN_GROUP), home $RUN_HOME"
 echo "output:    $OUT_DIR"
 echo "cache:     $CACHE_DIR"
+# (inside the output directory they were refused above, see not_public)
 lock="$(env_lookup WEATHER_LOCK_FILE)"
 case "$lock" in
-    ""|"$CACHE_DIR"/*|"$OUT_DIR"/*) ;;
-    *) echo "WARNING: WEATHER_LOCK_FILE=$lock is outside the cache and output directories;" \
-            "under the unit's sandboxing (ProtectSystem=full, ProtectHome=read-only, PrivateTmp)" \
+    ""|"$CACHE_DIR"/*) ;;
+    *) echo "WARNING: WEATHER_LOCK_FILE=$(printable "$lock") is outside the cache directory;" \
+            "under the unit's sandboxing (ProtectSystem=strict, ProtectHome=read-only, PrivateTmp)" \
             "it may be unwritable or private to each run. Leave it unset (<cache>/run.lock)." >&2 ;;
 esac
 # the state file carries the radar confirmation and the holds from one run to the next
 state="$(env_lookup VLBA_STATE_FILE)"
 case "$state" in
-    ""|"$CACHE_DIR"/*|"$OUT_DIR"/*) ;;
-    *) echo "WARNING: VLBA_STATE_FILE=$state is outside the cache and output directories;" \
+    ""|"$CACHE_DIR"/*) ;;
+    *) echo "WARNING: VLBA_STATE_FILE=$(printable "$state") is outside the cache directory;" \
             "under the unit's sandboxing it may be unwritable or private to each run, and then" \
             "the radar confirmation and the holds never carry over. Leave it unset" \
             "(<cache>/vlba_state.json)." >&2 ;;
 esac
 
 # ---- sanity: python + Pillow (+ numpy/h5py for GLM), as the unit will run them -------------
+# Code of the run user (WEATHER_PYTHON may come from its own env file) never gets root's
+# terminal: stdin is /dev/null and, where setsid(1) can wait for its child (util-linux), it
+# runs in a session of its own, so a process it leaves behind cannot read what root types
+# next or forge a password prompt from the controlling terminal. Output passes unchanged.
+SETSID=""
+if command -v setsid >/dev/null 2>&1 && setsid -w true </dev/null >/dev/null 2>&1; then
+    SETSID=1
+fi
+detached() {  # detached CMD...: CMD with stdin from /dev/null, in a new session when possible
+    local pid rc=0
+    if [ -z "$SETSID" ]; then "$@" </dev/null; return; fi
+    # In its own session Ctrl-C at this terminal no longer reaches CMD: pass it on.
+    setsid -w "$@" </dev/null &
+    pid=$!
+    trap 'kill -TERM -- "-$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null; wait "$pid"; exit 130' INT TERM
+    wait "$pid" || rc=$?
+    trap - INT TERM
+    return "$rc"
+}
 as_run_user() {  # as_run_user CMD: run a shell command as RUN_USER with a bare environment
-    local envcmd="cd / && exec env -i HOME=$RUN_HOME LOGNAME=$RUN_USER USER=$RUN_USER SHELL=/bin/sh PATH=/usr/bin:/bin"
+    # no exec: in "mkdir X && chmod 0755 X && test -w X" all three must run
+    local envcmd="cd / && env -i HOME='$RUN_HOME' LOGNAME='$RUN_USER' USER='$RUN_USER' SHELL=/bin/sh PATH=/usr/bin:/bin"
     if [ "$(id -u)" -eq 0 ]; then
-        su -s /bin/sh "$RUN_USER" -c "$envcmd $1"
+        detached su -s /bin/sh "$RUN_USER" -c "$envcmd $1"
     else                          # dry run without root: as this user, with the same env
-        sh -c "$envcmd $1"
+        detached sh -c "$envcmd $1"
     fi
 }
 as_run_user "/usr/bin/python3 -c 'import sys; sys.exit(0 if sys.version_info >= (3, 9) else 1)'" 2>/dev/null \
@@ -266,42 +359,70 @@ root_safe() {  # root_safe DIR: every existing ancestor of DIR is owned by root 
     return 0
 }
 prepare_dir() {  # prepare_dir WHAT DIR DEFAULT: DIR (mode 0755) owned by RUN_USER, safely
-    local what="$1" dir="$2" default="$3" real owner
-    # symlinks resolved: root acts on the real path, never through a link someone may swap
+    local what="$1" dir="$2" default="$3" real owner p link="" why
+    # Root decides on DIR as given (canon resolves no link) and acts on it only when no
+    # component is a symbolic link: through a link, root would create or hand over whatever
+    # the link points to, and whoever owns the link chooses that (the run user can put one
+    # at the default cache path in its home). The resolved path is checked too.
     real="$(realpath -m -- "$dir")"
-    case "$real/" in
-        /bin/* | /boot/* | /dev/* | /etc/* | /lib/* | /lib32/* | /lib64/* | /libx32/* | /proc/* | \
-        /root/* | /run/* | /sbin/* | /sys/* | /usr/* | /var/db/* | /var/log/* | /var/spool/*)
-            die "refusing $what $dir ($real): a system location is never handed to $RUN_USER" ;;
-    esac
     case "$real" in
-        / | /home | /opt | /srv | /tmp | /var | /var/cache | /var/lib | /var/tmp | /var/www | \
-        /var/www/html | /var/www/localhost | /var/www/localhost/htdocs | "$RUN_HOME")
-            die "refusing $what $dir: use a directory of its own below it, e.g. $dir/vlbaweather" ;;
+        *[!A-Za-z0-9._/+@,:=-]*)
+            die "refusing $what $dir: a symbolic link on the way leads to a path with characters
+       other than letters, digits and . _ / + @ , : = - ($(printable "$real"))" ;;
     esac
-    if root_safe "$real"; then
-        if [ -e "$real" ]; then
-            [ -d "$real" ] || die "$what $real exists and is not a directory"
-            owner="$(stat -c %U "$real")"
-            if [ "$owner" != "$RUN_USER" ] && [ "$real" != "$(realpath -m -- "$default")" ]; then
-                die "$what $real already exists and belongs to $owner. This installer takes over
+    for p in "$dir" "$real"; do
+        case "$p/" in
+            /bin/* | /boot/* | /dev/* | /etc/* | /lib/* | /lib32/* | /lib64/* | /libx32/* | /proc/* | \
+            /root/* | /run/* | /sbin/* | /sys/* | /usr/* | /var/db/* | /var/log/* | /var/spool/*)
+                die "refusing $what $dir ($real): a system location is never handed to $RUN_USER" ;;
+        esac
+        case "$p" in
+            / | /home | /opt | /srv | /tmp | /var | /var/cache | /var/lib | /var/tmp | /var/www | \
+            /var/www/html | /var/www/localhost | /var/www/localhost/htdocs | "$RUN_HOME")
+                die "refusing $what $dir: use a directory of its own below it, e.g. $dir/vlbaweather" ;;
+        esac
+    done
+    if [ "$real" != "$dir" ]; then
+        p="$dir"                                     # name the outermost link on the way
+        while [ "$p" != / ]; do
+            [ -L "$p" ] && link="$p"
+            p="$(dirname "$p")"
+        done
+        link="${link:-$dir}"
+    fi
+    if [ -z "$link" ] && root_safe "$dir"; then
+        if [ -e "$dir" ]; then
+            [ -d "$dir" ] || die "$what $dir exists and is not a directory"
+            owner="$(stat -c %U -- "$dir")"
+            # the default is compared as written: a link there must not make its target "the default"
+            if [ "$owner" != "$RUN_USER" ] && [ "$dir" != "$(realpath -m -s -- "$default")" ]; then
+                die "$what $dir already exists and belongs to $owner. This installer takes over
        only the default directory ($default) or one that already belongs to $RUN_USER.
-       If $real is meant for vlbaweather, hand it over yourself and rerun:
-         chown $RUN_USER:$RUN_GROUP $real && chmod 0755 $real"
+       If $dir is meant for vlbaweather, hand it over yourself and rerun:
+         chown $RUN_USER:$RUN_GROUP '$dir' && chmod 0755 '$dir'"
             fi
         fi
-        run install -d -m 0755 -o "$RUN_USER" -g "$RUN_GROUP" "$real"
+        run install -d -m 0755 -o "$RUN_USER" -g "$RUN_GROUP" "$dir"
     else
-        # inside space that RUN_USER (or another user) controls, e.g. ~RUN_USER/.cache: RUN_USER
-        # creates it, so no root action ever follows a path somebody else can change
-        if [ -n "$DRY_RUN" ]; then
-            echo "+ su -s /bin/sh $RUN_USER -c 'mkdir -p $real && chmod 0755 $real'"
-        elif ! as_run_user "mkdir -p $real && chmod 0755 $real && test -w $real" 2>/dev/null; then
-            die "$RUN_USER cannot create or write $what $real.
-       Its parent $UNSAFE_PARENT is not owned by root alone, so this
+        # inside space that RUN_USER (or another user) controls, e.g. ~RUN_USER/.cache, or
+        # reached through a link: RUN_USER creates it, so no root action ever follows a path
+        # somebody else can change
+        if [ -n "$link" ]; then
+            why="$link is a symbolic link (to $(printable "$(readlink -- "$link" 2>/dev/null || echo '?')")),
+       and root never creates or hands over a directory through a link. Remove the link, or,
+       if $real is meant for vlbaweather, give that path instead of $dir
+       (the argument, or the setting in $SYSTEM_ENV_FILE) and rerun."
+        else
+            why="Its parent $UNSAFE_PARENT is not owned by root alone, so this
        installer will not create the directory as root. Create it yourself, hand it to
        $RUN_USER, and rerun the installer:
-         mkdir -p $real && chown $RUN_USER:$RUN_GROUP $real && chmod 0755 $real"
+         mkdir -p '$dir' && chown $RUN_USER:$RUN_GROUP '$dir' && chmod 0755 '$dir'"
+        fi
+        if [ -n "$DRY_RUN" ]; then
+            echo "+ su -s /bin/sh $RUN_USER -c \"mkdir -p '$dir' && chmod 0755 '$dir' && test -w '$dir'\""
+        elif ! as_run_user "mkdir -p '$dir' && chmod 0755 '$dir' && test -w '$dir'" 2>/dev/null; then
+            die "$RUN_USER cannot create or write $what $dir.
+       $why"
         fi
     fi
     echo "$(printf '%-10s' "$what") $dir owned by $RUN_USER"
@@ -389,7 +510,7 @@ Done. The timer regenerates $OUT_DIR every 30 minutes.
   logs:     journalctl -u vlbaweather -n 50
             (follow: journalctl -u vlbaweather -f)
   run now:  sudo systemctl start vlbaweather.service
-  config:   /etc/vlbaweather.env or $RUN_HOME/vlbaweather.env
+  config:   /etc/vlbaweather.env (the only env file the unit reads)
             (see vlbaweather.env.example; local-weather-awareness's
             /etc/local-weather-awareness.env is not read); rerun this installer after
             changing WEATHER_OUT_DIR / WEATHER_CACHE_DIR.
@@ -416,7 +537,30 @@ case "$OUT_DIR" in
     *) echo "  $OUT_DIR is outside /var/www/html: the Alias in the snippet is required." ;;
 esac
 # The page's address: WEATHER_PAGE_URL from the env files, else a guess from this host's name.
-PAGE_URL="$(env_lookup WEATHER_PAGE_URL)"
+# Values printed into the commands below come from the env files, which root may be about to
+# paste into its shell: they are shown only from a file nobody but root (or whoever runs
+# this) can change, and only when they are a plain URL or path.
+shown_value() {  # shown_value KEY url|path: KEY from the env files, or nothing (with a note)
+    local key="$1" kind="$2" val src re
+    val="$(env_lookup "$key")"
+    [ -n "$val" ] || return 0
+    src="$(env_source "$key")"
+    if ! file_trusted "$src"; then
+        echo "note: $key from $(printable "$src") is not shown: another user can change that file" >&2
+        return 0
+    fi
+    if [ "$kind" = url ]; then
+        re='^https?://[A-Za-z0-9.-]+(:[0-9]+)?(/[A-Za-z0-9._~%/+-]*)?$'
+    else
+        re='^(-|~?/[A-Za-z0-9._/+@,:=-]*)$'
+    fi
+    if ! [[ "$val" =~ $re ]]; then
+        echo "note: $key=$(printable "$val") is not shown: only plain $kind characters are" >&2
+        return 0
+    fi
+    printf '%s' "$val"
+}
+PAGE_URL="$(shown_value WEATHER_PAGE_URL url)"
 if [ -n "$PAGE_URL" ]; then
     PAGE_BASE="${PAGE_URL%/}"
 else
@@ -424,7 +568,7 @@ else
 fi
 echo "  then:   curl -I $PAGE_BASE/"
 echo "  page:   $PAGE_BASE/"
-if [ -z "$PAGE_URL" ]; then
+if [ -z "$(env_lookup WEATHER_PAGE_URL)" ]; then
     echo "  (WEATHER_PAGE_URL is not set, so the page footer shows no address: add"
     echo "   WEATHER_PAGE_URL=$PAGE_BASE/ (your public address) to $SYSTEM_ENV_FILE)"
 fi

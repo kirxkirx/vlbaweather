@@ -37,7 +37,7 @@ import io
 import logging
 import math
 import re
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 from urllib.parse import urlencode
 
@@ -106,9 +106,15 @@ PALETTE: Tuple[Tuple[float, Tuple[int, int, int]], ...] = (
     (80.0, (0, 225, 236)),
 )
 COLOR_TOLERANCE = 24.0                  # RGB distance beyond which a colour is "not radar"
-MIN_ALPHA = 64                          # pixels fainter than this are treated as empty
-MAX_COLORS = 1 << 18                    # distinct colours a composite may hold (safety cap)
+MIN_ALPHA = 64                          # pixels fainter than this, but not transparent, are unknown
+MAX_COLORS = 1 << 18                    # distinct colours a composite may hold (beyond: not one)
 CAPS_TIMEOUT = 15.0
+# The workspace's capabilities document is 18 KB (hawaii, 2026-11-13); one this large is no
+# such document, and it is not searched.
+CAPS_MAX_BYTES = 1 << 20
+# A frame time this far ahead of the clock is no frame time (the composites are 2 min apart;
+# 10 min also allows for a host clock a few minutes slow).
+FUTURE_S = 600
 MERC_R = 20037508.342789244            # EPSG:3857 half-extent, metres
 
 
@@ -162,12 +168,17 @@ def capabilities_url(cfg, region: Dict[str, Any]) -> str:
         cfg.nwsradar_url.rstrip("/"), region["ws"])
 
 
-_DIM_RE = re.compile(r'<Dimension\s+name="time"[^>]*\bdefault="([^"]+)"', re.IGNORECASE)
-_DIM_LIST_RE = re.compile(r'<Dimension\s+name="time"[^>]*>([^<]*)</Dimension>', re.IGNORECASE)
+# The parsing is tolerant of what XML allows (attributes in any order, either quote, any
+# number of fraction digits) and linear in the document's length: no gap of a pattern may
+# cross a "<", a quoted value holds no blank, and the document is at most CAPS_MAX_BYTES.
+_TAG_RE = re.compile(r"<Dimension\b([^<>]{0,2000})>", re.IGNORECASE)
+_ATTR_RE = re.compile(r"""\s([A-Za-z_][\w.:-]*)\s*=\s*(?:"([^"\s]*)"|'([^'\s]*)')""")
+_TIME_RE = re.compile(r"(\d{4})-(\d\d)-(\d\d)T(\d\d):(\d\d)(?::(\d\d)(?:[.,](\d{1,9}))?)?(Z|[+-]\d\d:?\d\d)?\Z",
+                      re.IGNORECASE)
 
 
 def _layer_chunk(xml_text: Any, layer: str) -> Optional[str]:
-    if not isinstance(xml_text, str):
+    if not isinstance(xml_text, str) or len(xml_text) > CAPS_MAX_BYTES:
         return None
     i = xml_text.find("<Name>%s</Name>" % layer)
     if i < 0:
@@ -176,53 +187,104 @@ def _layer_chunk(xml_text: Any, layer: str) -> Optional[str]:
     return xml_text[i:j if j > 0 else None]
 
 
-def parse_frame_time(xml_text: str, layer: str) -> Optional[datetime]:
-    """The ``default`` of the layer's time dimension in a capabilities document (the latest
-    frame), as an aware UTC datetime; None when it is not there."""
-    chunk = _layer_chunk(xml_text, layer)
-    m = _DIM_RE.search(chunk) if chunk else None
+def _time_dimension(chunk: Optional[str]) -> Tuple[Optional[Dict[str, str]], Optional[str]]:
+    """(attributes, listed text) of the first ``time`` dimension in a layer's chunk; (None,
+    None) when there is none, the text None for an empty element."""
+    for m in _TAG_RE.finditer(chunk or ""):
+        attrs = {a.lower(): (v1 if v1 else v2) for a, v1, v2 in _ATTR_RE.findall(m.group(1))}
+        if attrs.get("name", "").lower() != "time":
+            continue
+        body = None
+        if not m.group(1).rstrip().endswith("/"):
+            k = chunk.find("<", m.end())
+            if k >= 0 and chunk[k:k + 12].lower() == "</dimension>":
+                body = chunk[m.end():k]
+        return attrs, body
+    return None, None
+
+
+def _parse_time(text: Any) -> Optional[datetime]:
+    """One time of the dimension (``2026-10-14T19:32:55.000Z``; any number of fraction
+    digits, ``Z``, an offset or no zone, which WMS reads as UTC) as an aware UTC datetime;
+    None for anything else."""
+    if not isinstance(text, str) or len(text) > 64:
+        return None
+    m = _TIME_RE.match(text.strip())
     if not m:
         return None
-    return util.parse_iso(m.group(1).strip())
+    y, mo, d, h, mi, sec, frac, zone = m.groups()
+    try:
+        t = datetime(int(y), int(mo), int(d), int(h), int(mi), int(sec or 0),
+                     int((frac or "").ljust(6, "0")[:6]), tzinfo=timezone.utc)
+        if zone and zone.upper() != "Z":
+            off = int(zone[1:3]) * 60 + int(zone[-2:])
+            t -= timedelta(minutes=off if zone[0] == "+" else -off)
+    except (ValueError, OverflowError):
+        return None
+    return t
 
 
-def parse_frame_times(xml_text: str, layer: str) -> List[datetime]:
-    """Every time the layer's time dimension lists, oldest first (aware UTC datetimes); an
-    empty list when there is none, or only a range (``start/end/period``), not a list."""
-    chunk = _layer_chunk(xml_text, layer)
-    m = _DIM_LIST_RE.search(chunk) if chunk else None
-    if not m:
-        return []
+def parse_frame_time(xml_text: str, layer: str) -> Optional[datetime]:
+    """The ``default`` of the layer's time dimension in a capabilities document (the latest
+    frame), as an aware UTC datetime; None when it is not there. A ``default`` of
+    ``current`` (WMS: the latest time) is the latest time listed."""
+    attrs, body = _time_dimension(_layer_chunk(xml_text, layer))
+    if attrs is None:
+        return None
+    default = attrs.get("default", "")
+    if default.lower() == "current":
+        times = _listed_times(body)
+        return times[-1] if times else None
+    return _parse_time(default)
+
+
+def _listed_times(body: Optional[str]) -> List[datetime]:
     out = []
-    for item in m.group(1).split(","):
+    for item in (body or "").split(","):
         item = item.strip()
-        t = util.parse_iso(item) if item and "/" not in item else None
+        t = _parse_time(item) if item and "/" not in item else None
         if t is not None:
             out.append(t)
     return sorted(set(out))
 
 
-def frame_time(cfg, region: Dict[str, Any]) -> Tuple[Optional[datetime], Optional[str]]:
+def parse_frame_times(xml_text: str, layer: str) -> List[datetime]:
+    """Every time the layer's time dimension lists, oldest first (aware UTC datetimes); an
+    empty list when there is none, or only a range (``start/end/period``), not a list."""
+    return _listed_times(_time_dimension(_layer_chunk(xml_text, layer))[1])
+
+
+def frame_time(cfg, region: Dict[str, Any],
+               now: Optional[datetime] = None) -> Tuple[Optional[datetime], Optional[str]]:
     """(latest frame time, error text)."""
-    ts, _times, err = frame_times(cfg, region)
+    ts, _times, err = frame_times(cfg, region, now=now)
     return ts, err
 
 
-def frame_times(cfg, region: Dict[str, Any]) -> Tuple[Optional[datetime], List[datetime], Optional[str]]:
+def frame_times(cfg, region: Dict[str, Any],
+                now: Optional[datetime] = None) -> Tuple[Optional[datetime], List[datetime], Optional[str]]:
     """(latest frame time, every listed frame time oldest first, error text), from one
-    capabilities document."""
+    capabilities document. A time more than ``FUTURE_S`` ahead of ``now`` (the clock) is
+    none: the latest frame's time is then unknown."""
     url = capabilities_url(cfg, region)
     try:
         data = http.get_bytes(url, cfg, accept="text/xml", timeout=CAPS_TIMEOUT)
     except http.HttpError as e:
         return None, [], "capabilities: %s" % str(e).replace(url, "GetCapabilities")
     except Exception as e:              # noqa: BLE001 - the time stamp is not worth a failure
-        return None, [], "capabilities: %s: %s" % (type(e).__name__, e)
+        log.warning("GetCapabilities of %s: %s: %s", region.get("ws"), type(e).__name__, e)
+        return None, [], "capabilities: %s" % type(e).__name__
+    if len(data) > CAPS_MAX_BYTES:
+        return None, [], "capabilities: a document of %d bytes (at most %d are read)" % (len(data), CAPS_MAX_BYTES)
     text = data.decode("utf-8", "replace")
     ts = parse_frame_time(text, region["layer"])
     if ts is None:
         return None, [], "capabilities: no time dimension for %s" % region["layer"]
-    return ts, parse_frame_times(text, region["layer"]), None
+    now = now if isinstance(now, datetime) and now.tzinfo is not None else util.utcnow()
+    limit = now + timedelta(seconds=FUTURE_S)
+    if ts > limit:
+        return None, [], "capabilities: the frame time %s lies ahead of the clock" % ts.strftime("%Y-%m-%d %H:%MZ")
+    return ts, [t for t in parse_frame_times(text, region["layer"]) if t <= limit], None
 
 
 # ---- colour decoding --------------------------------------------------------------------
@@ -258,20 +320,27 @@ def decode(img, palette=None, tolerance: float = COLOR_TOLERANCE, with_mask: boo
     a few thousand colours), then the pixels are mapped through the table. Counts:
     ``decoded`` / ``unknown`` distinct colours, ``unknown_px`` pixels left as no data. With
     ``with_mask`` a third item, an "L" image that is 255 where a pixel's colour was not
-    recognised: such a pixel may be an echo of any strength, never "no echo"."""
+    recognised: such a pixel may be an echo of any strength, never "no echo". Only a fully
+    transparent pixel is empty: the composites paint every value opaque, so a faint one
+    (alpha below ``MIN_ALPHA``) is unknown too. ValueError for an image of more than
+    ``MAX_COLORS`` colours (measured composites hold under 10000): no radar composite."""
     palette = tuple(palette) if palette else PALETTE
     rgba = img.convert("RGBA")
     w, h = rgba.size
-    colors = rgba.getcolors(MAX_COLORS) or []
+    colors = rgba.getcolors(MAX_COLORS)
+    if colors is None:
+        raise ValueError("not a radar composite (more than %d colours)" % MAX_COLORS)
     table: Dict[Tuple[int, int, int, int], int] = {}
     decoded = unknown = unknown_px = 0
+    bad = set()
     for n, c in colors:
-        if c[3] < MIN_ALPHA:
+        if c[3] == 0:
             table[c] = geo.MRMS_NODATA
             continue
-        dbz, dist = _segment_dbz(c[:3], palette)
+        dbz, dist = _segment_dbz(c[:3], palette) if c[3] >= MIN_ALPHA else (None, float("inf"))
         if dbz is None or dist > tolerance:
             table[c] = geo.MRMS_NODATA
+            bad.add(c)
             unknown += 1
             unknown_px += n
             continue
@@ -284,7 +353,6 @@ def decode(img, palette=None, tolerance: float = COLOR_TOLERANCE, with_mask: boo
         return idx, counts
     mask = Image.new("L", (w, h), 0)
     if unknown_px:
-        bad = {c for n, c in colors if c[3] >= MIN_ALPHA and table.get(c) == geo.MRMS_NODATA}
         mask.putdata([255 if c in bad else 0 for c in radarcheck.pixels(rgba)])
     return idx, counts, mask
 
@@ -310,13 +378,22 @@ def _decoded_result(cfg, data: bytes, frame, region, res: dict, layer: bool = Tr
     """Decode PNG bytes into ``res`` (``image`` unless ``layer`` is False, ``index``,
     ``unknown_mask``, ``colors``); ValueError when the bytes are not a usable map of the
     frame's size."""
+    # Only Pillow's PNG reader may see the bytes (any other codec is the reply's choice: an EPS
+    # would be handed to Ghostscript), and the size is checked from the header before any
+    # pixel is decoded (a small PNG can declare 13000 x 13000). The error text names the
+    # exception class only: Pillow's own text holds a memory address, and it reaches the page.
     try:
-        img = Image.open(io.BytesIO(data))
+        img = Image.open(io.BytesIO(data), formats=["PNG"])
+    except Exception as e:
+        raise ValueError("not an image (%s)" % type(e).__name__)
+    if img.format != "PNG":
+        raise ValueError("not an image (%s)" % img.format)
+    if tuple(img.size) != tuple(frame.size):
+        raise ValueError("unexpected map size %dx%d (wanted %dx%d)" % (tuple(img.size) + tuple(frame.size)))
+    try:
         img.load()
     except Exception as e:
-        raise ValueError("not an image (%s)" % (str(e).strip() or type(e).__name__))
-    if tuple(img.size) != tuple(frame.size):
-        raise ValueError("unexpected map size %dx%d (wanted %dx%d)" % (img.size + frame.size))
+        raise ValueError("unreadable image (%s)" % type(e).__name__)
     idx, counts, mask = decode(img, with_mask=True)
     res["index"] = idx
     res["unknown_mask"] = mask if counts.get("unknown_px") else None
@@ -350,7 +427,7 @@ def fetch(cfg, cache, site: dict, frame, now: Optional[datetime] = None) -> dict
         return res
     res.update(label=region["label"], source=region["layer"], region=region["ws"])
     key = _cache_key(site)
-    ts, times, ts_err = frame_times(cfg, region)
+    ts, times, ts_err = frame_times(cfg, region, now=now)
     res["times"] = times
     url = getmap_url(cfg, region, frame)
     res["url"] = url
@@ -361,7 +438,8 @@ def fetch(cfg, cache, site: dict, frame, now: Optional[datetime] = None) -> dict
     except (http.HttpError, ValueError) as e:
         err = str(e).replace(url, "GetMap")             # the URL would fill the map caption
     except Exception as e:              # noqa: BLE001 - any surprise = unavailable, never a crash
-        err = "%s: %s" % (type(e).__name__, e)
+        log.warning("%s: GetMap: %s: %s", site.get("slug"), type(e).__name__, e)
+        err = "GetMap: %s" % type(e).__name__           # its text may hold paths or addresses
     if err is None:
         res.update(ok=True, stale=False, age_s=0.0, ts=ts,
                    error=ts_err if ts_err else None)
@@ -434,5 +512,6 @@ def fetch_at(cfg, frame, newest: dict, at: datetime) -> Dict[str, Any]:
     except (http.HttpError, ValueError) as e:
         r["error"] = str(e).replace(url, "GetMap")
     except Exception as e:              # noqa: BLE001 - any surprise = that frame unavailable
-        r["error"] = "%s: %s" % (type(e).__name__, e)
+        log.warning("GetMap of %s: %s: %s", at, type(e).__name__, e)
+        r["error"] = "GetMap: %s" % type(e).__name__
     return r

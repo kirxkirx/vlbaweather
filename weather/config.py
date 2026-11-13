@@ -25,6 +25,7 @@ the Iowa Environmental Mesonet). Each part can be switched off on its own.
 """
 from __future__ import annotations
 
+import math
 import os
 import re
 from dataclasses import dataclass, field, fields
@@ -98,7 +99,9 @@ def _parse_sites_where(spec: str, what: str) -> List[Tuple[str, dict]]:
                              "slug|Name|lat|lon|tz: %r" % (what, raw))
         slug, name, lat, lon = parts[:4]
         tz = parts[4] if len(parts) == 5 and parts[4] else None
-        if not slug or not all(c.isalnum() or c in "_-" for c in slug):
+        # ASCII only: str.isalnum() is true for any Unicode letter or digit ("piñ²"), and the
+        # slug names files, anchors and status.json keys
+        if not re.fullmatch(r"[A-Za-z0-9_-]+", slug):
             raise ValueError("%s: the slug must be [A-Za-z0-9_-]: %r" % (what, slug))
         try:
             latf, lonf = float(lat), float(lon)
@@ -282,6 +285,74 @@ def lsr_feed_url(template: str, hours: int) -> str:
                          "(write a literal brace as {{ or }}): %r (%s)" % (template, e))
 
 
+def check_mrms_archive(pattern: str) -> str:
+    """``WEATHER_MRMS_ARCHIVE``: an http(s) URL whose file name holds %Y %m %d %H and %M.
+    The frame's time is taken from the name the pattern gives, and a frame whose URL did
+    not change since the last run is not fetched again: a name without the time to the
+    minute (a fixed "latest" file, an hourly name) would keep the first frame fetched,
+    labelled current, run after run. ValueError otherwise."""
+    _check_url(pattern, "WEATHER_MRMS_ARCHIVE")
+    name = pattern.rpartition("/")[2]
+    missing = [f for f in "YmdHM" if "%" + f not in name]
+    if missing:
+        raise ValueError("WEATHER_MRMS_ARCHIVE: the file name %r must hold %%Y %%m %%d %%H and %%M "
+                         "(the frame's time to the minute); it lacks %s"
+                         % (name, " ".join("%" + f for f in missing)))
+    return pattern
+
+
+# ---- paths -------------------------------------------------------------------
+def expand_path(value: str, what: str) -> str:
+    """``value`` with "~" expanded, made absolute. ValueError for an empty value, and for one
+    that still starts with "~" (an unknown user's home) or holds "$" (environment variables
+    are not expanded: neither systemd's EnvironmentFile nor the cron wrapper does it), which
+    would otherwise become a directory of that literal name below the working directory."""
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError("%s must be a path" % what)
+    p = os.path.expanduser(value.strip())
+    if p.startswith("~") or "$" in p:
+        raise ValueError("%s %r cannot be used: '~' is expanded to the run user's home only and "
+                         "$VARIABLES not at all; write the path out" % (what, value))
+    return os.path.abspath(p)
+
+
+def path_inside(path: str, root: str) -> bool:
+    """Whether ``path`` is ``root`` or lies below it, after resolving symbolic links."""
+    p, r = os.path.realpath(path), os.path.realpath(root)
+    return p == r or p.startswith(r.rstrip(os.sep) + os.sep)
+
+
+def check_not_published(what: str, path: str, out_dir: str) -> None:
+    """ValueError when the private ``path`` is the output directory or lies inside it: the
+    web server serves all of that directory."""
+    if path_inside(path, out_dir):
+        raise ValueError("%s %s lies in WEATHER_OUT_DIR %s (or is it), which the web server "
+                         "publishes; put it outside the output directory" % (what, path, out_dir))
+
+
+# ---- bounds of the numeric settings --------------------------------------------
+# Far above the defaults and any value the documentation shows: they catch a slip of the
+# keyboard (a digit too many, a sign), not a choice.
+MAX_HTTP_TIMEOUT_S = 120        # s per request (default 25; the GLM layer caps its own at 20)
+MAX_HTTP_RETRIES = 5            # default 2; each retry of a dead host costs a timeout
+MAX_RUN_BUDGET_S = 3600         # s: an hour, twice the VLBA page's 30-minute run interval
+MAX_AGE_S = 7 * 86400           # s: the TTLs and MAX_STALE limits (defaults 600..7200)
+MAX_POINTS_AGE_S = 366 * 86400  # s: /points metadata (defaults 7 and 60 days)
+MAX_RADAR_BACK = 30             # 2-minute frames: an hour (default 10); one HEAD request each
+# Basemap tiles per map (one theme): the default 100-mile map at zoom 9 takes 16 at most for
+# the VLBA sites, zoom 10 takes 49, zoom 11 182; 1000 miles at zoom 12 would take 61500 (a
+# 12 GB canvas). 256 tiles are a 4096x4096-pixel canvas.
+MAX_TILES_PER_MAP = 256
+
+
+def _tile_count(frame) -> int:
+    """How many basemap tiles the map ``frame`` (a ``geo.MapFrame``) is drawn from."""
+    t = float(geo.TILE_SIZE)
+    nx = int(math.floor(frame.gx1 / t)) - int(math.floor(frame.gx0 / t)) + 1
+    ny = int(math.floor(frame.gy1 / t)) - int(math.floor(frame.gy0 / t)) + 1
+    return nx * ny
+
+
 # ---- env helpers -------------------------------------------------------------
 # Placeholder contacts copied from documentation. OpenStreetMap blocks User-Agents that
 # contain them (verified 2026-09-24: any "example.org"/"example.com" in the string gets the
@@ -427,8 +498,9 @@ class Config:
         c = cls()
         env_sites_spec = _env_str("WEATHER_SITES", "")
         c.sites_file = _env_str("WEATHER_SITES_FILE", c.sites_file)
-        c.out_dir = os.path.abspath(_env_str("WEATHER_OUT_DIR", c.out_dir))
-        c.cache_dir = os.path.expanduser(_env_str("WEATHER_CACHE_DIR", c.cache_dir))
+        # "~" expanded and made absolute alike in validate() (_check_paths)
+        c.out_dir = _env_str("WEATHER_OUT_DIR", c.out_dir)
+        c.cache_dir = _env_str("WEATHER_CACHE_DIR", c.cache_dir)
         c.title = _env_str("WEATHER_TITLE", c.title)
         c.page_url = _env_str("WEATHER_PAGE_URL", c.page_url)
         c.refresh_seconds = _env_int("WEATHER_REFRESH_SECONDS", c.refresh_seconds)
@@ -555,6 +627,64 @@ class Config:
                 raise ValueError("%s: its map reaches no US state or territory, and NWS "
                                  "forecasts and alerts cover only those (US longitudes are "
                                  "negative, e.g. -106.65)" % what)
+            tiles = _tile_count(frame)
+            if tiles > MAX_TILES_PER_MAP:
+                raise ValueError("%s: its %g-mile map at WEATHER_TILE_ZOOM=%d needs %d basemap "
+                                 "tiles, more than %d; lower WEATHER_TILE_ZOOM or "
+                                 "WEATHER_MAP_MILES" % (what, self.map_miles, self.tile_zoom,
+                                                        tiles, MAX_TILES_PER_MAP))
+
+    def _check_numbers(self) -> None:
+        """The HTTP, run-budget, caching and radar look-back numbers: whole numbers (the
+        timeout any finite number) within bounds. A negative retry count sends no request at
+        all, a NaN timeout or a TTL of centuries breaks the run in the middle; the upper
+        bounds are far above any sensible value and the defaults, and only keep a slip of the
+        keyboard from turning into an overflow or a source that is never fetched again."""
+        def whole(name: str, value, lo: int, hi: int, unit: str) -> None:
+            if isinstance(value, bool) or not isinstance(value, int) or not (lo <= value <= hi):
+                raise ValueError("%s must be a whole number%s, %d..%d" % (name, unit, lo, hi))
+
+        timeout = self.http_timeout
+        if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) \
+                or not math.isfinite(timeout) or not (1 <= timeout <= MAX_HTTP_TIMEOUT_S):
+            raise ValueError("WEATHER_HTTP_TIMEOUT must be a number of seconds, 1..%d"
+                             % MAX_HTTP_TIMEOUT_S)
+        whole("WEATHER_HTTP_RETRIES", self.http_retries, 0, MAX_HTTP_RETRIES, "")
+        whole("WEATHER_RUN_BUDGET", self.run_budget_s, 10, MAX_RUN_BUDGET_S, " of seconds")
+        for name, value in (("WEATHER_POINTS_TTL", self.points_ttl),
+                            ("points_max_stale", self.points_max_stale)):
+            whole(name, value, 0, MAX_POINTS_AGE_S, " of seconds")
+        for name, value in (("WEATHER_FORECAST_TTL", self.forecast_ttl),
+                            ("WEATHER_FORECAST_MAX_STALE", self.forecast_max_stale),
+                            ("WEATHER_HOURLY_TTL", self.hourly_ttl),
+                            ("WEATHER_HOURLY_MAX_STALE", self.hourly_max_stale),
+                            ("WEATHER_OBS_TTL", self.obs_ttl),
+                            ("WEATHER_OBS_MAX_STALE", self.obs_max_stale),
+                            ("WEATHER_ALERTS_MAX_STALE", self.alerts_max_stale),
+                            ("WEATHER_RADAR_MAX_STALE", self.radar_max_stale)):
+            whole(name, value, 0, MAX_AGE_S, " of seconds")
+        whole("obs_max_age_min", self.obs_max_age_min, 1, MAX_AGE_S // 60, " of minutes")
+        whole("WEATHER_RADAR_MAX_BACK", self.radar_max_back, 0, MAX_RADAR_BACK, " of 2-minute frames")
+
+    def _check_paths(self) -> None:
+        """The output directory, the cache directory and the lock file: "~" expanded and made
+        absolute alike (a relative path would follow the cron job's working directory), and
+        none of the private ones published. The web server serves everything in the output
+        directory, so a cache directory or lock file in it, or an output directory inside
+        the cache, would publish the cached replies, the lock (its process id) and the
+        wrapper's cron.log."""
+        self.out_dir = expand_path(self.out_dir, "WEATHER_OUT_DIR")
+        self.cache_dir = expand_path(self.cache_dir, "WEATHER_CACHE_DIR")
+        if not self.lock_file:
+            self.lock_file = os.path.join(self.cache_dir, "run.lock")
+        self.lock_file = expand_path(self.lock_file, "WEATHER_LOCK_FILE")
+        if path_inside(self.out_dir, self.cache_dir):
+            raise ValueError("WEATHER_OUT_DIR %s lies in WEATHER_CACHE_DIR %s (or is it): the "
+                             "web server would publish the cache; keep the two apart"
+                             % (self.out_dir, self.cache_dir))
+        for name, path in (("WEATHER_CACHE_DIR", self.cache_dir),
+                           ("WEATHER_LOCK_FILE", self.lock_file)):
+            check_not_published(name, path, self.out_dir)
 
     def validate(self) -> None:
         if not self.sites:
@@ -581,8 +711,8 @@ class Config:
                 "block any User-Agent with a placeholder contact such as example.org (the maps "
                 "then show an 'Access blocked' tile). Put a real contact address or URL there, "
                 "or leave the contact out." % bad.group(0))
-        if self.run_budget_s < 10:
-            raise ValueError("WEATHER_RUN_BUDGET must be >= 10 (seconds)")
+        self._check_numbers()
+        check_mrms_archive(self.mrms_archive)
         for s in self.sites:
             tz = s.get("tz")
             if tz is not None and (not isinstance(tz, str) or not tz.strip()):
@@ -591,8 +721,7 @@ class Config:
         parse_alert_colors(self.alert_colors)   # ValueError on a malformed WEATHER_ALERT_COLORS
         self.alert_area_codes                   # ValueError: malformed, or auto finds no area
         self._validate_roads()
-        if not self.lock_file:
-            self.lock_file = os.path.join(self.cache_dir, "run.lock")
+        self._check_paths()
 
     def _validate_roads(self) -> None:
         """The road-closure settings. Checked even while ``roads_enabled`` is off, so that

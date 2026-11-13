@@ -11,8 +11,12 @@
 [Unit]
 Description=vlbaweather: VLBA antenna weather page generator (one run)
 Documentation=https://github.com/kirxkirx/vlbaweather
+# time-sync.target: a run on a clock that is still wrong after boot would stamp cached
+# replies in the future, and those would read as fresh until the clock caught up. Ordered
+# after it only: the time service pulls it in (systemd.special(7)).
 After=network-online.target
 Wants=network-online.target
+After=time-sync.target
 
 [Service]
 Type=oneshot
@@ -22,14 +26,20 @@ WorkingDirectory=__REPO__
 SyslogIdentifier=vlbaweather
 
 # Baseline paths, so the generator and the installer agree even with no env file at all.
-# EnvironmentFile= entries override these ('-' = fine if the file is absent); see
+# EnvironmentFile= overrides these ('-' = fine if the file is absent); see
 # vlbaweather.env.example. local-weather-awareness's /etc/local-weather-awareness.env is NOT read. If
 # you override WEATHER_OUT_DIR / WEATHER_CACHE_DIR there, rerun deploy/install.sh so the
 # directories, SELinux labels and ReadWritePaths= follow.
+# Only the root-owned /etc/vlbaweather.env, never a file in the run user's home: systemd
+# applies the environment files to EVERY command of the unit, the "+" ExecStartPre= line
+# below included, which starts as root, so LD_PRELOAD=... in a file the run user can write
+# would run its code as root. (The cron wrapper still reads ~/vlbaweather.env.)
 Environment=WEATHER_OUT_DIR=__OUT_DIR__
 Environment=WEATHER_CACHE_DIR=__CACHE_DIR__
 EnvironmentFile=-/etc/vlbaweather.env
-EnvironmentFile=-__HOME__/vlbaweather.env
+# no user site-packages: ~/.local is outside the sandbox's writable paths, but a .pth file
+# planted there earlier would run in every later run
+Environment=PYTHONNOUSERSITE=1
 
 # Recreate the output and cache directories if they were deleted (e.g. `rm -rf` of the
 # cache to force a basemap rebuild). The generator cannot do it itself: under
@@ -52,17 +62,25 @@ ExecStart=/usr/bin/python3 __REPO__/make_vlba_page.py
 TimeoutStartSec=10min
 # Background job on a shared web host: yield to Apache.
 Nice=10
+# A normal run needs a few hundred MB (the GLM granules and the maps); a reply that would
+# grow it far beyond (a huge body, a gzip bomb) ends the run here, not on the whole host.
+MemoryMax=2G
 
 # Hardening. The generator only needs: read the checkout, read/write the output and cache
-# directories, talk HTTPS. ProtectSystem=full mounts /usr, /boot and /etc read-only;
+# directories, talk HTTPS. ProtectSystem=strict mounts the whole file system read-only (a
+# service home such as /var/lib/vlbaweather, a checkout under /opt or /srv included);
 # ProtectHome=read-only does the same for /home, /root and /run/user; the ReadWritePaths=
-# below punch the two writable holes ('-' = ignore a path that does not exist yet).
+# below punch the two writable holes ('-' = ignore a path that does not exist yet). The
+# generator writes nothing else: index.html, status.json and the maps go to the output
+# directory, the cache, the state file (VLBA_STATE_FILE) and the lock (WEATHER_LOCK_FILE)
+# to the cache directory unless set elsewhere (deploy/install.sh warns then), the log to
+# the journal, and whatever a library puts in /tmp to the private /tmp (PrivateTmp=).
 # If the service fails with "Failed to set up mount namespacing" (some container hosts),
 # comment out the Protect*/Private* lines.
 NoNewPrivileges=true
 PrivateTmp=true
 PrivateDevices=true
-ProtectSystem=full
+ProtectSystem=strict
 ProtectHome=read-only
 ProtectKernelTunables=true
 ProtectControlGroups=true

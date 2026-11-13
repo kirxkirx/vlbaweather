@@ -20,14 +20,26 @@ cd "$(dirname "$0")" || exit 1
 PORT="${1:-8080}"
 OUT="${2:-./out}"
 INTERVAL="${INTERVAL:-1800}"
+# Whole seconds, at least 60: a word or 0 would restart the generator at once forever (a
+# request storm against the upstream servers), and "30m" would stop the loop after one run.
+# Leading zeros are dropped (bash arithmetic reads 0600 as octal); more than 7 digits
+# (about 4 months) is refused before the arithmetic could overflow.
 case "$INTERVAL" in
     '' | *[!0-9]*) ;;
-    *)
-        win=$(( (INTERVAL + 59) / 60 ))
-        if [ "$win" -lt 1 ]; then win=1; fi
-        if [ "$win" -gt 60 ]; then win=60; fi
-        export VLBA_GLM_WINDOW_MIN="${VLBA_GLM_WINDOW_MIN:-$win}" ;;
+    *) INTERVAL="${INTERVAL#"${INTERVAL%%[!0]*}"}" ;;
 esac
+case "$INTERVAL" in
+    '' | *[!0-9]* | ????????*)
+        echo "run_local.sh: INTERVAL must be a whole number of seconds, at least 60 (got: ${INTERVAL:-0})" >&2
+        exit 2 ;;
+esac
+if [ "$INTERVAL" -lt 60 ]; then
+    echo "run_local.sh: INTERVAL must be a whole number of seconds, at least 60 (got: $INTERVAL)" >&2
+    exit 2
+fi
+win=$(( (INTERVAL + 59) / 60 ))
+if [ "$win" -gt 60 ]; then win=60; fi
+export VLBA_GLM_WINDOW_MIN="${VLBA_GLM_WINDOW_MIN:-$win}"
 BIND="${BIND:-0.0.0.0}"
 export WEATHER_OUT_DIR="$OUT"
 export WEATHER_CACHE_DIR="${WEATHER_CACHE_DIR:-./.cache-dev}"

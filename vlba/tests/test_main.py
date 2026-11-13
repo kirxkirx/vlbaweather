@@ -251,8 +251,19 @@ def glm_flash_pt(monkeypatch):
     monkeypatch.setattr(glm, "fetch", lambda cfg, now=None, since=None, retried=None, seen=None: _glm_result([(flash[0], flash[1], "G19")]))
 
 
-def test_full_run_two_antennas(cfg, fake_http, mrms, glm_flash_pt, monkeypatch):
+def test_full_run_two_antennas(cfg, fake_http, glm_flash_pt, monkeypatch):
+    island_first = island_ts()      # the composite's time is taken in add_routes, to the second
     add_routes(fake_http, cfg)
+    island_last = island_ts()
+    # IEM's archive: a clear frame before the newest (the echo is a first one: "watch"; with no
+    # frame before it could be read it would be "no data", audit #119), and the frames of the
+    # newest scan that the later runs look back to. The newest frame's time is fixed for the
+    # whole test: the routes are named after it, and a minute that ends during the test must
+    # not move it (30 dBZ 10 km north of Pie Town)
+    t = _fixed_frame(monkeypatch, [(PT["lat"] + 0.09, PT["lon"])])
+    fake_http.add(_archive_name(t - timedelta(minutes=2)), frame_png([]))
+    for m in (0, 2):
+        fake_http.add(_archive_name(t + timedelta(minutes=m)), frame_png([(PT["lat"] + 0.09, PT["lon"])]))
     run = mvp.run_once(cfg)
     assert [s["slug"] for s in run["sites"]] == ["pt", "mk"]
     pt, mk = run["sites"]
@@ -285,8 +296,8 @@ def test_full_run_two_antennas(cfg, fake_http, mrms, glm_flash_pt, monkeypatch):
             assert os.path.exists(p) and Image.open(p).format == "PNG"
     html = read_page(cfg)
     assert "could not be rendered" not in html
-    assert "NWS Hawaii composite %s" % island_ts().strftime("%H:%MZ") in html
-    assert "MRMS frame %s" % frame_ts().strftime("%H:%MZ") in html
+    assert any("NWS Hawaii composite %s" % ts.strftime("%H:%MZ") in html for ts in (island_first, island_last))
+    assert "MRMS frame %s" % t.strftime("%H:%MZ") in html
     assert 'class="vbadge bad sm">BAD' in html and ">GOOD?</span>" not in html
     st = read_status(cfg)
     assert st["verdicts"]["pt"]["status"] == "BAD" and st["verdicts"]["mk"]["checks"]["forecast_thunder"] == "not provided"
@@ -303,12 +314,12 @@ def test_full_run_two_antennas(cfg, fake_http, mrms, glm_flash_pt, monkeypatch):
     assert radar2["state"] == "watch" and "not counted again" in radar2["detail"]
     # a newer frame with the very same data in the ring (the radar has not completed a new
     # scan): no second observation either
-    same = dict(_mrms_result([(PT["lat"] + 0.09, PT["lon"])]), ts=frame_ts() + timedelta(minutes=2))
+    same = dict(_mrms_result([(PT["lat"] + 0.09, PT["lon"])]), ts=t + timedelta(minutes=2))
     monkeypatch.setattr(mvp.mwp.radar, "load_frame", lambda cfg, cache: same)
     radar_same = [c for c in mvp.run_once(cfg)["sites"][0]["verdict"]["checks"] if c["key"] == "radar"][0]
     assert radar_same["state"] == "watch" and "the same radar data as the frame counted last" in radar_same["detail"]
     # a new scan (the echo has moved) confirms it
-    newer = dict(_mrms_result([(PT["lat"] + 0.08, PT["lon"] + 0.02)]), ts=frame_ts() + timedelta(minutes=4))
+    newer = dict(_mrms_result([(PT["lat"] + 0.08, PT["lon"] + 0.02)]), ts=t + timedelta(minutes=4))
     monkeypatch.setattr(mvp.mwp.radar, "load_frame", lambda cfg, cache: newer)
     run3 = mvp.run_once(cfg)
     pt3 = run3["sites"][0]
@@ -391,6 +402,7 @@ def test_observation_from_a_station_that_reports_weather(cfg, fake_http, monkeyp
     # only the station without weather qualifies; none of its recent reports has weather
     first("gridpoints/ABQ/50,60/stations", stations_doc("KRAW", 34.32, -108.10, 2300.0))
     first("/stations/KRAW/observations?limit", _history(*[_no_weather("KRAW", 15 + 60 * k) for k in range(12)]))
+    first("aviationweather.gov/api/data/metar", b"")        # no METARs of it (its 204): QSBA3's case
     for k in list(os.listdir(cfg.cache_dir)):
         if k.startswith(("obs_", "stations_")):
             os.unlink(os.path.join(cfg.cache_dir, k))
@@ -403,8 +415,8 @@ def test_observation_from_a_station_that_reports_weather(cfg, fake_http, monkeyp
 
 def test_blank_record_of_a_metar_station_is_not_n_a(cfg, fake_http, monkeypatch):
     """St. Croix's case: the only qualifying station is a METAR airport whose latest record
-    came back blank. Its newest report with weather of the last 90 min decides; without
-    one the check has no data this run (GOOD?), never n/a."""
+    came back blank. Its newest report with weather of the last 2 h decides; without one
+    (nor a METAR at aviationweather.gov) the check has no data this run (GOOD?), never n/a."""
     monkeypatch.setattr(mvp.mwp.radar, "load_frame", lambda cfg, cache: _mrms_result([]))
     monkeypatch.setattr(glm, "fetch", lambda cfg, now=None, since=None, retried=None, seen=None: _glm_result([]))
     monkeypatch.setattr(glm, "deps_available", lambda: True)
@@ -492,7 +504,7 @@ def test_another_stations_report_moves_only_the_precipitation_check(cfg, fake_ht
     windy = _report("KNEAR", minutes_ago=2)
     windy["properties"]["windSpeed"] = _q("km_h-1", 80.0)
     _setup_two_stations(cfg, fake_http, monkeypatch,
-                        {"/latest": windy, "?limit": _history(windy, _report("KNEAR", "Clear", 25))},
+                        {"/latest": windy, "?limit": _history(windy, _report("KNEAR", "Clear", 100))},
                         {"/latest": _report("KFAR", "Clear", 10)})
     pt = mvp.run_once(cfg)["sites"][0]
     states = {c["key"]: c for c in pt["verdict"]["checks"]}
@@ -621,7 +633,7 @@ def test_only_histories_that_could_win_are_fetched(cfg, fake_http, monkeypatch):
     blank latest records of the others, whose recent reports therefore cannot win and are not
     fetched; with the precipitation check off, nothing beyond the parent's report is."""
     _setup_two_stations(cfg, fake_http, monkeypatch,
-                        {"/latest": _report("KNEAR", minutes_ago=55), "?limit": _history(_report("KNEAR", "Rain", 30))},
+                        {"/latest": _report("KNEAR", minutes_ago=100), "?limit": _history(_report("KNEAR", "Rain", 30))},
                         {"/latest": _report("KFAR", "Clear", 20)})
     pt, c = _precip_check(cfg)
     assert c["state"] == "ok" and c["detail"].startswith("KFAR report of 20 min ago (KNEAR's latest has no weather)")
@@ -641,7 +653,171 @@ def test_the_detail_says_why_the_latest_report_was_passed_over(cfg, fake_http, m
     _setup_two_stations(cfg, fake_http, monkeypatch, {"/latest": _report("KNEAR", "Clear", 120)},
                         {"/latest": _report("KFAR", "Clear", 20)})
     pt, c = _precip_check(cfg)
-    assert c["state"] == "ok" and c["detail"].startswith("KFAR report of 20 min ago (KNEAR's latest is 2 h ")
+    assert c["state"] == "ok" and c["detail"].startswith("KFAR report of 20 min ago (KNEAR's latest at NWS is 2 h ")
+
+
+# ---- METARs NWS serves late: aviationweather.gov (St. Croix's TISX, 2026-11-10) ----------------
+def _metar(sid, minutes_ago, wx="", rmk="AO2 SLP184", at=None):
+    """An aviationweather.gov METAR (its data API's JSON) of ``minutes_ago`` (or of ``at``)."""
+    t = at or util.utcnow() - timedelta(minutes=minutes_ago)
+    return {"icaoId": sid, "obsTime": int(t.timestamp()), "metarType": "METAR",
+            "rawOb": "METAR %s %sZ 03004KT 10SM %sCLR 26/24 A3008 RMK %s" % (
+                sid, t.strftime("%d%H%M"), wx + " " if wx else "", rmk)}
+
+
+def _late_nws(cfg, fake_http, monkeypatch, metars, nws_age=97, nws=None):
+    """St. Croix at the :30 runs: Pie Town's one qualifying station (KPT1, a METAR airport)
+    whose newest report at NWS is ``nws_age`` min old ("Clear"; or the report ``nws``), and
+    ``metars`` as aviationweather.gov's answer (a list; b"" for its 204; None for a failure)."""
+    monkeypatch.setattr(mvp.mwp.radar, "load_frame", lambda cfg, cache: _mrms_result([]))
+    _quiet_glm(monkeypatch)
+    add_routes(fake_http, cfg)
+    late = nws or _report("KPT1", "Clear", nws_age, raw="KPT1 101853Z 15005KT 10SM CLR 31/25 A3001 RMK AO2")
+    answer = (None, False) if metars is None else (metars if isinstance(metars, bytes) else json.dumps(metars).encode(), True)
+    fake_http.routes[:0] = [("/stations/KPT1/observations/latest", json.dumps(late).encode(), True),
+                            ("aviationweather.gov/api/data/metar",) + answer]
+
+
+def test_a_metar_nws_serves_late_is_read_from_aviationweather(cfg, fake_http, monkeypatch):
+    """NWS's newest report is 97 min old, the station's METAR of 37 min ago is at
+    aviationweather.gov: the newest decides, rain in it too."""
+    _late_nws(cfg, fake_http, monkeypatch, [_metar("KPT1", 97), _metar("KPT1", 37)])
+    pt, c = _precip_check(cfg)
+    assert c["state"] == "ok" and not pt["verdict"]["incomplete"]
+    assert c["detail"] == ("KPT1 METAR of 37 min ago from aviationweather.gov (KPT1's latest at NWS is 1 h 37 min "
+                           "old): no precipitation reported")
+    assert pt["obs_raw"]["report_source"] == "aviationweather.gov" and pt["obs_raw"]["metar"].startswith("KPT1 ")
+    calls = [u for u in fake_http.calls if "aviationweather.gov" in u]
+    assert len(calls) == 1 and calls[0].endswith("?ids=KPT1&format=json&hours=2")
+    fake_http.routes.insert(0, ("aviationweather.gov/api/data/metar", json.dumps([_metar("KPT1", 37, "-RA")]).encode(),
+                                True))
+    pt, c = _precip_check(cfg)
+    assert c["state"] == "bad" and "METAR reports -RA" in c["detail"] and pt["verdict"]["status"] == "BAD"
+
+
+@pytest.mark.parametrize("metars", [None, b""])
+def test_a_report_of_up_to_2_h_counts_when_aviationweather_has_none(cfg, fake_http, monkeypatch, metars):
+    """aviationweather.gov down, or without METARs (its 204): NWS's report of 97 min ago still
+    counts, the window being 2 h (90 min until 2026-11-10)."""
+    _late_nws(cfg, fake_http, monkeypatch, metars)
+    pt, c = _precip_check(cfg)
+    assert c["state"] == "ok" and c["detail"].startswith("KPT1 report of 1 h 37 min ago (its newest with weather)")
+    assert any("aviationweather.gov" in u for u in fake_http.calls)
+
+
+@pytest.mark.parametrize("metars, note", [
+    (None, "; aviationweather.gov: fake: no route"),             # out of reach: named, nothing more
+    (b"", ""),                                                  # its 204: no METARs, no note
+    ("too old", ""),                                            # a METAR of 2 h 05 min ago
+    ("pwino", "; KPT1: newest report: present-weather sensor out (PWINO)"),   # its sensor out: said
+])
+def test_no_report_of_the_last_2_h_anywhere_is_no_data(cfg, fake_http, monkeypatch, metars, note):
+    """NWS's newest report is 2 h 30 min old; aviationweather.gov out of reach, without METARs,
+    or with only one too old or one that says nothing about the weather: never "clear"."""
+    answer = {"too old": [_metar("KPT1", 125)], "pwino": [_metar("KPT1", 37, rmk="AO2 PWINO")]}.get(metars, metars)
+    _late_nws(cfg, fake_http, monkeypatch, answer, nws_age=150)
+    pt, c = _precip_check(cfg)
+    assert c["state"] == "unknown" and pt["verdict"]["incomplete"]
+    assert c["detail"].startswith("no report with weather of the last 2 h from KPT1" + note)
+    if not note:
+        assert c["detail"] == "no report with weather of the last 2 h from KPT1"
+
+
+def test_nws_wins_a_tie_with_aviationweather(cfg, fake_http, monkeypatch):
+    """The same report at both, 100 min old: NWS's copy, with its decoded words, is read."""
+    t = (util.utcnow() - timedelta(minutes=100)).replace(microsecond=0)
+    nws = _report("KPT1", "Clear", raw="KPT1 101853Z 15005KT 10SM CLR 31/25 A3001 RMK AO2")
+    nws["properties"]["timestamp"] = _iso(t)
+    _late_nws(cfg, fake_http, monkeypatch, [_metar("KPT1", 0, at=t)], nws=nws)
+    pt, c = _precip_check(cfg)
+    assert c["state"] == "ok" and pt["obs_raw"].get("report_source") is None and pt["obs_raw"]["text"] == "Clear"
+
+
+@pytest.mark.parametrize("bad", [lambda t: t * 1000, lambda t: float("nan"), lambda t: 1e20])
+def test_a_metar_with_an_unusable_time_is_left_out(cfg, fake_http, monkeypatch, bad):
+    """aviationweather.gov sends a METAR whose time is out of range (in milliseconds, NaN):
+    that one is left out; NWS's report, with its rain, still counts."""
+    rain = _report("KPT1", "Light Rain", 97, raw="KPT1 101853Z 15005KT 10SM -RA BKN030 31/25 A3001 RMK AO2")
+    m = _metar("KPT1", 37)
+    m["obsTime"] = bad(m["obsTime"])
+    _late_nws(cfg, fake_http, monkeypatch, [m], nws=rain)
+    run = mvp.run_once(cfg)
+    pt = run["sites"][0]
+    c = [c for c in pt["verdict"]["checks"] if c["key"] == "obs_precip"][0]
+    assert c["state"] == "bad" and pt["verdict"]["status"] == "BAD" and not pt["verdict"]["incomplete"]
+    assert not any("precipitation report failed" in e for e in run["errors"]), run["errors"]
+    assert "pt precipitation report: METARs from aviationweather.gov unavailable: none of the 1 reports" \
+        " in its answer could be read" in run["errors"]
+
+
+def test_a_metar_as_new_as_a_blank_nws_record_raises_no_doubt(cfg, fake_http, monkeypatch):
+    """KPT1's latest record at NWS is blank, its history cannot be read, and its METAR of the
+    same time is at aviationweather.gov: that history cannot hold anything newer."""
+    t = (util.utcnow() - timedelta(minutes=37)).replace(microsecond=0)
+    blank = _no_weather("KPT1", 37)
+    blank["properties"]["timestamp"] = _iso(t)
+    _late_nws(cfg, fake_http, monkeypatch, [_metar("KPT1", 0, at=t)], nws=blank)
+    fake_http.routes.insert(0, ("/stations/KPT1/observations?limit", None, False))
+    pt, c = _precip_check(cfg)
+    assert c["state"] == "ok" and "maybe newer" not in c["detail"] and pt["obs_raw"]["report_source"] == "aviationweather.gov"
+
+
+def test_a_metar_of_just_now(cfg, fake_http, monkeypatch):
+    _late_nws(cfg, fake_http, monkeypatch, [_metar("KPT1", 0.5)])
+    pt, c = _precip_check(cfg)
+    assert c["state"] == "ok" and c["detail"].startswith("KPT1 METAR just now from aviationweather.gov (")
+
+
+def test_a_fresh_nws_report_asks_aviationweather_nothing(cfg, fake_http, monkeypatch):
+    """NWS has a report of the last 90 min: the station's latest, or (its latest blank) one of
+    its recent reports. aviationweather.gov is not asked."""
+    _late_nws(cfg, fake_http, monkeypatch, [_metar("KPT1", 10, "-RA")], nws_age=50)
+    pt, c = _precip_check(cfg)
+    assert c["state"] == "ok" and not any("aviationweather.gov" in u for u in fake_http.calls)
+    fake_http.routes[:0] = [("/stations/KPT1/observations/latest", json.dumps(_no_weather("KPT1", 10)).encode(), True),
+                            ("/stations/KPT1/observations?limit",
+                             json.dumps(_history(_no_weather("KPT1", 10), _report("KPT1", "Clear", 50))).encode(), True)]
+    for k in list(os.listdir(cfg.cache_dir)):
+        if k.startswith(("obs_", "obshist_")):
+            os.unlink(os.path.join(cfg.cache_dir, k))
+    fake_http.calls.clear()
+    pt, c = _precip_check(cfg)
+    assert c["state"] == "ok" and c["detail"].startswith("KPT1 report of 50 min ago (its newest with weather)")
+    assert any("observations?limit" in u for u in fake_http.calls)
+    assert not any("aviationweather.gov" in u for u in fake_http.calls)
+
+
+def test_aviationweather_can_be_switched_off(cfg, fake_http, monkeypatch):
+    cfg.metar_url = ""
+    _late_nws(cfg, fake_http, monkeypatch, [_metar("KPT1", 37, "-RA")])
+    pt, c = _precip_check(cfg)
+    assert c["state"] == "ok" and not any("aviationweather.gov" in u for u in fake_http.calls)
+
+
+def test_metars_from_aviationweather_read_like_nws_reports(cfg, fake_http):
+    """Its METAR without the METAR / SPECI word (the weather groups follow the station and the
+    time, as in NWS's raw message), the hourly precipitation of its P group, nothing else
+    decoded; entries without station, time or text are left out."""
+    m = {"icaoId": "TISX", "obsTime": 1794358380,
+         "rawOb": "METAR TISX 110053Z 03004KT 10SM CLR 26/24 A3008 RMK AO2 SLP184 T02610244 PNO $"}
+    p = mvp._metar_props(m)
+    assert p["rawMessage"].startswith("TISX 110053Z ") and p["timestamp"] == "2026-11-11T00:53:00+00:00"
+    assert p["precipitationLastHour"] is None and decision.metar_precipitation(p["rawMessage"]) == []
+    assert mvp._reports_weather(p) and p["source"] == "aviationweather.gov"
+    rain = mvp._metar_props(dict(m, obsTime=m["obsTime"] + 17 * 60,
+                                 rawOb="SPECI TISX 110110Z 14007KT 5SM -RA FEW002 26/24 A3008 RMK AO2 P0012"))
+    assert decision.metar_precipitation(rain["rawMessage"]) == ["-RA"] and util.quantity(rain["precipitationLastHour"]) == 3.05
+    for bad in ({}, "x", dict(m, obsTime=True), dict(m, obsTime=None), dict(m, rawOb=""), dict(m, icaoId="")):
+        assert mvp._metar_props(bad) is None
+    older = dict(m, obsTime=m["obsTime"] - 3600, rawOb=m["rawOb"].replace("110053Z", "102353Z"))
+    fake_http.add("aviationweather.gov/api/data/metar", [older, m, dict(m, icaoId="KXYZ"), {"junk": 1}])
+    got, why = mvp._metar_reports(cfg, ["TISX", "CJDW", "no such id", None])
+    assert why is None and set(got) == {"TISX"}
+    assert [r["timestamp"] for r in got["TISX"]] == ["2026-11-11T00:53:00+00:00", "2026-11-10T23:53:00+00:00"]
+    assert fake_http.calls[-1] == "https://aviationweather.gov/api/data/metar?ids=TISX,CJDW&format=json&hours=2"
+    fake_http.routes.insert(0, ("aviationweather.gov", json.dumps({"error": "bad"}).encode(), True))
+    assert mvp._metar_reports(cfg, ["TISX"]) == ({}, "unreadable answer (dict instead of a list)")
+    assert mvp._metar_reports(cfg, ["no such id"]) == ({}, None) and len(fake_http.calls) == 2
 
 
 def test_the_precipitation_report_carries_its_own_staleness(cfg, cache, monkeypatch):
@@ -801,7 +977,7 @@ def test_station_info_reads_the_list_entry_by_entry(cfg, cache):
         f["geometry"] = None
     cache.put(key, nogeo)
     info = mvp._station_info(cfg, cache, pt, obs)
-    assert info["usable"] is True and info["qualifying"] is None and "distance" in info["why"]
+    assert info["usable"] is False and info["qualifying"] is None and "position unknown" in info["why"]
     odd = stations_doc("KBAD", 34.3, -108.1, 2300.0, ("KAAA", 34.32, -108.10, 2300.0))
     odd["features"][0]["geometry"] = {"type": "Point", "coordinates": {"lon": 1, "lat": 2}}
     cache.put(key, odd)
@@ -851,6 +1027,7 @@ def test_unknown_station_list_never_gives_n_a(cfg, cache, fake_http):
     site = dict(cfg.sites[0])
     fake_http.add("/stations/KRAW/observations?limit", _history(*[_report("KRAW", minutes_ago=15 + 60 * k)
                                                                   for k in range(12)]))
+    fake_http.add("aviationweather.gov/api/data/metar", b"")        # no METARs of it (its 204)
     cache.put("obs/%s/KRAW" % site["slug"], _report("KRAW"))
     obs = {"ok": True, "station_id": "KRAW"}
     res = mvp._precip_report(cfg, cache, site, {"id": "KRAW", "usable": True, "qualifying": None}, obs)
@@ -1147,8 +1324,9 @@ def test_one_run_confirms_an_echo_with_the_frame_before(cfg, fake_http, monkeypa
 def test_an_earlier_frame_with_the_same_ring_data_is_passed_over(cfg, fake_http, monkeypatch):
     """IEM writes a frame every 2 min but a radar completes a scan only every 4.5-10 min: a
     frame whose ring holds the very data of the newest is no second observation. It is passed
-    over for the one before it; when every frame within VLBA_RADAR_STALE (20 min) holds the
-    same data, the echo stays unconfirmed, and no older frame is asked for."""
+    over for the one before it; when every frame within VLBA_RADAR_STALE (20 min) before the
+    newest holds the same data, nothing confirms or refutes the echo: no data (audit #119), and
+    no older frame is asked for."""
     _quiet_glm(monkeypatch)
     t = _fixed_frame(monkeypatch, ECHO)
     fake_http.add(_archive_name(t - timedelta(minutes=2)), frame_png(ECHO))          # same scan
@@ -1163,19 +1341,19 @@ def test_an_earlier_frame_with_the_same_ring_data_is_passed_over(cfg, fake_http,
     os.remove(cfg.state_file)
     run = mvp.run_once(cfg)
     radar = _radar_state(run["sites"][0])
-    assert radar["state"] == "watch" and "frame 1 of 2" in radar["detail"]
+    assert radar["state"] == "unknown" and "no earlier frame could be read to confirm it" in radar["detail"]
     assert run["sites"][0]["radar_check"]["earlier"] == []
     asked = sorted({c.rsplit("lcref_", 1)[1][:12] for c in fake_http.calls if "lcref_" in c})
-    oldest = (util.utcnow() - timedelta(seconds=cfg.radar_stale_s + 60)).strftime("%Y%m%d%H%M")
-    assert asked and all(a >= oldest for a in asked) and len(asked) <= 8
+    oldest = (t - timedelta(seconds=cfg.radar_stale_s + 60)).strftime("%Y%m%d%H%M")
+    assert asked and all(a >= oldest for a in asked) and len(asked) <= cfg.radar_stale_s // 120
     assert not [e for e in run["errors"] if "frame before" in e], run["errors"]
 
 
 def test_runs_half_an_hour_apart_still_confirm_an_echo(cfg, fake_http, monkeypatch):
     """The 30-minute schedule: the run before counted the echo once, half an hour ago; now the
     echo is on both of this run's frames: BAD. Without a frame before it (missing from the
-    archive) the echo stays unconfirmed, because frames 30 min apart are not consecutive,
-    and the run says why."""
+    archive) the echo cannot be confirmed, because frames 30 min apart are not consecutive:
+    no data (audit #119, it read "watch" and GOOD), and the run says why."""
     _quiet_glm(monkeypatch)
     t = _fixed_frame(monkeypatch, ECHO)
     now = util.utcnow()
@@ -1196,7 +1374,7 @@ def test_runs_half_an_hour_apart_still_confirm_an_echo(cfg, fake_http, monkeypat
     fake_http.calls.clear()
     run = mvp.run_once(cfg)
     radar = _radar_state(run["sites"][0])
-    assert radar["state"] == "watch" and "frame 1 of 2" in radar["detail"]
+    assert radar["state"] == "unknown" and "(frames missing from the archive)" in radar["detail"]
     assert any("MRMS frame before %s unavailable (frames missing from the archive)" % t.strftime("%H:%MZ") in e
                for e in run["errors"]), run["errors"]
     assert sum(c.startswith("HEAD ") and "lcref_" in c for c in fake_http.calls) == 3
@@ -1287,7 +1465,8 @@ def test_an_island_echo_is_confirmed_with_the_composite_frame_before(cfg, fake_h
 def test_an_island_frame_before_that_fails_or_has_unknown_colours(cfg, fake_http, monkeypatch):
     """A composite frame before the newest that cannot be fetched ends the search and is a
     problem of the run (the echo stays unconfirmed, a running streak is not reset); one with a
-    colour the decoder does not know inside the ring is unusable and passed over."""
+    colour the decoder does not know inside the ring and no echo decoded there is unusable and
+    passed over (audit #90: with an echo decoded there, that echo counts)."""
     _island_setup(cfg, fake_http, monkeypatch, None)
     now = util.utcnow()
     st = decision.load_state(cfg.state_file)
@@ -1301,11 +1480,10 @@ def test_an_island_frame_before_that_fails_or_has_unknown_colours(cfg, fake_http
                and "not confirmed by this run alone" in e for e in run["errors"]), run["errors"]
 
     def unknown_colour(frame, echo):
-        # other data than the newest (a 30 dBZ cell 20 km out), so only the colour rule can
-        # pass it over, and a colour the decoder does not know inside the ring
+        # other data than the newest (no echo in the ring), so only the colour rule can pass
+        # it over, and a colour the decoder does not know inside the ring
         x = geo.dest_point(MK["lat"], MK["lon"], 6.0, 200.0)
-        y = geo.dest_point(MK["lat"], MK["lon"], 20.0, 300.0)
-        return island_png(frame, echo + [(y[0], y[1], (11, 136, 15)), (x[0], x[1], (2, 253, 2))])
+        return island_png(frame, [(x[0], x[1], (2, 253, 2))])
     fake_http.routes = []
     os.remove(cfg.state_file)
     ts = _island_setup(cfg, fake_http, monkeypatch, unknown_colour)
@@ -1369,6 +1547,6 @@ def test_island_three_frame_trigger_and_the_stale_bound(cfg, fake_http, monkeypa
     ts = _island_list(cfg, fake_http, monkeypatch, {m: echo for m in range(2, 42, 2)})     # 40 min listed
     add_routes(fake_http, cfg, mk_blobs=echo)
     mk = mvp.run_once(cfg)["sites"][1]
-    assert mk["radar_check"]["earlier"] == [] and _radar_state(mk)["state"] == "watch"
+    assert mk["radar_check"]["earlier"] == [] and _radar_state(mk)["state"] == "unknown"      # audit #119
     asked = [c for c in fake_http.calls if "TIME=" in c]
     assert asked and len(asked) <= cfg.radar_stale_s // 120

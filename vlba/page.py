@@ -24,7 +24,6 @@ removed, which matters when a newer copy of the library is taken in (README, Lay
 from __future__ import annotations
 
 import html
-import json
 import logging
 import os
 from datetime import datetime, timezone
@@ -91,6 +90,13 @@ VERDICT_CSS = """
   .nav .dot.unk { background: var(--faint); }
   .nav .dot.caution { background: var(--warn); }
   table.sum td.why .watch { color: var(--warn); }
+  /* a page that is no longer regenerated (PAGE_JS adds .outdated): its verdicts are not
+     current, so nothing keeps a verdict colour */
+  .page.outdated .vbadge, .page.outdated .nav .dot, .page.outdated .cdot { background: var(--faint); }
+  .page.outdated .vbadge { text-decoration: line-through; }
+  .page.outdated .vcard { box-shadow: none; border-color: var(--line); }
+  .page.outdated table.sum, .page.outdated .counts, .page.outdated .vcard { opacity: .6; }
+  .page.outdated .vwhy { color: var(--muted); }
   /* phone width: the summary and the check table stack, nothing scrolls sideways */
   @media (max-width: 600px) {
     table.sum thead, table.checks thead { display: none; }
@@ -120,6 +126,12 @@ NWSRADAR_CREDIT_HTML = (
     'Radar outside the contiguous US: NWS radar composites (MRMS-based) from '
     '<a href="https://radar.weather.gov/" rel="noopener">radar.weather.gov</a> '
     '(opengeo.ncep.noaa.gov)')
+# where make_vlba_page reads a station's METAR when NWS serves it late (cfg.metar_url), as
+# the precipitation step names it in a site entry (obs_raw["report_source"])
+METAR_SOURCE = "aviationweather.gov"
+METAR_CREDIT_HTML = (
+    'Station reports that NWS serves late: METARs from the NOAA/NWS Aviation Weather Center '
+    '(<a href="https://aviationweather.gov/" rel="noopener">aviationweather.gov</a>)')
 SITES_CREDIT_HTML = ("Antenna positions: NRAO (VLBA Observational Status Summary); the VLA and "
                      "the GBT from the SCHED station catalog")
 # The parent's disclaimer, naming NRAO and the Green Bank Observatory: on a page with a
@@ -166,8 +178,10 @@ def cuts_text(cfg) -> str:
         ["humidity over %g %%" % cfg.obs_humidity_max] if cfg.check_enabled("obs_humidity") else [])
     if obs:
         checks.append("the report (%s) of the nearest NWS station within %g km and %g m of elevation of the "
-                      "antenna that has a recent report, one that reports weather where there is one"
-                      % (", ".join(obs), cfg.obs_max_km, cfg.obs_max_delev_m))
+                      "antenna that has a recent report, one that reports weather where there is one%s"
+                      % (", ".join(obs), cfg.obs_max_km, cfg.obs_max_delev_m,
+                         " (for precipitation its METAR from aviationweather.gov when NWS has no recent one)"
+                         if _metars_on(cfg) else ""))
     if cfg.check_enabled("wind"):
         checks.append("wind or gusts of %g mph or more (observed, or forecast for this hour or next)" % cfg.wind_mph)
     listed = "; ".join(checks[:-1]) + "; and " + checks[-1] if len(checks) > 1 else checks[0]
@@ -176,6 +190,10 @@ def cuts_text(cfg) -> str:
             "answer; it is not a safety interface. The checks follow the weather cuts of the "
             "ttustatus observatory monitor, applied to public data: %s. Thresholds are configuration; "
             "see the README. The sun is shown for information only." % listed)
+
+
+# what an outdated page says is no longer current (its banner, PAGE_JS; the noscript line)
+STALE_WHAT = "the verdicts below are"
 
 
 # ---- small helpers --------------------------------------------------------------------
@@ -271,16 +289,56 @@ def _code(s: dict) -> str:
     return site_code(site) if site else "?"
 
 
+def _counts(sites: List[dict]) -> Dict[str, int]:
+    """The verdicts counted the way the badges read: ``good`` (GOOD with every input),
+    ``good_incomplete`` (the "GOOD?" badges), ``bad``, and ``no_data`` (NO DATA and no
+    verdict). ``decision.summary`` counts a "GOOD?" as good."""
+    n = {"good": 0, "good_incomplete": 0, "bad": 0, "no_data": 0}
+    for s in sites:
+        v = _verdict(s)
+        if v.get("status") == decision.GOOD:
+            n["good_incomplete" if v.get("incomplete") else "good"] += 1
+        elif v.get("status") == decision.BAD:
+            n["bad"] += 1
+        else:
+            n["no_data"] += 1
+    return n
+
+
+def _metars_on(cfg) -> bool:
+    """Whether a run may read METARs from aviationweather.gov: the precipitation check is
+    on and VLBA_METAR_URL is not "none"."""
+    return bool(cfg.check_enabled("obs_precip") and getattr(cfg, "metar_url", ""))
+
+
+def _metar_use(sites: List[dict]) -> Dict[str, List[dict]]:
+    """What the precipitation step recorded about aviationweather.gov in the site entries:
+    ``used`` (the check reads a METAR from there: ``obs_raw["report_source"]``) and
+    ``failed`` (no report answered the check and the request there failed:
+    ``obs_station["weather_why"]`` names it). A request that failed while an NWS report
+    still answered leaves no trace in the entry, and none here."""
+    out: Dict[str, List[dict]] = {"used": [], "failed": []}
+    for s in sites:
+        raw = s.get("obs_raw") if _is_dict(s.get("obs_raw")) else {}
+        st = s.get("obs_station") if _is_dict(s.get("obs_station")) else {}
+        if raw.get("report_source") == METAR_SOURCE:
+            out["used"].append(s)
+        elif (METAR_SOURCE + ": ") in str(st.get("weather_why") or ""):
+            out["failed"].append(s)
+    return out
+
+
 # ---- page blocks --------------------------------------------------------------------
 def _head_html(cfg) -> str:
     return (
         '<!DOCTYPE html>\n<html lang="en">\n<head>\n'
         '<meta charset="utf-8">\n'
         '<meta name="viewport" content="width=device-width, initial-scale=1">\n'
+        '%s'
         '<noscript><meta http-equiv="refresh" content="%d"></noscript>\n'
         '<title>%s</title>\n'
         '<style>\n%s%s</style>\n</head>\n<body>\n'
-        % (int(cfg.refresh_seconds), _e(wp._title(cfg)), wp.PAGE_CSS, VERDICT_CSS))
+        % (wp.REFERRER_META, int(cfg.refresh_seconds), _e(wp._title(cfg)), wp.PAGE_CSS, VERDICT_CSS))
 
 
 def _masthead_html(cfg, run: dict, gen: datetime, night: bool) -> str:
@@ -293,7 +351,7 @@ def _masthead_html(cfg, run: dict, gen: datetime, night: bool) -> str:
         '  <div class="mastright">\n'
         '    <button class="modebtn" id="modebtn" type="button" aria-pressed="%s">%s</button>\n'
         '    <div class="when">\n'
-        '      <div class="t mono">%s UTC</div>\n'
+        '      <div class="t mono"><span class="gl">generated</span> %s UTC</div>\n'
         '      <div class="d">%s<span class="lt"> · local times in each row</span></div>\n'
         '    </div>\n'
         '  </div>\n'
@@ -316,16 +374,15 @@ def _summary_html(run: dict, sites: List[dict], gen: datetime) -> str:
             '<td class="why">%s</td><td class="sun">%s</td><td class="lt mono">%s</td></tr>\n'
             % (_e(wp.site_anchor(slug)), _e(_code(s)), _e(name), _badge(v, small=True),
                why, _sun_chip(s), _e(_local_time(gen, tz))))
-    counts = run.get("summary") if _is_dict(run.get("summary")) else decision.summary([_verdict(s) for s in sites])
-    n = len(sites)
-    line = ('<p class="counts"><b>%d</b> of %d sites GOOD, <b>%d</b> BAD%s%s.</p>\n'
-            % (int(counts.get("good") or 0), n, int(counts.get("bad") or 0),
-               (", %d without data" % int(counts.get("no_data") or 0)) if counts.get("no_data") else "",
-               (", %d with inputs missing" % int(counts.get("incomplete") or 0)) if counts.get("incomplete") else ""))
+    # counted from the verdicts as the badges read: a "GOOD?" is not among the GOOD
+    counts = _counts(sites)
+    line = ('<p class="counts">%d sites: <b>%d</b> GOOD, <b>%d</b> GOOD? (inputs missing), <b>%d</b> BAD%s.</p>\n'
+            % (len(sites), counts["good"], counts["good_incomplete"], counts["bad"],
+               (", <b>%d</b> without data" % counts["no_data"]) if counts["no_data"] else ""))
     return (
         '<div class="summary" id="summary">\n<h2>Weather at the sites</h2>\n'
         '<table class="sum">\n<thead><tr><th>Site</th><th></th><th>Verdict</th><th>Why</th>'
-        '<th>Sun</th><th class="lt">Local time</th></tr></thead>\n<tbody>\n%s</tbody></table>\n%s</div>\n'
+        '<th>Sun</th><th class="lt">Generated (local)</th></tr></thead>\n<tbody>\n%s</tbody></table>\n%s</div>\n'
         % ("".join(rows), line))
 
 
@@ -407,15 +464,24 @@ def _verdict_html(s: dict, tz: str) -> str:
     return "".join(parts)
 
 
-def _radar_caption(run: dict, s: dict, tz: str) -> str:
+def _radar_caption(run: dict, s: dict, tz: str, cfg=None) -> str:
     """The frame line of the map caption: MRMS for the sites inside the grid (from
-    ``run["radar"]``), the NWS composite for the others (``s["island_radar"]``)."""
+    ``run["radar"]``), the NWS composite for the others (``s["island_radar"]``). With
+    ``cfg``, a frame the radar check does not use for its age (``wp._frame_unused_age``)
+    says so: the map still shows it."""
+    when = wp._judged_at([s], wp._generated(run))
+    not_used = " · frame %s old, not used for the verdict"
     island = s.get("island_radar") if _is_dict(s.get("island_radar")) else None
     if island is not None and island.get("not_applicable"):
         return "No radar here: %s" % (island.get("error") or "outside the MRMS grid")
     if island is not None:
         label = str(island.get("label") or "NWS radar composite")
         ts = island.get("ts")
+        old = wp._frame_unused_age(cfg, island, when, copy_age=True)
+        if old is not None:
+            at = ("%s · %s" % (ts.astimezone(timezone.utc).strftime("%H:%MZ"), util.fmt_local(ts, tz, "%H:%M %Z"))
+                  if isinstance(ts, datetime) else "(frame time unknown)")
+            return "%s %s%s" % (label, at, not_used % util.fmt_age(old))
         if island.get("ok") and isinstance(ts, datetime):
             frame = "%s %s · %s" % (label, ts.astimezone(timezone.utc).strftime("%H:%MZ"),
                                     util.fmt_local(ts, tz, "%H:%M %Z"))
@@ -435,12 +501,17 @@ def _radar_caption(run: dict, s: dict, tz: str) -> str:
         ts = radar["ts"]
         frame = "MRMS frame %s · %s" % (ts.astimezone(timezone.utc).strftime("%H:%MZ"),
                                         util.fmt_local(ts, tz, "%H:%M %Z"))
+        old = wp._frame_unused_age(cfg, radar, when)
+        if old is not None:
+            return frame + not_used % util.fmt_age(old)
         if radar.get("stale"):
             frame += " · STALE (%s old%s)" % (wp._age_txt(radar) or "?",
                                               ", %s" % radar["error"] if radar.get("error") else "")
         return frame
     if _is_dict(radar) and radar.get("not_applicable"):
         return "No MRMS radar here"
+    if _is_dict(radar) and radar.get("disabled"):
+        return "Radar switched off: %s" % (radar.get("error") or "by configuration")
     if _is_dict(radar):
         return "Radar unavailable: %s" % (radar.get("error") or "no frame")
     return "Radar layer not rendered this run"
@@ -473,7 +544,7 @@ def _map_html(cfg, run: dict, s: dict, tz: str, gen_ts: float) -> str:
     rings = (["solid ring %g km (radar check)" % cfg.radar_km] if not rc.get("off") else []) + (
         ["dashed ring %g km (lightning check)" % cfg.glm_km] if glm_ring else [])
     lines = ["%s · %g × %g mi centred on the antenna%s"
-             % (_radar_caption(run, s, tz), cfg.map_miles, cfg.map_miles,
+             % (_radar_caption(run, s, tz, cfg), cfg.map_miles, cfg.map_miles,
                 (" · " + ", ".join(rings)) if rings else "")]
     for note in s.get("map_notes") or []:
         lines.append(str(note))
@@ -581,7 +652,8 @@ def _site_section_html(cfg, run: dict, s: dict, units, gen: datetime, gen_ts: fl
     parts.append(_guard("current conditions", wp._now_html, s, units, tz))
     parts.append(_guard("station note", _obs_station_note, s))
     parts.append(_guard("lightning", _glm_html, cfg, s, tz, run))
-    parts.append(_guard("alerts", wp._alert_cards_html, s, tz, gen))
+    # with the state of the feed behind them: unreadable is "unknown", not "no alerts"
+    parts.append(_guard("alerts", wp._alert_cards_html, s, tz, gen, s.get("alerts_feed")))
     parts.append('</div>\n</div>\n')
     if s.get("sun"):
         parts.append(_guard("sun and twilight", _sun_html, s, tz, gen))
@@ -613,10 +685,36 @@ def _extra_pills(cfg, run: dict, sites: List[dict]) -> str:
         if island is None:
             continue
         dot, txt = (" off", "off") if island.get("not_applicable") else wp._src_status(island)
+        old = wp._frame_unused_age(cfg, island, wp._judged_at([s], wp._generated(run)), copy_age=True)
+        if old is not None:
+            # fetched, but older than the radar check accepts (VLBA_RADAR_STALE): never "fresh"
+            dot, txt = " warnc", "frame %s old, not used" % util.fmt_age(old)
         pills.append('<span class="pill"><span class="dot%s"></span>%s radar (%s): %s</span>'
                      % (dot, _e(_code(s)), _e(island.get("label") or "NWS composite"), _e(txt)))
     pills.extend(_coverage_pills(cfg, run, sites))
+    pills.extend(_metar_pills(cfg, sites))
     return "\n".join(pills)
+
+
+def _metar_pills(cfg, sites: List[dict]) -> List[str]:
+    """The pill of the METARs from aviationweather.gov, which can decide the precipitation
+    check: for which sites one was read this run, and where none could be had although no
+    NWS report answered. None while the precipitation check is off."""
+    if not cfg.check_enabled("obs_precip"):
+        return []
+    if not _metars_on(cfg):
+        dot, txt = " off", "off"
+    else:
+        use = _metar_use(sites)
+        bits = []
+        for key, word in (("failed", "unavailable for"), ("used", "used for")):
+            n = len(use[key])
+            if n:
+                bits.append("%s %d site%s (%s)" % (word, n, "" if n == 1 else "s", ", ".join(_code(s) for s in use[key])))
+        # amber: a site needed one and none could be had (its precipitation check reads "no data")
+        dot = " warnc" if use["failed"] else ("" if use["used"] else " off")
+        txt = "; ".join(bits) or "not needed this run"
+    return ['<span class="pill"><span class="dot%s"></span>METARs (%s): %s</span>' % (dot, METAR_SOURCE, _e(txt))]
 
 
 def _coverage_pills(cfg, run: dict, sites: List[dict]) -> List[str]:
@@ -698,8 +796,9 @@ def _footer_html(cfg, run: dict, sites: List[dict], gen: datetime) -> str:
     # data change (the generator runs every 30 min, the page reloads every 5)
     base = base.replace("refreshes every %d s" % int(cfg.refresh_seconds),
                         "page reloads every %d s" % int(cfg.refresh_seconds), 1)
-    credits = ('<p class="foot">%s · %s · %s</p>\n<p class="foot">%s</p>\n'
-               % (GLM_CREDIT_HTML, NWSRADAR_CREDIT_HTML, SITES_CREDIT_HTML, _e(cuts_text(cfg))))
+    credits = ('<p class="foot">%s · %s%s · %s</p>\n<p class="foot">%s</p>\n'
+               % (GLM_CREDIT_HTML, NWSRADAR_CREDIT_HTML, (" · " + METAR_CREDIT_HTML) if _metars_on(cfg) else "",
+                  SITES_CREDIT_HTML, _e(cuts_text(cfg))))
     marker = '<p class="foot disclaimer">'
     if marker in base:
         return base.replace(marker, credits + marker, 1)
@@ -714,9 +813,14 @@ def _render(cfg, run: dict) -> str:
     night = bool(run.get("night_default"))
     units = wp._Units(cfg.units)
     parts = [_head_html(cfg)]
-    parts.append('<div class="%s" id="page" data-night-default="%s" data-refresh="%d">\n<div class="wrap">\n'
-                 % ("page night" if night else "page", "1" if night else "0", int(cfg.refresh_seconds)))
+    # data-generated / data-stale-after: PAGE_JS compares them with the viewer's clock and
+    # says in the slot below when the page is no longer being regenerated
+    parts.append('<div class="%s" id="page" data-night-default="%s" data-refresh="%d"%s>\n<div class="wrap">\n'
+                 % ("page night" if night else "page", "1" if night else "0", int(cfg.refresh_seconds),
+                    wp._age_attrs(cfg, gen_ts, STALE_WHAT)))
+    parts.append(wp._age_slot_html())
     parts.append(_guard("masthead", _masthead_html, cfg, run, gen, night))
+    parts.append(_guard("page age", wp._age_noscript_html, cfg, gen, STALE_WHAT))
     parts.append(_guard("summary", _summary_html, run, sites, gen))
     parts.append(_guard("navigation", _nav_html, sites))
     parts.append(_guard("alerts banner", wp._banner_html, run, sites))
@@ -772,6 +876,8 @@ def status_doc(cfg, run: dict) -> dict:
     """The parent's health document plus the verdicts, GLM and the island radar."""
     doc = wp._status_doc(cfg, run)
     run = run if _is_dict(run) else {}
+    gen = wp._generated(run)
+    entries = [s for s in (run.get("sites") or []) if _is_dict(s)]
     verdicts: Dict[str, Any] = {}
     for s in run.get("sites") or []:
         if not _is_dict(s):
@@ -792,14 +898,22 @@ def status_doc(cfg, run: dict) -> dict:
         if slug in doc.get("sites", {}):
             doc["sites"][slug]["sun_up"] = sun_up
             doc["sites"][slug]["verdict"] = v.get("status") if v else None
+            # the page's badge for a GOOD with this set reads "GOOD?"
+            doc["sites"][slug]["verdict_incomplete"] = bool(v.get("incomplete")) if v else None
     doc["verdicts"] = verdicts
-    doc["summary"] = run.get("summary") if _is_dict(run.get("summary")) else decision.summary(
-        [_verdict(s) for s in (run.get("sites") or []) if _is_dict(s)])
+    summary = dict(run.get("summary") if _is_dict(run.get("summary")) else decision.summary(
+        [_verdict(s) for s in entries]))
+    # "good" counts every GOOD, the "GOOD?" ones too: this many of them have inputs missing
+    summary["good_incomplete"] = _counts(entries)["good_incomplete"]
+    doc["summary"] = summary
     g = run.get("glm") if _is_dict(run.get("glm")) else None
     doc["glm"] = None if g is None else {
         "ok": bool(g.get("ok")), "partial": bool(g.get("partial")), "skipped": g.get("skipped"),
         "flashes": int(wp._num(g.get("flash_count")) or 0), "error": g.get("error")}
     probs = list(doc.get("problems") or [])
+    if wp._frame_unused_age(cfg, run.get("radar"), wp._judged_at(entries, gen, mrms_only=True)) is not None:
+        # fetched (even fresh), but older than the radar check accepts: its checks read "no data"
+        probs = [p for p in probs if p != "radar: stale"] + ["radar: frame too old"]
     if cfg.glm_enabled and g is not None and not g.get("ok") and not g.get("skipped"):
         probs.append("GLM lightning: unavailable")
     elif cfg.glm_enabled and g is not None and g.get("partial"):
@@ -818,6 +932,8 @@ def status_doc(cfg, run: dict) -> dict:
             continue
         if not island.get("ok"):
             probs.append("%s radar composite: unavailable" % slug)
+        elif wp._frame_unused_age(cfg, island, wp._judged_at([s], gen), copy_age=True) is not None:
+            probs.append("%s radar composite: frame too old" % slug)
         elif island.get("stale"):
             probs.append("%s radar composite: stale" % slug)
     # an observation that is only shown (no station qualifies: Mauna Kea, Pie Town) is no
@@ -825,6 +941,14 @@ def status_doc(cfg, run: dict) -> dict:
     shown_only = {wp._site_ident(s)[0] for s in run.get("sites") or []
                   if _is_dict(s) and _is_dict(s.get("obs")) and s["obs"].get("display_only")}
     probs = [p for p in probs if not any(p.startswith("%s observation: " % slug) for slug in shown_only)]
+    # the METARs from aviationweather.gov: where one decided, and where none could be had
+    # although no NWS report answered the precipitation check
+    use = _metar_use(entries)
+    doc["metars"] = None if not _metars_on(cfg) else {
+        "source": METAR_SOURCE, "used": [wp._site_ident(s)[0] for s in use["used"]],
+        "unavailable": [wp._site_ident(s)[0] for s in use["failed"]]}
+    for s in use["failed"] if doc["metars"] is not None else []:
+        probs.append("%s METARs (%s): unavailable" % (wp._site_ident(s)[0], METAR_SOURCE))
     # the radar coverage: a domain that could not be read, a ring below the minimum
     cov = run.get("radar_coverage") if _is_dict(run.get("radar_coverage")) else {}
     doc["radar_coverage"] = None if not cfg.radar_coverage else {
@@ -858,11 +982,12 @@ def write_status_json(cfg, run: dict) -> str:
     except Exception as e:  # noqa: BLE001
         log.exception("status summary failed: %s", e)
         msg = "status summary failed: %s: %s" % (type(e).__name__, e)
-        doc = {"generated": util.utcnow().isoformat(), "page_written": False, "degraded": True,
+        doc = {"generated": util.utcnow().isoformat(), "stale_after_s": wp._stale_after_s(cfg),
+               "page_written": False, "degraded": True,
                "ok": False, "problems": [msg], "alerts": {}, "radar": {}, "network": None,
                "roads": None, "sites": {}, "verdicts": {}, "summary": {}, "glm": None, "errors": [msg]}
     path = os.path.join(cfg.out_dir, "status.json")
-    wp._atomic_write_text(path, json.dumps(doc, indent=1, sort_keys=True, default=str) + "\n")
+    wp._atomic_write_text(path, wp._json_text(doc))
     return path
 
 

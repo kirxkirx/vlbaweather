@@ -153,6 +153,7 @@ def test_state_file_path_is_expanded(monkeypatch, tmp_path):
     {"VLBA_MRMS_CONUS_MIRROR": "https://m.example/%Y/SeamlessHSR_00.00_%Y%m%d-%H%M%S.grib2.gz%"},   # a last "%"
     {"VLBA_MRMS_CONUS_MIRROR": "https://m.example/100%%/SeamlessHSR_00.00_%Y%m%d-%H%M%S.grib2.gz"},  # "%%"
     {"VLBA_MRMS_CONUS_MIRROR": "https://m.example/%Y/PrecipFlag_00.00_%Y%m%d-%H%M%S.grib2.gz"},     # another product
+    {"VLBA_METAR_URL": "ftp://aviationweather.gov/api/data/metar"},
 ])
 def test_bad_values_are_startup_errors(monkeypatch, tmp_path, env):
     with pytest.raises(ValueError):
@@ -191,3 +192,12 @@ def test_keyword_overrides_win(monkeypatch, tmp_path):
     assert c.radar_km == 25.0
     with pytest.raises(TypeError):
         VlbaConfig.from_env(out_dir=str(tmp_path / "o"), cache_dir=str(tmp_path / "c"), nosuch=1)
+
+
+def test_the_metar_source(monkeypatch, tmp_path):
+    """aviationweather.gov's METARs for the precipitation check when NWS serves a station's
+    late: on by default, "none" switches it off (an empty value cannot)."""
+    assert _cfg(monkeypatch, tmp_path).metar_url == "https://aviationweather.gov/api/data/metar"
+    assert _cfg(monkeypatch, tmp_path, VLBA_METAR_URL=" None ").metar_url == ""
+    assert _cfg(monkeypatch, tmp_path, VLBA_METAR_URL="").metar_url == "https://aviationweather.gov/api/data/metar"
+    assert _cfg(monkeypatch, tmp_path, VLBA_METAR_URL="http://m.example/metar/").metar_url == "http://m.example/metar"

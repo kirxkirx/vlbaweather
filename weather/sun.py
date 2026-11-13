@@ -174,17 +174,25 @@ def _event_utc(lat: float, lon: float, noon_utc: datetime, alt: float,
     so relative to solar noon (720 - 4*lon - EoT_noon) the offset is
     (EoT_noon - EoT_t) -/+ 4*HA_t. Two passes: first with noon values, then re-evaluated
     at the first estimate — the sun's declination moves ~0.4 deg/day near the equinoxes,
-    which alone would shift a sunrise by tens of seconds if left at the noon value."""
+    which alone would shift a sunrise by tens of seconds if left at the noon value.
+
+    On the few days a year when a twilight starts or stops occurring at a high latitude
+    the crossing happens near solar midnight, 12 h from noon, and the declination of noon
+    may not allow it while that of midnight does. So when the passes from noon find no
+    crossing, they are tried once more from the solar midnight on that side of noon."""
     _decl_noon, eot_noon = _sun_position(_julian_century(noon_utc))
-    t = noon_utc
-    for _ in range(2):
-        decl, eot = _sun_position(_julian_century(t))
-        ha = _hour_angle_deg(lat, decl, alt)
-        if ha is None:
-            return None
-        offset = (eot_noon - eot) + (-4.0 * ha if before_noon else 4.0 * ha)
-        t = noon_utc + timedelta(minutes=offset)
-    return t
+    for start in (noon_utc, noon_utc + timedelta(hours=-12.0 if before_noon else 12.0)):
+        t = start
+        for _ in range(2):
+            decl, eot = _sun_position(_julian_century(t))
+            ha = _hour_angle_deg(lat, decl, alt)
+            if ha is None:
+                break
+            offset = (eot_noon - eot) + (-4.0 * ha if before_noon else 4.0 * ha)
+            t = noon_utc + timedelta(minutes=offset)
+        else:
+            return t
+    return None
 
 
 def day_events(lat: float, lon: float, date_local, tzname: Optional[str]) -> Dict[str, Optional[datetime]]:

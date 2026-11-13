@@ -41,14 +41,15 @@ At the top, the **summary table**: every site with its verdict badge, the reason
 few words (what is happening at the site now first, the forecast after it; for a GOOD
 verdict an unconfirmed radar echo, a warning scheduled to start or missing inputs, and
 "all checks clear" only when there is none of these), "Sun up" or "Sun down" with the
-sun's altitude (information only, so in a neutral chip), and the local time. Then the sticky
+sun's altitude (information only, so in a neutral chip), and the time the page was generated,
+in the site's local time. Then the sticky
 navigation (one pill per site, its dot in the verdict colour, amber for a GOOD that deserves
 a look), the NWS alerts banner across all sites, and one section per site:
 
 - **Verdict card**: GOOD (green), BAD (red, with the reasons) or NO DATA (grey, nothing
   could be checked). A GOOD verdict with some check lacking data this run reads **GOOD?**
   (amber) and names the missing inputs: unknown is never counted as clear. A check that
-  cannot apply to the antenna at all (a field its NWS office does not produce, an
+  cannot apply to the antenna at all (a field its NWS office is known not to produce, an
   observation where no station is near enough) is *n/a*, not missing. Below it, every
   check with its state (clear / BAD / watch / scheduled / no data / off / n/a; the dot green,
   red, amber for watch, scheduled and no data, grey for off and n/a), the value
@@ -74,17 +75,24 @@ a look), the NWS alerts banner across all sites, and one section per site:
   event of the next 24 h, in the antenna's time zone.
 - **Next 24 hours** and the **7-day forecast** from NWS.
 
+The page judges its own age in the visitor's browser: generated more than
+`VLBA_PAGE_STALE_MIN` minutes ago (default 75, two and a half run intervals), it says at the
+top that it is no longer being updated and greys out every verdict.
+
 The footer lists every source's freshness (alerts, MRMS, GLM per satellite, the island
 composites, each site's NWS products, the gridpoint forecasts behind the forecast checks,
-the radar coverage per MRMS domain),
+the radar coverage per MRMS domain, the METARs from aviationweather.gov),
 the credits, what the checks are (spelled out from the configuration in use), the
 disclaimer: not an official product of NOAA, NWS, NRAO or the Green Bank Observatory, not
 the only source for safety or operations decisions, and as its last line a link to this
 repository, the source code.
 `status.json` beside the page is a machine-readable health summary of the generator (the
 parent's, plus the verdicts, the GLM state, the island radar and the radar coverage) for
-monitoring; it is not a safety interface. Where no station qualifies (Mauna Kea, Pie Town,
-the VLA, the GBT) the observation is only shown, so NWS delivering nothing usable there is no
+monitoring; it is not a safety interface. It carries `generated` and `stale_after_s` (the
+page's limit in seconds), so a monitor can apply the page's rule (alert when now minus
+`generated` exceeds `stale_after_s`), and `summary.good_incomplete`, how many of the GOOD
+verdicts counted in `summary.good` read GOOD?. Where no station qualifies (Mauna Kea, Pie
+Town, the VLA, the GBT) the observation is only shown, so NWS delivering nothing usable there is no
 problem of the run.
 
 ## The verdict
@@ -95,16 +103,16 @@ see `vlbaweather.env.example`):
 
 | Check | BAD when | ttustatus origin |
 |---|---|---|
-| NWS warning over the site | an alert AT the site (its polygon contains the antenna, or a zone product lists the antenna's forecast / county / fire zone) whose product is one of `VLBA_VETO_EVENTS`: Tornado, Dust Storm, High Wind, Extreme Wind, Hurricane, Typhoon, Tropical Storm, Blizzard, Winter Storm, Ice Storm, Snow Squall and Lake Effect Snow Warning (`VLBA_VETO_EVENTS=none` switches the check off). A warning issued ahead of its onset counts from 45 min before the onset (ttustatus's 15 min plus the 30-minute run interval, so the page is BAD at least 15 min before every onset) and is shown as *scheduled* until then. If a run cannot fetch the alert feed, the last good copy is used for up to 40 min, so one failed run does not drop a warning in effect. Without the site's NWS metadata its zones are unknown and the check has no data | the three-event veto (Tornado, Dust Storm, High Wind Warning) with its 15-min onset lead (45 min here, for the 30-minute runs); the wind and snowstorm products added here |
-| Rain on radar | an echo of 20 dBZ or more within 30 km in **two consecutive radar frames** (the first is shown as *watch: unconfirmed*), then held for 15 min after the last confirmed echo. Where the newest frame shows an echo in the ring, the run also reads the frame before it and counts it first, so one run confirms an echo by itself: frames of runs 30 min apart are not consecutive. A frame whose ring holds the same data as the frame counted last is no new observation (the composites are written every 2 min, but a radar completes a scan only every 4.5-10 min): the run passes over it for an older one, up to 20 min back. With runs 30 min apart, the hold shows only on a run started by hand in between. Each frame counts once: a frame an earlier run already saw, or the last good one reused after a failed fetch, is no new evidence, and frames either side of an outage are not consecutive. At Mauna Kea and St. Croix a pixel of a colour the decoder does not recognise within the ring makes the check "no data", never "no echo". No echo is clear only where radar covers the ring: MRMS's own data of the frame must show radar coverage over at least 90 % of it (`VLBA_RADAR_MIN_COVERAGE`), else the check is "no data" (a radar outage, or coverage that could not be read; while NOAA's feed is late, a file up to 1 h older than the frame stands in, the check then marked stale: `VLBA_RADAR_COVERAGE_MAX_LAG`, 0 = never); an echo counts either way, and a new frame without an echo restarts the count whatever its coverage | 30 km / 20 dBZ ring, `RADAR_TRIGGER_AFTER=2` (a failed fetch never counts there either), 15-min freeze |
-| Lightning | a GOES GLM flash within 50 km in the last 30 minutes. Each run examines the last 31 minutes (the 30-minute window, the run interval, plus 1 minute of the previous run's): no granule whose flashes could still count goes unexamined, and a late run reaches back as far as the hold, no further (anything older can no longer count); one that does not arrive is fetched again, first of all, by the next run, once, unless its flashes are past the 30 min by then, and a run that misses one is marked partial. Bad for 30 min after the last flash; a flash in the window that is older than that no longer counts. A flash counts even when a satellite's data is incomplete; "clear" needs one covering satellite's complete window | 50 km ring, 30-min cool-off; day and night here |
-| Precipitation probability | above 20 % this hour or next | `NWS_PRECIP_MAX` |
+| NWS warning over the site | an alert AT the site (its polygon contains the antenna, or a zone product lists the antenna's forecast / county / fire zone) whose product is one of `VLBA_VETO_EVENTS`: Tornado, Dust Storm, High Wind, Extreme Wind, Hurricane, Typhoon, Tropical Storm, Blizzard, Winter Storm, Ice Storm, Snow Squall and Lake Effect Snow Warning (`VLBA_VETO_EVENTS=none` switches the check off). A warning issued ahead of its onset counts from 45 min before the onset (ttustatus's 15 min plus the 30-minute run interval, so the page is BAD at least 15 min before every onset) and is shown as *scheduled* until then. If a run cannot fetch the alert feed, the last good copy is used for up to 40 min, so one failed run does not drop a warning in effect. Without the site's NWS metadata, or with metadata that names no zone, its zones are unknown and the check has no data; so it has when an alert that could be one of these products cannot be placed (no usable polygon and no zone list), when the alerts cannot be classified for the site, or when `WEATHER_ALERT_AREAS` leaves out the site's state | the three-event veto (Tornado, Dust Storm, High Wind Warning) with its 15-min onset lead (45 min here, for the 30-minute runs); the wind and snowstorm products added here |
+| Rain on radar | an echo of 20 dBZ or more within 30 km in **two consecutive radar frames** (the first is shown as *watch: unconfirmed* when the frame before it was read and showed no echo; an echo that no earlier frame could be read to confirm is "no data"), then held for 15 min after the last confirmed echo. Where the newest frame shows an echo in the ring, the run also reads the frame before it and counts it first, so one run confirms an echo by itself: frames of runs 30 min apart are not consecutive. A frame whose ring holds the same data as the frame counted last is no new observation (the composites are written every 2 min, but a radar completes a scan only every 4.5-10 min): the run passes over it for an older one, up to `VLBA_RADAR_STALE` (20 min) before the newest frame. With runs 30 min apart, the hold shows only on a run started by hand in between. Each frame counts once: a frame an earlier run already saw, or the last good one reused after a failed fetch, is no new evidence, and frames either side of an outage are not consecutive. A frame of unknown time is never clear. At Mauna Kea and St. Croix a pixel of a colour the decoder does not recognise within the ring makes "no echo" "no data" (an echo decoded beside it counts); where such pixels cannot be placed on the map, the check is "no data". No echo is clear only where radar covers the ring: MRMS's own data of the frame must show radar coverage over at least 90 % of it (`VLBA_RADAR_MIN_COVERAGE`), else the check is "no data" (a radar outage, coverage that could not be read, or an echo in the ring in MRMS's file that the frame does not show; while NOAA's feed is late, a file up to 1 h older than the frame stands in, the check then marked stale: `VLBA_RADAR_COVERAGE_MAX_LAG`, 0 = never); an echo counts either way, and a new frame without an echo restarts the count whatever its coverage | 30 km / 20 dBZ ring, `RADAR_TRIGGER_AFTER=2` (a failed fetch never counts there either), 15-min freeze |
+| Lightning | a GOES GLM flash within 50 km in the last 30 minutes. Each run examines the last 31 minutes (the 30-minute window, the run interval, plus 1 minute of the previous run's): no granule whose flashes could still count goes unexamined, and a late run reaches back as far as the hold, no further (anything older can no longer count); one that does not arrive is fetched again, first of all, by the next run, once, unless its flashes are past the 30 min by then, and a run that misses one is marked partial. Bad for 30 min after the last flash; a flash in the window that is older than that no longer counts. A flash counts even when a satellite's data is incomplete; "clear" needs one covering satellite's complete window (its newest granule at most `VLBA_GLM_MAX_LAG`, 5 min, before the run, no more than 2 min in a row unpublished, its listing whole), else the check is "no data" | 50 km ring, 30-min cool-off; day and night here |
+| Precipitation probability | above 20 % this hour or next (no value for this hour is "no data", as in the thunder and cloud checks) | `NWS_PRECIP_MAX` |
 | Thunder probability | above 15 % this hour or next (the Honolulu and San Juan offices do not produce it: *n/a* at Mauna Kea and St. Croix, where radar, GLM and the precipitation probability remain) | `NWS_THUNDER_MAX` |
 | Cloud cover | above 60 % this hour or next (an optical-astronomy cut, kept on purpose: the user confirmed it on 2026-10-08; `VLBA_NWS_CLOUD_MAX=-1` switches it off) | `NWS_CLOUD_MAX` |
-| Snow or ice | snowfall or ice accumulation above zero this hour or next (NWS gives amounts as totals over periods of often 6 h; the reason names the period), or snow / sleet / freezing rain or drizzle, or icing (freezing fog or spray, ice fog, ice crystals, blowing snow), forecast with a coverage of likely or more (likely, definite, numerous, widespread, occasional, frequent, periods, areas, intermittent). San Juan's grid has no snowfall or ice series: St. Croix's check rests on the weather entries | added: "include snowstorms in bad" |
-| Precipitation observed | the station reports precipitation now (present weather, the text, or precipitation in the last hour; fog, mist, haze, squalls and snow drifting along the ground are no precipitation, nor is anything "in the vicinity"). The report it reads: the station's latest report when it says anything about the weather (a description, present weather, clouds, a precipitation amount, or a raw METAR, whose weather groups are read when NWS did not decode them) and is at most 90 min old; otherwise the newest report with weather of the last 90 min, from the station's recent reports or the latest and recent reports of the next three qualifying stations, the nearer station on a tie (Brewster: CJDW has no present-weather sensor, KOMK's report answers; a METAR station's blank record: St. Croix's TISX leaves about a third of its records blank). A qualifying station's report without a temperature (NWS's quality control drops it now and then, at St. Croix's TISX for one) counts like any other: the verdict never reads the temperature. Another station's report moves only this check: the wind and humidity stay the station's. "No precipitation" in a report is no answer while a station's recent reports, maybe newer, could not be read (rain in it still counts). A METAR whose present-weather sensor is out of service (PWINO) says nothing unless it shows precipitation (mist, haze or a thunderstorm in the vicinity do not count). *n/a* only when the station and the next qualifying ones checked never report weather (judged by their last 12 reports, at least 3 distinct: Kitt Peak's QSBA3); "no data" in every other case | the WU rain latch |
+| Snow or ice | snowfall or ice accumulation above zero this hour or next (NWS gives amounts as totals over periods of often 6 h; the reason names the period), or snow / sleet / freezing rain or drizzle, or icing (freezing fog or spray, ice fog, ice crystals, blowing snow), forecast with a coverage of likely or more (likely, definite, numerous, widespread, occasional, frequent, periods, areas, intermittent). "None" needs a value for this hour in every snowfall, ice and weather series the forecast carries. San Juan's grid has no snowfall or ice series, Tucson's (Kitt Peak) no ice series: St. Croix's check rests on the weather entries | added: "include snowstorms in bad" |
+| Precipitation observed | the station reports precipitation now (present weather, the text, or precipitation in the last hour; fog, mist, haze, squalls and snow drifting along the ground are no precipitation, nor is anything "in the vicinity"). The report it reads: the station's latest report when it says anything about the weather (a description, present weather, clouds, a precipitation amount, or a raw METAR, whose weather groups are read when NWS did not decode them) and is at most 90 min old; otherwise each station checked (the station and the next three qualifying ones) answers with its newest report with weather of the last 2 h, from its latest and recent reports or, when NWS has none of the last 90 min (or none of the nearest station's, and no rain), from their METARs at aviationweather.gov (NWS's API serves some late: St. Croix's TISX about 40 min, so at the :30 runs its newest report there was 97 min old; `VLBA_METAR_URL`, one request, only then). Precipitation in any answer of the last 90 min counts; without it the nearest station's answer decides when it is at most 90 min old, else the newest; the nearer station on a tie and NWS's copy of the same report (Brewster: CJDW has no present-weather sensor, KOMK's report answers; a METAR station's blank record: St. Croix's TISX leaves about a third of its records blank). A qualifying station's report without a temperature (NWS's quality control drops it now and then, at St. Croix's TISX for one) counts like any other: the verdict never reads the temperature. Another station's report moves only this check: the wind and humidity stay the station's. "No precipitation" in a report is no answer while a station's recent reports, maybe newer, could not be read (rain in it still counts). A METAR that cannot show precipitation (present-weather sensor out, PWINO; no precipitation sensor, AO1; a missing report, NIL; present weather not observed, //) says nothing unless it shows precipitation (mist, haze or a thunderstorm in the vicinity do not count), and while a station's newest report is such a METAR its older "no precipitation" reports say nothing either. *n/a* only when the station and the next qualifying ones checked never report weather (judged by their last 12 reports, at least 3 distinct: Kitt Peak's QSBA3) and aviationweather.gov, asked, answered without a METAR of them; "no data" in every other case | the WU rain latch |
 | Humidity observed | **off** (`VLBA_OBS_HUMIDITY_MAX=-1`): ttustatus's 95 % protects an optical dome from condensation, which does not concern a radio antenna; `VLBA_OBS_HUMIDITY_MAX=95` restores it | `HUMIDITY_UNSAFE_ABOVE` |
-| Wind | observed wind or gust, or the forecast wind or gust this hour or next, at or above **45 mph** (`VLBA_WIND_MPH`; 0 switches it off); a report without a wind value is named in the detail, the forecast then decides alone | none: the VLBA antennas stow in high wind, added here |
+| Wind | observed wind or gust, or the forecast wind or gust this hour or next, at or above **45 mph** (`VLBA_WIND_MPH`; 0 switches it off); a report without a wind value is named in the detail, the forecast then decides alone. Below the limit, a qualifying station without a usable report, a forecast without wind or gust for this hour, or an absent or unreadable wind or gust series is "no data" | none: the VLBA antennas stow in high wind, added here |
 
 The observation checks (precipitation, humidity, the observed half of the wind check) use
 the nearest station of NWS's list for the antenna's grid cell that lies within 50 km and
@@ -122,11 +130,18 @@ without a recent report is "no data" (GOOD?). The
 forecast checks read the raw NWS gridpoint for the antenna's own grid cell; NWS offices
 update it a few times a day (2 to 6 h apart, measured), so a forecast is "no data" only
 when its update is older than 12 h (`VLBA_NWS_STALE_MIN`; ttustatus uses 150 min for a
-single office). A malformed gridpoint series is "no data" too (never *n/a*, which is for a
-series the office does not produce). A radar frame older than 20 min (a frame of unknown
-time counts as old as the cached copy it came from), a failed GLM poll or an observation
-older than 3 h are "no data" as well. A source switched off on purpose (`WEATHER_RADAR=0`,
-`VLBA_ISLAND_RADAR=0`, `VLBA_GLM=0`) makes its check *off*, not missing.
+single office). A malformed, empty or absent gridpoint series is "no data" too: *n/a* is
+only for a series the office is known not to produce (listed in `vlba/sites.py`: thunder at
+Honolulu; thunder, snowfall and ice at San Juan; ice at Tucson). A radar frame older than
+20 min (a frame of unknown time counts as old as the cached copy it came from) or dated more
+than 10 min ahead of this host's clock, a failed GLM poll or an observation older than 3 h
+are "no data" as well; an observation dated more than 10 min ahead is passed over for the
+next station's. A source switched off on purpose (`WEATHER_RADAR=0`, `VLBA_ISLAND_RADAR=0`,
+`VLBA_GLM=0`) makes its check *off*, not missing. When this host's clock is more than 5 min
+off the clocks of the data sources (the `Date` headers of their replies), no answer is
+trusted: every clear, watch or scheduled check reads "no data" ("host clock off by ..."), so
+the verdict is BAD or NO DATA, and the run reports the error. Keep the host's clock
+synchronised (NTP).
 
 The holds (radar 15 min, lightning 30 min), the radar streak, the last radar frame counted,
 the newest GLM granule examined, the GLM granules to fetch again and those examined are kept in
@@ -142,10 +157,11 @@ do not carry over between runs.
 |---|---|
 | Point metadata, observations, 7-day and hourly forecasts, alerts and zone outlines | api.weather.gov, through `weather.nws` / `weather.alerts` |
 | Raw gridpoint forecast (cloud cover, thunder probability, snowfall, ice, gusts, weather types) | `https://api.weather.gov/gridpoints/{office}/{x},{y}` (`vlba/gridpoint.py`) |
-| Radar, contiguous US | NOAA/NSSL MRMS Seamless Hybrid Scan Reflectivity (the lowest unblocked tilt; IEM's `lcref` frames, which IEM labels "lowest elevation composite reflectivity", match MRMS's `SeamlessHSR` cell for cell) via the Iowa Environmental Mesonet (`weather.radar`); the ring check reads the palette indices of the same frame and, where the newest one shows an echo in a ring, of the frames before it from the same archive (2 min apart; a frame whose ring holds the same scan as the next newer one taken is passed over, none older than `VLBA_RADAR_STALE`). These frames write "no radar coverage" like "no echo"; the radar coverage (below) tells them apart |
+| Radar, contiguous US | NOAA/NSSL MRMS Seamless Hybrid Scan Reflectivity (the lowest unblocked tilt; IEM's `lcref` frames, which IEM labels "lowest elevation composite reflectivity", match MRMS's `SeamlessHSR` cell for cell) via the Iowa Environmental Mesonet (`weather.radar`); the ring check reads the palette indices of the same frame and, where the newest one shows an echo in a ring, of the frames before it from the same archive (2 min apart; a frame whose ring holds the same scan as the next newer one taken is passed over, none more than `VLBA_RADAR_STALE` before the newest frame). These frames write "no radar coverage" like "no echo"; the radar coverage (below) tells them apart |
 | Radar, Hawaii and the Virgin Islands | the NWS radar composites of radar.weather.gov on `https://opengeo.ncep.noaa.gov/geoserver/{hawaii,carib}/ows` (WMS, layers `hawaii_bref_qcd` and `carib_bref_qcd`, MRMS-based, a frame every 2 min). The server only serves coloured pixels (no values, no custom styles, WCS gives the same four bands), so `vlba/nwsradar.py` decodes the colours back to dBZ with the RIDGE II colour scale (`PALETTE`: the stops were derived by matching the MRMS source grids pixel for pixel with the served images, since no table is published; the nearest point on the colour ramp) and re-colours the result in the parent's dBZ palette, so every map reads the same. The frame time comes from the workspace's GetCapabilities, which also lists the frames of the last two hours: where the newest shows an echo in the ring, the frames before it are fetched with `TIME`, newest first, by the same rule. Pixels of unknown colour are left empty and counted in the log |
 | Radar coverage | MRMS's own GRIB2 files of the frames' times on NOAA Open Data (`noaa-mrms-pds` on AWS): `CONUS/SeamlessHSR_00.00` (about 1.3 MB, every 2 min) and `HAWAII` / `CARIB` `MergedBaseReflectivityQC_00.50` (20-60 KB), the products behind the frames, read with Pillow (`vlba/mrms.py`): -999 marks a cell no radar covers, -99 a covered cell without echo. A file missing at the frame's time is replaced by the nearest one within 5 min. NOAA's feed to the bucket can fall behind (on 2026-11-10 its files came 25-30 min late in every domain, and every radar check read "no data"), so a CONUS file the bucket lacks is read from IEM's archive (`mtarchive.geol.iastate.edu`, the same files from NCEP directly; `VLBA_MRMS_CONUS_MIRROR`, named in the footer). A file counts only when it is MRMS's file of the product (its GRIB2 identity) and its own time is the one its name gives; anything else is passed over for the next file or source. Nobody mirrors the islands' files: while the bucket is late, the newest file up to 1 h older than the frame stands in (`VLBA_RADAR_COVERAGE_MAX_LAG`; 0 = never, the check then "no data"), at the price that a radar which failed since reads "clear" (marked stale in the check, amber in the footer, "stale" in status.json). A lookup is bounded (15-s attempts, one retry, nothing started after 60 s) |
 | Lightning | GOES-East (GOES-19, 75.2° W) and GOES-West (GOES-18, 137.0° W) `GLM-L2-LCFA` granules on AWS Open Data (`noaa-goes19`, `noaa-goes18`; 20-s granules, GOES-19's 300-600 KB, GOES-18's about 200 KB, parsed in RAM with numpy + h5py, or netCDF4). Each site uses the satellites within 62° of arc of their sub-satellite point (GLM's field of view ends about there diagonally: in the granules of 2026-10-14 GOES-18 recorded nothing near the GBT, 64.9° away): Mauna Kea GOES-West only, St. Croix, Hancock and the GBT GOES-East only, the others both (a flash both detect counts once: same 1 s, within 20 km). Each run fetches the last 30 minutes, the run interval, plus 1 minute of overlap, because a granule is published 10-30 s after it ends and would otherwise fall between two runs: about 185 granules, 45-75 MB per run with both satellites (25-30 s, measured 2026-10-14). `VLBA_GLM_STRIDE=2` halves that, but then half of each interval goes unexamined, as it does with `VLBA_GLM_WINDOW_MIN` below the 30-minute run interval |
+| METARs, when NWS's are late | aviationweather.gov's data API (`https://aviationweather.gov/api/data/metar?ids=...&format=json&hours=2`), asked only when NWS has no report with weather of the last 90 min from the stations the precipitation check reads, or none from the nearest of them and no rain (a station that never reports weather, Kitt Peak's QSBA3, makes it ask every run; it answers 204, nothing): their raw METARs, whose weather groups and hourly precipitation (P group) the check reads like an undecoded NWS record. On 2026-11-10 it had St. Croix's TISX within minutes, NWS's API about 40 min later |
 | Sun | `weather.sun` (NOAA solar equations); "sun up" means the altitude is above −0.833° (the upper limb is visible) |
 | Basemap | OpenStreetMap standard tiles, fetched once per site and theme and cached for good |
 
@@ -172,6 +188,7 @@ vlba/
   mrms.py                MRMS's own GRIB2 files: the radar coverage of each ring
   radarcheck.py          the ring scans (MRMS cells; frame-space index images)
   decision.py            the checks, the verdict, the state file
+  clock.py               this host's clock against the servers' Date headers
   maps.py                the parent's map renderer plus rings, flashes and the caption label
   page.py                the page and status.json (the parent's blocks in the VLBA layout)
   tests/                 pytest, network blocked (FakeHttp, from the parent's suite)
@@ -184,22 +201,24 @@ deploy/
   install.sh             idempotent systemd installer: dirs, SELinux label, unit + timer
   vlbaweather.service    oneshot generator (placeholders filled by install.sh)
   vlbaweather.timer      every 30 min
-  apache-vlbaweather.conf  Alias /vlbaweather → output dir, no listings, short Cache-Control
+  apache-vlbaweather.conf  Alias /vlbaweather → output dir: the page's files only, no
+                         listings, short Cache-Control, security headers
 vlbaweather.env.example  every WEATHER_* and VLBA_* variable with its default
 run_local.sh             local preview: regenerate every 30 min and serve on port 8080
 .github/workflows/ci.yml lint, tests and shell syntax on Python 3.9 and 3.12
 ```
 
-`weather/` is the parent's library as of 2026-10-15, byte for byte apart from the origin
-notes at the top of `weather/__init__.py` and `weather/pipeline.py`. It has the hooks the
-parent took in for this page: in `weather.radar.SiteMap` the caption label (`radar["label"]`,
+`weather/` is the parent's library as of 2026-10-15, with the origin notes at the top of
+`weather/__init__.py` and `weather/pipeline.py` and fixes made here since. It has the
+hooks the parent took in for this page: in `weather.radar.SiteMap` the caption label (`radar["label"]`,
 default "MRMS") and the scale bars (`SCALE_BARS`, default 25 mi and 10 mi; the antennas' maps
 draw 10 mi and 10 km), and the footer's source-code link (`source_url`, set to this
 repository in `vlba/config.py`). All of its modules are needed (the page and the maps import the road
 layer too, which stays off here). To take in a later version, copy the parent's
 `weather/*.py` and its `make_weather_page.py` (as `weather/pipeline.py`) over these, put the
 origin notes back at the top of `weather/__init__.py` and `weather/pipeline.py`, naming the
-parent commit you copied, and run the tests; the parent's own tests of its library stay in
+parent commit you copied, check with `git diff` that no fix made here is lost, and run the
+tests; the parent's own tests of its library stay in
 its repository.
 
 ## Run locally
@@ -257,7 +276,8 @@ that also runs the parent, the two keep separate env files, cron lines, output a
 directories. The host needs Apache, a running cron daemon and git (`www-servers/apache`,
 `sys-process/cronie`, `dev-vcs/git`; the parent's README has the details). The checkout
 belongs to an admin account (`kirx` in the commands below), which also runs every later
-`git pull`; `apache` only reads it, so it must be able to enter the home directory: if
+`git pull`; `apache` only reads it (the installers warn when the run user or other accounts
+can change it), so it must be able to enter the home directory: if
 `ls -ld /home/kirx` shows `drwx------`, `chmod 711 /home/kirx`. As kirx:
 
 ```bash
@@ -278,11 +298,13 @@ WEATHER_OUT_DIR=/var/www/localhost/htdocs/vlbaweather
 WEATHER_PAGE_URL=https://www.example.org/vlbaweather/
 WEATHER_USER_AGENT=vlbaweather (+https://github.com/kirxkirx/vlbaweather; you@example.org)
 EOT
-chmod 0644 /etc/vlbaweather.env     # and put YOUR REAL e-mail address in the User-Agent
-                                    # and your host's name in WEATHER_PAGE_URL
+chgrp apache /etc/vlbaweather.env   # owner root, group apache, no other readers; put YOUR REAL
+chmod 0640 /etc/vlbaweather.env     # e-mail address in the User-Agent and your host's
+                                    # name in WEATHER_PAGE_URL
 
 # the output directory, handed to apache: the installer does not create it as root
-# under /var/www, which belongs to apache
+# under /var/www, which belongs to apache (nor, as root, any directory reached through a
+# symbolic link: where the web root is one, give the resolved path)
 mkdir -p /var/www/localhost/htdocs/vlbaweather
 chown apache:apache /var/www/localhost/htdocs/vlbaweather
 chmod 0755 /var/www/localhost/htdocs/vlbaweather
@@ -302,7 +324,34 @@ included. Logs go to syslog with the tag `vlbaweather`. Cache: `~apache/.cache/v
 The installer warns when numpy / h5py are missing for the run user's Python (the page then
 says lightning is unavailable). `git pull` in the checkout (as kirx) updates the service;
 rerun the installer when files under `deploy/` changed. On a systemd host,
-`deploy/install.sh` installs the service and timer instead.
+`deploy/install.sh` installs the service and timer instead. The unit reads only
+`/etc/vlbaweather.env` (a `~apache/vlbaweather.env` is read by the cron wrapper alone), and
+under its `ProtectSystem=strict` everything but the output and cache directories is
+read-only, so a `VLBA_STATE_FILE` or `WEATHER_LOCK_FILE` belongs in the cache directory.
+
+Apache serves everything in the output directory, so the cache directory, `VLBA_STATE_FILE`,
+`WEATHER_LOCK_FILE` and `WEATHER_LOG` must lie outside it (the installers refuse otherwise,
+and so does the generator for all but the log). A new `/etc/vlbaweather.env` from the cron
+installer is 0640 root:<run user's group>; an existing one keeps its mode. The cron wrapper
+reads `/etc/vlbaweather.env`, then `~apache/vlbaweather.env`, and skips, with a log line,
+an env file not owned by root or the run user, or writable by group or others (the file,
+what it links to, or their directories); one that exists but cannot be read stops the run
+(exit 2).
+
+Exit status: 0 even when every source is down, and when the previous run still holds the
+lock (`<cache>/run.lock`, mode 0600, owned by the run user) for less than 30 min; 1 when
+the lock has been held longer, cannot be used (a link, not the run user's, a file system
+without working flock, such as NFS without a lock service), the output or cache directory
+cannot be written, or the run fails unexpectedly (see the log); 2 for a configuration error.
+
+The Apache snippet serves only `index.html`, `status.json` and the maps
+`radar_<slug>_<theme>.png` (anything else, a stray cache or log file included, is 403),
+redirects `/vlbaweather` to `/vlbaweather/`, runs no handler in the directory, and, with
+mod_headers, sets `X-Content-Type-Options`, `Referrer-Policy` and a
+`Content-Security-Policy` (`frame-ancestors 'none'`: no other site can show the page in a
+frame). The copy in the Apache configuration is yours: after an update that changes
+`deploy/apache-vlbaweather.conf`, rerun the installer, copy
+`/etc/vlbaweather/apache-vlbaweather.conf` over it again, then configtest and reload.
 
 Packages: Pillow must be built for the Python version the run user's `python3` runs. On
 Gentoo, the `PYTHON_TARGETS` of `dev-python/pillow` must include that version (or set
@@ -328,8 +377,8 @@ or a few before it too) and MRMS's own file of it for the radar coverage (~1.3 M
 NOAA's bucket is late, the same file from IEM's archive, or an hour's index pages and a file
 near the frame's time: a few more requests, never one started after 60 s), two
 capabilities documents, two composites (more where a ring shows an echo) and two small MRMS
-files for the islands, and the GLM
-granules (45-75 MB); about 2.5-3.5 GB a day, almost all of it GLM. `VLBA_GLM_STRIDE=2` or a
+files for the islands, one request to aviationweather.gov for each site where NWS's
+station reports are late (see the METAR row above), and the GLM granules (45-75 MB); about 2.5-3.5 GB a day, almost all of it GLM. `VLBA_GLM_STRIDE=2` or a
 shorter `VLBA_GLM_WINDOW_MIN` cut that down, at the price of unexamined minutes. After an
 update that changes the run interval (as on 2026-10-14, from 5 to 30 minutes), rerun the
 installer right after the `git pull`: it replaces the crontab line (or the timer).
@@ -339,8 +388,9 @@ installer right after the `git pull`: it replaces the crontab line (or the timer
 Map data © OpenStreetMap contributors. Radar: NOAA/NSSL MRMS via the Iowa Environmental
 Mesonet, and NWS radar composites from radar.weather.gov. Lightning: NOAA GOES-East and
 GOES-West Geostationary Lightning Mapper via the NOAA Open Data Dissemination program on
-AWS. Forecasts and alerts: NOAA/NWS. Antenna positions: NRAO (the VLBA Observational Status
-Summary); the VLA and the GBT from the SCHED station catalog. The verdict logic follows the
+AWS. Forecasts and alerts: NOAA/NWS; station reports that NWS serves late: METARs from the
+NOAA/NWS Aviation Weather Center (aviationweather.gov). Antenna positions: NRAO (the VLBA
+Observational Status Summary); the VLA and the GBT from the SCHED station catalog. The verdict logic follows the
 ttustatus SafetyMonitor.
 
 Not an official product: this page is not from, or endorsed by, NOAA, the National Weather

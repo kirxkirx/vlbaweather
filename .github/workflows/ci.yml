@@ -4,6 +4,10 @@ on:
   push:
   pull_request:
 
+# The tests only read the checkout: the job's token gets no write access to anything.
+permissions:
+  contents: read
+
 jobs:
   test:
     # Pinned, not ubuntu-latest: actions/setup-python has Python 3.9 builds for Ubuntu 22.04
@@ -16,21 +20,25 @@ jobs:
         # release catches deprecations early.
         python-version: ["3.9", "3.12"]
     steps:
-      # Node 24 releases (checkout v4 and setup-python v5 run on the retired Node 20).
-      - uses: actions/checkout@v5
+      # Node 24 releases (checkout v4 and setup-python v5 run on the retired Node 20), pinned
+      # by commit: a tag can be moved to other code, a commit hash cannot. To update, look up
+      # the commit the tag names now and replace hash and comment together.
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09  # v5
 
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1  # v6
         with:
           python-version: ${{ matrix.python-version }}
 
       # Pillow is the only runtime dependency; numpy and h5py are the optional GLM lightning
-      # layer, installed so its granule-parser tests run (they are skipped without them). The
+      # layer, installed so its granule-parser tests run (they are skipped without them);
+      # netCDF4 is the layer's other reader, installed so its tests run too. Not pinned, on
+      # purpose: like the 3.12 leg, the current releases catch deprecations early. The
       # tests block urllib outright and feed every module through the fake_http fixture, so
       # this is the real environment the suite must pass in: no network, no fonts beyond
       # Pillow's default. shellcheck-py puts a shellcheck binary on PATH, which turns on the
       # suite's shellcheck test for the deploy scripts (skipped where shellcheck is missing).
       - name: Install dependencies
-        run: pip install pillow pytest flake8 shellcheck-py numpy h5py
+        run: pip install pillow pytest flake8 shellcheck-py numpy h5py netCDF4
 
       # weather/ is local-weather-awareness's library, copied: linted like the rest.
       - name: Lint (flake8)

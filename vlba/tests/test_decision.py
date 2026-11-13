@@ -67,7 +67,8 @@ def test_warning_check_without_the_sites_zones_is_unknown(cfg):
     e = _entry(meta=meta, alerts_at=[_alert("Tornado Warning", onset=NOW - timedelta(minutes=5),
                                             ends=NOW + timedelta(hours=1))])
     assert d.evaluate(cfg, e, {}, NOW)["status"] == d.BAD
-    assert d.evaluate(cfg, _entry(meta={"ok": True}), {}, NOW)["checks"][0]["state"] == "ok"
+    meta = {"ok": True, "forecast_zone": "NMZ226", "county_zone": "NMC003"}
+    assert d.evaluate(cfg, _entry(meta=meta), {}, NOW)["checks"][0]["state"] == "ok"
 
 
 def test_observed_precipitation_words():
@@ -539,11 +540,12 @@ def test_unreadable_winter_or_wind_series_is_no_answer(cfg):
 
 def test_radar_frame_of_unknown_time_ages_with_its_copy(cfg):
     """An island composite whose time is unknown (capabilities failed) and that comes from a
-    25-min-old cached copy is too old for the verdict, like any frame of known age."""
+    25-min-old cached copy is too old for the verdict, like any frame of known age. A fresh
+    one is not "clear" either (audit #89): its age cannot be judged."""
     v = d.evaluate(cfg, _entry(radar_check=_radar(False, frame_ts=None, stale=True, age_s=1500.0)), {}, NOW)
     assert [c for c in v["checks"] if c["key"] == "radar"][0]["state"] == "unknown" and v["incomplete"]
     v = d.evaluate(cfg, _entry(radar_check=_radar(False, frame_ts=None, age_s=0.0)), {}, NOW)
-    assert [c for c in v["checks"] if c["key"] == "radar"][0]["state"] == "ok"
+    assert [c for c in v["checks"] if c["key"] == "radar"][0]["state"] == "unknown" and v["incomplete"]
 
 
 def test_future_hold_stamp_is_clamped(cfg):
@@ -801,6 +803,10 @@ def test_unusable_station_is_unknown_not_bad(cfg):
     assert "Humidity observed" in d.evaluate(cfg, e, {}, NOW)["missing"]
     cfg.obs_precip = False
     cfg.obs_humidity_max = -1
+    v = d.evaluate(cfg, e, {}, NOW)
+    # the observed half of the wind check is missing too (#143): the forecast alone is no answer
+    assert v["missing"] == ["Wind"]
+    cfg.wind_mph = 0
     v = d.evaluate(cfg, e, {}, NOW)
     assert not v["incomplete"]
 

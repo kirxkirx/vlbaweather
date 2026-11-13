@@ -7,7 +7,8 @@ Everything a viewer sees is built here from the ``run`` dict that
   a visible "unavailable" / error box, never into a missing page: the systemd timer keeps
   running and an exception here would leave a stale page up for ever.
 * **Everything is escaped.** Every string that came from the network passes through
-  ``html.escape``; URLs from the feeds are emitted only when they start with ``https://``;
+  ``html.escape`` (``_e``, which also drops control and text-direction characters); URLs
+  from the feeds are emitted only as https to weather.gov or a NOAA host (``_feed_url``);
   alert colours only when they look like ``#rrggbb`` (else a neutral grey). The links this
   module builds itself (NWS hazard page, point forecast, attribution) use fixed hosts and
   URL-encoded, validated parameters.
@@ -73,12 +74,31 @@ _POINT_URL = "https://forecast.weather.gov/MapClick.php"
 _PHASE_BANDS = ((-0.833, "day"), (-6.0, "civil twilight"), (-12.0, "nautical twilight"),
                 (-18.0, "astronomical twilight"))
 _AREA_MAX = 90                  # banner: area description truncated to about this many chars
+# What ``_e`` leaves out of every text: the C0 and C1 controls and DEL (newline and tab
+# stay: alert texts are shown pre-wrapped), the bidirectional embeddings, overrides and
+# isolates (U+202A-202E, U+2066-2069: they reorder the text that follows on the screen),
+# the byte order mark, the two non-characters and the invisible "tag" characters
+# (U+E0000-E007F). The line and paragraph separators (U+2028, U+2029) become a newline.
+_NOT_TEXT: Dict[int, Optional[str]] = dict.fromkeys(
+    [c for c in range(0x20) if c not in (0x09, 0x0A)] + list(range(0x7F, 0xA0))
+    + list(range(0x202A, 0x202F)) + list(range(0x2066, 0x206A)) + [0xFEFF, 0xFFFE, 0xFFFF]
+    + list(range(0xE0000, 0xE0080)))
+_NOT_TEXT.update({0x2028: "\n", 0x2029: "\n"})
+# A URL from a feed, as ``_feed_url`` admits it: https, a host name of letters, digits, dots
+# and hyphens (group 1; no login, no port but 443), then nothing or a path / query / fragment
+# of printable ASCII.
+_FEED_URL_RE = re.compile(r"https://([A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*)(?::443)?(?:[/?#][!-~]*)?\Z")
+# An unpaired UTF-16 surrogate: JSON may carry one ("\\ud83d", half an emoji), Python keeps
+# it in the string, and UTF-8 cannot encode it.
+_SURROGATE_RE = re.compile("[\ud800-\udfff]")
 
 
 # ---- small escaping / formatting helpers ------------------------------------------
 def _e(x: Any) -> str:
-    """HTML-escape anything (None -> '')."""
-    return html.escape("" if x is None else str(x), quote=True)
+    """HTML-escape anything (None -> ''). Characters that are no text are left out first
+    (``_NOT_TEXT``): escaping keeps markup out, but a NUL byte or a right-to-left override
+    from a feed would still reach the file and reorder what the reader sees."""
+    return html.escape(("" if x is None else str(x)).translate(_NOT_TEXT), quote=True)
 
 
 def _color(c: Any) -> str:
@@ -88,8 +108,25 @@ def _color(c: Any) -> str:
 
 
 def _https(u: Any) -> Optional[str]:
-    """Only https URLs from the feeds are ever emitted (icons, alert web links)."""
+    """An https URL of the configuration (the page's own address, the source-code link):
+    whatever its host. URLs from the feeds go through ``_feed_url``."""
     return u if isinstance(u, str) and u.startswith("https://") else None
+
+
+def _feed_url(u: Any) -> Optional[str]:
+    """A URL from a feed (a forecast icon, an alert's web page) is emitted only when it is
+    plain https to weather.gov, a host under it, or a host under noaa.gov: an ``<img src>``
+    makes every visitor's browser call the host, and the link is labelled as NWS's. Strict
+    on the form too (``_FEED_URL_RE``): browsers read a backslash as a slash and what stands
+    before an "@" as a login, so a URL with either before its path could show one host to
+    this test and send the browser to another."""
+    m = _FEED_URL_RE.match(u) if isinstance(u, str) else None
+    if m is None:
+        return None
+    host = m.group(1).lower()
+    if host == "weather.gov" or host.endswith((".weather.gov", ".noaa.gov")):
+        return u
+    return None
 
 
 def _text_on(color: str) -> str:
@@ -273,6 +310,65 @@ def _generated_ts(run: dict, gen: datetime) -> float:
         return float(run.get("generated_ts"))
     except (TypeError, ValueError):
         return gen.timestamp()
+
+
+def _age_attrs(cfg: Any, gen_ts: float, what: Optional[str] = None) -> str:
+    """The ``data-`` attributes of the page element that let the page judge its own age in
+    the viewer's browser (PAGE_JS): when it was generated (epoch seconds), after how many
+    seconds without a new one it is no longer being updated (``cfg.page_stale_min``) and,
+    optionally, what is then "not current" (``what``, e.g. "the verdicts below are").
+    Nothing for a configuration without that setting: the page then makes no such
+    statement."""
+    limit = _stale_after_s(cfg)
+    if limit is None:
+        return ""
+    return ' data-generated="%d" data-stale-after="%d"%s' % (
+        int(gen_ts), limit, (' data-stale-what="%s"' % _e(what)) if what else "")
+
+
+def _stale_after_s(cfg: Any) -> Optional[int]:
+    """``cfg.page_stale_min`` in seconds; None when the configuration has no usable one."""
+    try:
+        limit = int(getattr(cfg, "page_stale_min", None)) * 60
+    except (TypeError, ValueError):
+        return None
+    return limit if limit > 0 else None
+
+
+def _judged_at(sites: List[dict], gen: datetime, mrms_only: bool = False) -> datetime:
+    """When the radar frames were judged: the latest ``verdict["evaluated"]`` of the sites
+    (of those on the MRMS frame only with ``mrms_only``: the others carry their own
+    ``island_radar``), else the generation time. The sites are evaluated one after another
+    during a run, so a frame just inside the limit at the start can be past it at the end."""
+    when = gen
+    for s in sites:
+        if not _is_dict(s) or (mrms_only and _is_dict(s.get("island_radar"))):
+            continue
+        v = s.get("verdict") if _is_dict(s.get("verdict")) else {}
+        ev = v.get("evaluated")
+        if isinstance(ev, datetime) and ev.tzinfo is not None and ev > when:
+            when = ev
+    return when
+
+
+def _frame_unused_age(cfg: Any, d: Any, when: datetime, copy_age: bool = False) -> Optional[float]:
+    """The age in seconds of a radar frame that was fetched but that the verdict does not
+    use because it is older than ``cfg.radar_stale_s`` at ``when``; None for a frame within
+    the limit, a source that is not ok, and a configuration without the setting. The rule
+    is the radar check's own (``vlba.decision.check_radar``): the frame's time decides; a
+    frame without one is as old as the copy it came from (``age_s``) where the check reads
+    that (``copy_age``: the island composites), and counts otherwise."""
+    limit = getattr(cfg, "radar_stale_s", None)
+    if not _ok(d) or isinstance(limit, bool) or not isinstance(limit, (int, float)):
+        return None
+    ts = d.get("ts")
+    if isinstance(ts, datetime):
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=timezone.utc)
+        age: Optional[float] = (when - ts).total_seconds()
+    else:
+        age = _float_or_none(d.get("age_s")) if copy_age else None
+    return age if age is not None and age > float(limit) else None
 
 
 def _site_ident(s: Any) -> Tuple[str, str]:
@@ -474,6 +570,17 @@ PAGE_CSS = """  body { margin: 0; }
   }
   .modebtn:hover { color: var(--ink); border-color: var(--muted); }
   .modebtn:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  .when .gl { font-size: 13px; font-weight: 400; color: var(--muted); }
+
+  /* the page's own age (PAGE_JS fills #pageage and adds .outdated to the page when it is no
+     longer regenerated): red on purpose, the same in both palettes */
+  .pageage { margin: 0 0 16px; padding: 12px 16px; border-radius: 8px; font-size: 16px; font-weight: 700;
+             line-height: 1.4; color: #ffffff; background: #b42318; }
+  .pageage[hidden] { display: none; }
+  .pageage.note { font-size: 13.5px; font-weight: 400; color: var(--warn); background: var(--warnbg); }
+  .page.outdated .noalerts, .page.outdated .abox, .page.outdated .acard { opacity: .6; }
+  .page.outdated .noalerts { color: var(--muted); }
+  .page.outdated .noalerts .dot, .page.outdated .pills .dot { background: var(--faint); }
 
   .pills { display: flex; gap: 8px; flex-wrap: wrap; margin: 14px 0 0; }
   .pill { display: inline-flex; align-items: center; gap: 7px; font-size: 12.5px;
@@ -644,6 +751,42 @@ PAGE_JS = """  var page = document.getElementById('page');
   var BASE = page.getAttribute('data-night-default') === '1' ? '1' : '0';
   var MODE_KEY = 'weather-mode', VIEW_KEY = 'weather-view';
 
+  // The page's age by the viewer's clock: a page that is no longer regenerated (the generator
+  // stopped, its output cannot be written) must say so itself, the reload below only fetches
+  // the same old file again. First in the script, so that nothing below can keep it from
+  // running. The numbers and the words come from data- attributes and the texts go in as
+  // textContent: nothing of the page's data is ever part of this script.
+  var generated = parseInt(page.getAttribute('data-generated'), 10);
+  var staleAfter = parseInt(page.getAttribute('data-stale-after'), 10);
+  var staleWhat = page.getAttribute('data-stale-what') || 'what it shows is';
+  var agebox = document.getElementById('pageage');
+  function checkAge() {
+    if (!agebox || !(generated > 0) || !(staleAfter > 0)) { return; }
+    var age = Date.now() / 1000 - generated;
+    if (age > staleAfter) {
+      var min = Math.floor(age / 60);
+      agebox.textContent = 'This page was generated ' + (min > 120 ? Math.floor(min / 60) + ' h' : min + ' min') +
+        ' ago and is no longer being updated: ' + staleWhat + ' not current.';
+      agebox.className = 'pageage';
+      agebox.hidden = false;
+      page.classList.add('outdated');
+    } else if (age < -300) {
+      // a clock more than 5 min behind the generation time: no age can be told from it
+      agebox.textContent = 'The clock of this device is behind the time this page was generated: ' +
+        'how old the page is cannot be judged here. Compare the generation time with a clock you trust.';
+      agebox.className = 'pageage note';
+      agebox.hidden = false;
+      page.classList.remove('outdated');
+    } else {
+      agebox.hidden = true;
+      page.classList.remove('outdated');
+    }
+  }
+  checkAge();
+  setInterval(checkAge, 30000);
+  // a tab restored from the back/forward cache or woken from sleep: judge at once
+  window.addEventListener('pageshow', checkAge);
+
   // The hidden theme's radar images wait in data-src until that theme is first shown.
   function loadMaps(night) {
     var imgs = document.querySelectorAll('img.radar-' + (night ? 'dark' : 'light') + '[data-src]');
@@ -742,11 +885,34 @@ def _head_html(cfg) -> str:
         '<!DOCTYPE html>\n<html lang="en">\n<head>\n'
         '<meta charset="utf-8">\n'
         '<meta name="viewport" content="width=device-width, initial-scale=1">\n'
+        '%s'
         '<noscript><meta http-equiv="refresh" content="%d"></noscript>\n'
         '<title>%s</title>\n'
         '<style>\n%s</style>\n</head>\n<body>\n'
-        % (int(cfg.refresh_seconds), _e(_title(cfg)), PAGE_CSS)
+        % (REFERRER_META, int(cfg.refresh_seconds), _e(_title(cfg)), PAGE_CSS)
     )
+
+
+# No request a visitor's browser makes from this page (the NWS forecast icons, a followed
+# link) tells the other side which page it came from.
+REFERRER_META = '<meta name="referrer" content="no-referrer">\n'
+
+
+def _age_slot_html() -> str:
+    """Where PAGE_JS writes that the page is no longer being updated (hidden until then)."""
+    return '<div class="pageage" id="pageage" role="alert" hidden></div>\n'
+
+
+def _age_noscript_html(cfg, gen: datetime, what: str = "what it shows is") -> str:
+    """For viewers without JavaScript, who get no banner: when the page was generated and
+    after how long it is to be taken as stopped. Nothing without ``cfg.page_stale_min``."""
+    limit = _stale_after_s(cfg)
+    if limit is None:
+        return ""
+    return ('<noscript><p class="pageage note">Generated %s. This page cannot check its own age without '
+            'JavaScript: when that time is more than %d min ago, the page is no longer being updated and '
+            '%s not current.</p></noscript>\n'
+            % (_e(gen.astimezone(timezone.utc).strftime("%H:%M UTC on %A, %B %-d, %Y")), limit // 60, _e(what)))
 
 
 def _masthead_html(cfg, gen: datetime, first_tz: str, night: bool) -> str:
@@ -762,7 +928,7 @@ def _masthead_html(cfg, gen: datetime, first_tz: str, night: bool) -> str:
         '  <div class="mastright">\n'
         '    <button class="modebtn" id="modebtn" type="button" aria-pressed="%s">%s</button>\n'
         '    <div class="when">\n'
-        '      <div class="t mono">%s</div>\n'
+        '      <div class="t mono"><span class="gl">generated</span> %s</div>\n'
         '      <div class="d">%s · %s UTC</div>\n'
         '    </div>\n'
         '  </div>\n'
@@ -806,6 +972,13 @@ def _feed_warning_html(feed: Any) -> str:
             'incomplete.</p>\n' % (_e(err or "unknown error"), _e(last)))
 
 
+def _alert_id(a: dict) -> Optional[str]:
+    """The alert's id where it is text, else None: a feed record whose id is a list or an
+    object must not break a set or a dict key (it is then told apart by its words)."""
+    aid = a.get("id")
+    return aid if isinstance(aid, str) and aid else None
+
+
 def _banner_html(run: dict, sites: List[dict]) -> str:
     """One coloured box per distinct alert (across all sites): event, threat and severity
     chips, which sites it is AT or NEAR (linked), its time span in the first affected
@@ -822,18 +995,36 @@ def _banner_html(run: dict, sites: List[dict]) -> str:
             for a in s.get(rel) or []:
                 if not _is_dict(a):
                     continue
-                key = a.get("id") or (a.get("event"), a.get("headline"))
+                # an id that is no text (a list, an object) cannot be a key: by its words then
+                key = _alert_id(a) or (str(a.get("event")), str(a.get("headline")))
                 d = distinct.setdefault(key, {"alert": a, "at": [], "near": []})
                 d["at" if rel == "alerts_at" else "near"].append((slug, name, tz))
     parts = ['<div class="banner" id="alerts">\n', _feed_warning_html(run.get("alerts"))]
     road_line = _guard("road closures banner", _roads_banner_html, sites)
+    # sites whose alerts could not be had this run (``alerts_feed`` of the entry, where the
+    # run dict carries one: the feed unreadable, or the site's own step failed)
+    unknown = [_site_ident(s) for s in sites if _is_dict(s) and _alerts_unknown(s.get("alerts_feed"))]
+    feed = run.get("alerts")
+    unknown_line = ""
+    if _is_dict(feed) and feed.get("ok") and unknown:
+        unknown_line = ('<p class="feedwarn">Alerts unknown for %s: the site could not be worked out this '
+                        'run.</p>\n' % " · ".join('<a href="#%s">%s</a>' % (_e(site_anchor(sl)), _e(nm))
+                                                  for sl, nm in unknown))
     if not distinct:
-        parts.append('<h2>NWS alerts</h2>\n<p class="noalerts"><span class="dot"></span>'
-                     'No NWS alerts for these sites.</p>\n%s%s</div>\n'
-                     % (road_line, BANNER_DISCLAIMER_HTML))
+        if not _is_dict(feed) or not feed.get("ok"):
+            # "no alerts" must never stand where the truth is "could not ask"
+            none = '<p class="unavail">%s.</p>\n' % ALERTS_UNKNOWN
+        elif unknown and len(unknown) == len(sites):
+            none = ""
+        else:
+            none = ('<p class="noalerts"><span class="dot"></span>No NWS alerts for %s.</p>\n'
+                    % ("the other sites" if unknown else "these sites"))
+        parts.append('<h2>NWS alerts</h2>\n%s%s%s%s</div>\n'
+                     % (unknown_line, none, road_line, BANNER_DISCLAIMER_HTML))
         return "".join(parts)
     order = sorted(distinct.values(), key=lambda d: (_rank(d["alert"]), str(d["alert"].get("event"))))
     parts.append('<h2>NWS alerts <span class="chip warn">%d active</span></h2>\n' % len(order))
+    parts.append(unknown_line)
     for d in order:
         a = d["alert"]
         where = []
@@ -912,14 +1103,14 @@ def _legend_html(s: dict) -> str:
     if isinstance(ids, (list, tuple, set)):
         drawn = {i for i in ids if isinstance(i, str)}
     else:
-        drawn = {a.get("id") for a in near} | {a.get("id") for a in at if a.get("geometry") is not None}
+        drawn = {_alert_id(a) for a in near} | {_alert_id(a) for a in at if a.get("geometry") is not None}
     shaded: Dict[Tuple[str, str], None] = {}
     unshaded: Dict[Tuple[str, str], None] = {}
     for a in sorted(at + near, key=_rank):
         key = (str(a.get("event") or "Alert"), _color(a.get("color")))
         # Two same-named alerts, one drawn and one not, appear in both groups: the colour
         # is on the map, but not for every alert of that name listed on the page.
-        (shaded if a.get("id") in drawn else unshaded).setdefault(key, None)
+        (shaded if _alert_id(a) in drawn else unshaded).setdefault(key, None)
 
     def items(group: Dict[Tuple[str, str], None]) -> str:
         return ''.join('<span><span class="sw" style="background:%s"></span>%s</span>' % (col, _e(ev))
@@ -1057,7 +1248,7 @@ def _alert_card_html(a: dict, rel: str, tz: str, s: Optional[dict] = None,
         body.append('<div class="txt"><b>Instruction:</b> %s</div>' % _e(a["instruction"]))
     details = ""
     if body:
-        key = "%s:%s" % (slug, a.get("id") or a.get("event") or "alert")
+        key = "%s:%s" % (slug, _alert_id(a) or a.get("event") or "alert")
         details = ('  <details data-k="%s"><summary>Details</summary>%s</details>\n'
                    % (_e(key), "".join(body)))
     links = []
@@ -1065,7 +1256,7 @@ def _alert_card_html(a: dict, rel: str, tz: str, s: Optional[dict] = None,
     if url:
         links.append('<a href="%s" rel="noopener">%s</a>'
                      % (_e(url), "Full text on weather.gov" if is_hazard else "NWS forecast for this site"))
-    web = _https(a.get("web"))
+    web = _feed_url(a.get("web"))
     # api.weather.gov usually sends the bare weather.gov home page here: not worth a link
     if web and web.rstrip("/") not in ("https://www.weather.gov", "https://weather.gov"):
         links.append('<a href="%s" rel="noopener">NWS alert page</a>' % _e(web))
@@ -1083,12 +1274,46 @@ def _alert_card_html(a: dict, rel: str, tz: str, s: Optional[dict] = None,
     )
 
 
-def _alert_cards_html(s: dict, tz: str, gen: Optional[datetime] = None) -> str:
+# What stands in place of "no alerts" when the feed could not be read: unknown is not clear.
+ALERTS_UNKNOWN = "Alerts unknown: the NWS alert feed could not be read"
+
+
+def _alerts_unknown(feed: Any) -> bool:
+    """True for a feed status that says the alerts could not be had (not ok); False for a
+    usable one and for none at all (a run dict without it: nothing is known about the feed)."""
+    return _is_dict(feed) and not feed.get("ok")
+
+
+def _alert_cards_html(s: dict, tz: str, gen: Optional[datetime] = None, feed: Any = None) -> str:
+    """The site's alert cards. ``feed`` (optional): the status of the alert feed behind
+    them (``ok``, ``stale``, ``age_s``). Not ok: the block says the alerts are unknown,
+    never that there are none; a last good copy in use is named with its time."""
     at = [a for a in (s.get("alerts_at") or []) if _is_dict(a)]
     near = [a for a in (s.get("alerts_near") or []) if _is_dict(a)]
+    unknown = _alerts_unknown(feed)
+    copy = ""
+    if _is_dict(feed) and feed.get("ok") and feed.get("stale"):
+        age = _float_or_none(feed.get("age_s"))
+        ref = gen if isinstance(gen, datetime) else util.utcnow()
+        copy = "of an earlier run"
+        if age is not None:
+            try:
+                copy = "from %s" % util.fmt_local(ref - timedelta(seconds=age), tz, "%H:%M %Z")
+            except (OverflowError, ValueError):
+                pass            # an age no clock can show must not cost the site its alert cards
     if not at and not near:
+        if unknown:
+            return ('<h2>Alerts <span class="chip off">unknown</span></h2>\n'
+                    '<p class="unavail">%s.</p>\n' % ALERTS_UNKNOWN)
+        if copy:
+            return ('<h2>Alerts <span class="chip warn">feed copy %s</span></h2>\n'
+                    '<p class="unavail">No NWS alerts at or near this site in the last good copy of the feed '
+                    '(%s): the latest fetch failed.</p>\n' % (_e(copy), _e(copy)))
         return '<h2>Alerts</h2>\n<p class="unavail">No NWS alerts at or near this site.</p>\n'
-    parts = ['<h2>Alerts <span class="chip warn">%d at site · %d nearby</span></h2>\n' % (len(at), len(near))]
+    parts = ['<h2>Alerts <span class="chip warn">%d at site · %d nearby</span>%s</h2>\n'
+             % (len(at), len(near), (' <span class="chip warn">feed copy %s</span>' % _e(copy)) if copy else "")]
+    if unknown:
+        parts.append('<p class="unavail">%s: the list below may be incomplete.</p>\n' % ALERTS_UNKNOWN)
     for a in at:
         parts.append(_guard("alert card", _alert_card_html, a, "AT", tz, s, gen))
     for a in near:
@@ -1516,10 +1741,10 @@ def _forecast_html(cfg, s: dict, units: _Units, tz: str) -> str:
     slug, _ = _site_ident(s)
     cards = []
     for idx, p in enumerate(periods, 1):
-        icon = _https(p.get("icon"))
+        icon = _feed_url(p.get("icon"))
         short = str(p.get("short") or "")
-        img = ('<img src="%s" alt="%s" width="44" height="44" loading="lazy">' % (_e(icon), _e(short))
-               if icon else "")
+        img = ('<img src="%s" alt="%s" width="44" height="44" loading="lazy" referrerpolicy="no-referrer">'
+               % (_e(icon), _e(short)) if icon else "")
         temp = units.temp(p.get("temp_f"), p.get("temp_c"))
         trend = (' <span class="alt">%s</span>' % _e(p.get("temp_trend"))) if p.get("temp_trend") else ""
         wind = units.wind_text(p.get("wind"))
@@ -1600,8 +1825,15 @@ def _footer_html(cfg, run: dict, sites: List[dict], gen: datetime) -> str:
     pills.append('<span class="pill"><span class="dot%s"></span>Alerts: %s</span>' % (dot, _e(txt)))
     radar = run.get("radar")
     dot, txt = _src_status(radar)
+    old = _frame_unused_age(cfg, radar, _judged_at(sites, gen, mrms_only=True))
     if _is_dict(radar) and radar.get("not_applicable"):
         dot, txt = " off", "not applicable (no map in the MRMS grid)"
+    elif _is_dict(radar) and radar.get("disabled"):
+        dot, txt = " off", "off"            # switched off by configuration: not a failure
+    elif old is not None:
+        # fetched, but older than the verdict accepts: never "fresh"
+        dot, txt = " warnc", "frame %s · frame %s old, not used" % (
+            radar["ts"].astimezone(timezone.utc).strftime("%H:%MZ"), util.fmt_age(old))
     elif _is_dict(radar) and isinstance(radar.get("ts"), datetime):
         txt = "frame %s · %s" % (radar["ts"].astimezone(timezone.utc).strftime("%H:%MZ"), txt)
     pills.append('<span class="pill"><span class="dot%s"></span>Radar: %s</span>' % (dot, _e(txt)))
@@ -1712,9 +1944,12 @@ def _render(cfg, run: dict) -> str:
     night = bool(run.get("night_default"))
     units = _Units(cfg.units)
     parts = [_head_html(cfg)]
-    parts.append('<div class="%s" id="page" data-night-default="%s" data-refresh="%d">\n<div class="wrap">\n'
-                 % ("page night" if night else "page", "1" if night else "0", int(cfg.refresh_seconds)))
+    parts.append('<div class="%s" id="page" data-night-default="%s" data-refresh="%d"%s>\n<div class="wrap">\n'
+                 % ("page night" if night else "page", "1" if night else "0", int(cfg.refresh_seconds),
+                    _age_attrs(cfg, gen_ts)))
+    parts.append(_age_slot_html())
     parts.append(_guard("masthead", _masthead_html, cfg, gen, first_tz, night))
+    parts.append(_guard("page age", _age_noscript_html, cfg, gen))
     parts.append(_guard("navigation", _nav_html, sites))
     parts.append(_guard("alerts banner", _banner_html, run, sites))
     if not sites:
@@ -1749,9 +1984,13 @@ def render_html(cfg, run: dict) -> str:
 
 
 def _atomic_write_text(path: str, text: str) -> None:
-    """tmp + fsync + os.replace: a crash mid-write must never leave a half page behind."""
+    """tmp + fsync + os.replace: a crash mid-write must never leave a half page behind.
+    An unpaired surrogate in the text (one upstream string with half an emoji is enough)
+    is written as U+FFFD: UTF-8 cannot encode it, and failing here would leave the old page
+    with its old verdicts up for as long as that string is served."""
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     tmp = "%s.tmp.%d" % (path, os.getpid())
+    text = _SURROGATE_RE.sub("\ufffd", text)
     try:
         with open(tmp, "w", encoding="utf-8") as f:
             f.write(text)
@@ -1787,8 +2026,10 @@ def _problems(run: dict, cfg: Any = None) -> List[str]:
     probs: List[str] = []
 
     def source(label: str, d: Any) -> None:
-        if _is_dict(d) and (d.get("not_provided") or d.get("not_applicable")):
-            return      # nothing NWS provides here / no map in the MRMS grid: not a fault
+        if _is_dict(d) and (d.get("not_provided") or d.get("not_applicable") or d.get("disabled")):
+            # nothing NWS provides here / no map in the MRMS grid / switched off by the
+            # configuration (the radar: WEATHER_RADAR=0): not a fault
+            return
         if not _is_dict(d):
             probs.append("%s: missing" % label)
         elif not d.get("ok"):
@@ -1851,6 +2092,9 @@ def _status_doc(cfg, run: dict) -> dict:
     feed = run.get("alerts") if _is_dict(run.get("alerts")) else {}
     radar = run.get("radar") if _is_dict(run.get("radar")) else {}
     ts = radar.get("ts")
+    # the road counts only for a run that carries road data: a zero for a road source that
+    # was never asked would read as "no closures"
+    with_roads = _roads_in_run(run, [s for s in (run.get("sites") or []) if _is_dict(s)])
     sites: Dict[str, dict] = {}
     for s in run.get("sites") or []:
         if not _is_dict(s):
@@ -1865,9 +2109,10 @@ def _status_doc(cfg, run: dict) -> dict:
             "alerts_at": len(s.get("alerts_at") or []),
             "alerts_near": len(s.get("alerts_near") or []),
             "maps_ok": bool(maps) and all(_ok(m) for m in maps.values()),
-            "roads_events": len(_road_list(_site_roads(s), "events")),
-            "roads_reports": len(_road_list(_site_roads(s), "reports")),
         }
+        if with_roads:
+            sites[slug]["roads_events"] = len(_road_list(_site_roads(s), "events"))
+            sites[slug]["roads_reports"] = len(_road_list(_site_roads(s), "reports"))
     problems = _problems(run, cfg)
     degraded = bool(problems)
     net = run.get("network") if _is_dict(run.get("network")) else None
@@ -1875,17 +2120,23 @@ def _status_doc(cfg, run: dict) -> dict:
         net = {"budget_s": net.get("budget_s"), "left_s": net.get("left_s"),
                "exhausted": bool(net.get("exhausted")),
                "down_hosts": [str(h) for h in (net.get("down_hosts") or [])]}
+    radar_doc: Any = RADAR_NOT_APPLICABLE if radar.get("not_applicable") else {
+        "ok": bool(radar.get("ok")), "stale": bool(radar.get("stale")),
+        "ts": ts.isoformat() if isinstance(ts, datetime) else None}
+    if _is_dict(radar_doc) and radar.get("disabled"):
+        radar_doc["disabled"] = True        # off by configuration: neither ok nor a problem
     return {
         "generated": gen.isoformat(),
+        # after this many seconds without a new "generated" the page is no longer being
+        # updated (the page itself applies the same limit); None: no limit configured
+        "stale_after_s": _stale_after_s(cfg),
         "page_written": bool(page_written),
         "degraded": degraded,
         "ok": bool(page_written) and not degraded,
         "problems": problems,
         "alerts": {"ok": bool(feed.get("ok")), "stale": bool(feed.get("stale")),
                    "count": len(feed.get("alerts") or [])},
-        "radar": (RADAR_NOT_APPLICABLE if radar.get("not_applicable") else
-                  {"ok": bool(radar.get("ok")), "stale": bool(radar.get("stale")),
-                   "ts": ts.isoformat() if isinstance(ts, datetime) else None}),
+        "radar": radar_doc,
         "network": net,
         "roads": _roads_status(run),
         "sites": sites,
@@ -1925,6 +2176,29 @@ def _roads_status(run: dict) -> Any:
                     "reports": len(reports)}}
 
 
+def _json_plain(x: Any) -> Any:
+    """``x`` with every unpaired surrogate in its strings (keys too) replaced by U+FFFD: JSON
+    would carry one as an escape that strict readers reject."""
+    if isinstance(x, str):
+        return _SURROGATE_RE.sub("\ufffd", x)
+    if isinstance(x, dict):
+        return {(_json_plain(k) if isinstance(k, str) else k): _json_plain(v) for k, v in x.items()}
+    if isinstance(x, (list, tuple)):
+        return [_json_plain(v) for v in x]
+    return x
+
+
+def _json_text(doc: Any) -> str:
+    """status.json's text: ASCII JSON with "<", ">" and "&" written as \\u003c, \\u003e and
+    \\u0026 (the same content for every JSON reader). The document holds upstream text
+    (reasons, error messages), and nothing that looks like markup may reach a consumer that
+    drops the file into a page, or a browser that is handed it under the wrong type."""
+    text = json.dumps(_json_plain(doc), indent=1, sort_keys=True,
+                      default=lambda o: _SURROGATE_RE.sub("\ufffd", str(o)))
+    # outside its strings JSON has none of the three characters
+    return text.replace("<", "\\u003c").replace(">", "\\u003e").replace("&", "\\u0026") + "\n"
+
+
 def write_status_json(cfg, run: dict) -> str:
     """Write ``<out_dir>/status.json``, a small machine-readable health summary for
     monitoring; returns the path. Like the page, a bad run dict yields a document that says
@@ -1934,10 +2208,11 @@ def write_status_json(cfg, run: dict) -> str:
     except Exception as e:  # noqa: BLE001
         log.exception("status summary failed: %s", e)
         msg = "status summary failed: %s: %s" % (type(e).__name__, e)
-        doc = {"generated": util.utcnow().isoformat(), "page_written": False, "degraded": True,
+        doc = {"generated": util.utcnow().isoformat(), "stale_after_s": _stale_after_s(cfg),
+               "page_written": False, "degraded": True,
                "ok": False, "problems": [msg], "alerts": {}, "radar": {}, "network": None,
                "roads": None, "sites": {},
                "errors": [msg]}
     path = os.path.join(cfg.out_dir, "status.json")
-    _atomic_write_text(path, json.dumps(doc, indent=1, sort_keys=True, default=str) + "\n")
+    _atomic_write_text(path, _json_text(doc))
     return path

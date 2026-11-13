@@ -34,10 +34,26 @@ BASE = "https://api.weather.gov"
 STATIONS_TTL = 7 * 86400            # a grid cell's station list practically never changes
 STATIONS_MAX_STALE = 60 * 86400
 MAX_STATIONS = 3                    # stations to try before declaring "no current conditions"
+# A /points answer without a forecast grid is right for American Samoa and wrong everywhere
+# else: it is asked for again after an hour at most (not after ``points_ttl``, a week), so
+# one odd reply does not switch a site's forecast checks off for days.
+NO_GRID_TTL = 3600
+# A report dated more than this ahead of our clock is not "now": the station's clock (or the
+# reply) is wrong. Ten minutes is what make_vlba_page._recent allows as well, and far more
+# than NTP-kept clocks ever differ.
+FUTURE_TOLERANCE_MIN = 10.0
 M_TO_FT = 3.28084
 
 _NUMBER = re.compile(r"\d+(?:\.\d+)?")
-_STATION_ID = re.compile(r"^[A-Za-z0-9_-]{1,16}$")   # goes into a URL path: keep it boring
+_STATION_ID = re.compile(r"^[A-Za-z0-9_-]{1,16}\Z")  # goes into a URL path: keep it boring
+# (\Z, not $: "$" also matches before a final newline, and "KABQ\n" in a URL is refused by
+# http.client before anything is sent)
+_ZONE_ID = re.compile(r"^[A-Z]{3}[0-9]{3}\Z")         # NMZ226, NMC003 (as alerts.ZONE_ID_RE)
+# A product address taken from a /points answer is fetched only when it is on api.weather.gov
+# over https and made of plain path characters: no other host or scheme (file://, http://),
+# no credentials, no query, no blank. The answer is data from the network, not a trusted link.
+_NWS_URL = re.compile(r"^%s/[A-Za-z0-9_.,/-]{1,200}\Z" % re.escape(BASE))
+NOT_NWS_URL = "the NWS point metadata names no usable address for it"
 
 META_FIELDS = ("grid_id", "grid_x", "grid_y", "office", "forecast_url", "hourly_url",
                "stations_url", "tz", "city", "state", "radar_station", "forecast_zone",
@@ -61,12 +77,31 @@ def _props(d: Any) -> Optional[dict]:
     return p if isinstance(p, dict) else None
 
 
+def nws_url(url: Any) -> bool:
+    """Whether ``url`` may be fetched as an NWS product (see ``_NWS_URL``)."""
+    return isinstance(url, str) and bool(_NWS_URL.match(url)) and ".." not in url
+
+
+def _zone_id(url: Any) -> Optional[str]:
+    """'https://api.weather.gov/zones/forecast/NMZ220' -> 'NMZ220' (also accepts a bare id);
+    None unless the last part has the form of a zone id."""
+    zid = _last_segment(url)
+    return zid if zid and _ZONE_ID.match(zid) else None
+
+
+def _has_grid(p: dict) -> bool:
+    return bool(p.get("gridId") and p.get("forecast"))
+
+
 def _valid_points(d: Any) -> bool:
-    """A usable ``/points`` answer: a forecast grid, or at least the time zone and a zone
-    (American Samoa has zones and a time zone but no forecast grid)."""
+    """A usable ``/points`` answer: a forecast zone or a county, and with it a forecast grid
+    or at least the time zone (American Samoa has zones and a time zone but no forecast
+    grid). The zones are required of a gridded point too: without them a zone-based warning
+    cannot be matched to the site, and an answer that lacks them is a failed fetch (the last
+    good copy is used), not metadata to keep for a week."""
     p = _props(d)
-    return bool(p and ((p.get("gridId") and p.get("forecast"))
-                       or (p.get("timeZone") and (p.get("forecastZone") or p.get("county")))))
+    return bool(p and (_zone_id(p.get("forecastZone")) or _zone_id(p.get("county")))
+                and (_has_grid(p) or p.get("timeZone")))
 
 
 def _loc(site: dict) -> str:
@@ -107,13 +142,18 @@ def _valid_observation(d: Any) -> bool:
 
 
 def _fetch(cfg, cache, key: str, url: Optional[str], ttl: float, max_stale: float,
-           validate) -> Dict[str, Any]:
+           validate, why: Optional[str] = None) -> Dict[str, Any]:
     """``http.cached_json`` that also copes with a missing URL (site metadata unavailable):
     the last good copy is still served for ``max_stale`` so one NWS hiccup does not take
-    every product of a site down at once."""
-    if url:
+    every product of a site down at once. An address that is not an https one on
+    api.weather.gov (``nws_url``) is never fetched and counts as missing; the error says
+    so (``why``, when ``site_metadata`` already dropped it) without repeating the address."""
+    if url and nws_url(url):
         return http.cached_json(cfg, cache, key, url, ttl, max_stale, validate=validate)
-    err = "no URL for %s (site metadata unavailable)" % key
+    if url:
+        log.warning("%s: address %.60r is not on %s, not fetched", key, url, BASE)
+        why = NOT_NWS_URL
+    err = "no URL for %s (%s)" % (key, why or "site metadata unavailable")
     old, age = cache.get_any(key)
     if old is not None and age is not None and age <= max_stale and validate(old):
         return {"data": old, "ok": True, "stale": True, "age_s": age, "error": err,
@@ -168,19 +208,28 @@ def _temp_pair(raw: Any, unit_hint: Optional[str] = None,
     return _tidy(v), _tidy(util.f_to_c(v))
 
 
+_KNOTS = ("kn", "kt", "[kn_i]")     # WMO, the common abbreviation, UCUM
+
+
 def _speed_kmh(q: Any) -> Optional[float]:
-    """Observation wind quantity -> km/h honouring ``unitCode`` (km_h-1, m_s-1, mi_h-1, kn)."""
+    """Observation wind quantity -> km/h honouring ``unitCode`` (km_h-1, m_s-1, mi_h-1,
+    knots). A bare number or a quantity without a unit code is km/h, what the API sends.
+    A unit code this function does not know gives None: a speed in an unknown unit read
+    as km/h would understate the wind (knots by half), and "no value" is the honest answer."""
     v = util.quantity(q)
     if v is None:
         return None
     u = _unit(q)
+    if not u or "km_h" in u:
+        return v
     if "m_s" in u:
         return v * 3.6
     if "mi_h" in u or u.lower().endswith("mph"):
         return util.mph_to_kmh(v)
-    if u.endswith(":kn") or u == "kn":
+    if u.rsplit(":", 1)[-1] in _KNOTS:
         return v * 1.852
-    return v
+    log.warning("wind speed in an unknown unit %.40r: not used", u)
+    return None
 
 
 def _pressure_pa(q: Any) -> Optional[float]:
@@ -258,6 +307,26 @@ def _cloud_layers(layers: Any) -> List[str]:
 
 
 # ---- /points ---------------------------------------------------------------------------
+def _points_ttl(cfg, cache, key: str) -> float:
+    """How long the copy on disk of a ``/points`` answer counts as fresh: ``cfg.points_ttl``
+    for a gridded point; ``NO_GRID_TTL`` at most for one without a grid; no time at all for
+    a copy that is not valid any more (cached before the zones were required)."""
+    old, _age = cache.get_any(key)
+    if old is None:
+        return cfg.points_ttl
+    if not _valid_points(old):
+        return float("-inf")            # no age counts as fresh: ask
+    if not _has_grid(_props(old) or {}):
+        return min(cfg.points_ttl, NO_GRID_TTL)
+    return cfg.points_ttl
+
+
+def _url_why(meta: Optional[dict], name: str) -> Optional[str]:
+    """The reason for ``_fetch`` when ``site_metadata`` dropped the product's address."""
+    rejected = (meta or {}).get("rejected_urls")
+    return NOT_NWS_URL if isinstance(rejected, (list, tuple)) and name in rejected else None
+
+
 def site_metadata(cfg, cache, site: dict) -> dict:
     """Grid, product URLs, time zone and zone ids for a site. ``tz`` is always a usable
     name ("UTC" when the lookup failed) because every other product formats times with it.
@@ -266,31 +335,45 @@ def site_metadata(cfg, cache, site: dict) -> dict:
     no forecast grid (American Samoa): the forecasts and observations are then "not
     provided" rather than failed."""
     url = "%s/points/%s" % (BASE, _loc(site))
-    res = http.cached_json(cfg, cache, "points/%s" % _loc(site), url,
-                           cfg.points_ttl, cfg.points_max_stale, validate=_valid_points)
+    key = "points/%s" % _loc(site)
+    res = http.cached_json(cfg, cache, key, url, _points_ttl(cfg, cache, key),
+                           cfg.points_max_stale, validate=_valid_points)
     out = _status(res)
     out.update({k: None for k in META_FIELDS})
     out["tz"] = "UTC"
     out["zone_urls"] = []
     out["no_grid"] = False
+    out["rejected_urls"] = []
+    if res["ok"] and not _valid_points(res["data"]):
+        # a copy cached before the zones were required, served because the fetch failed
+        out.update({"ok": False, "stale": True,
+                    "error": "%s (the copy on disk names no zone)" % (res["error"] or "no fresh answer")})
+        res = dict(res, ok=False, error=out["error"])
     if not res["ok"]:
         log.warning("%s: point metadata unavailable: %s", site["slug"], res["error"])
         return out
     p = res["data"]["properties"]
-    out["no_grid"] = not (p.get("gridId") and p.get("forecast"))
-    rel = ((p.get("relativeLocation") or {}).get("properties") or {})
+    out["no_grid"] = not _has_grid(p)
+    rel = _props(p.get("relativeLocation")) or {}
     zones = [p.get("forecastZone"), p.get("county"), p.get("fireWeatherZone")]
+    links = {"forecast_url": p.get("forecast"), "hourly_url": p.get("forecastHourly"),
+             "stations_url": p.get("observationStations")}
+    for name in sorted(links):
+        if links[name] and not nws_url(links[name]):
+            log.warning("%s: %s of the point metadata is not an address on %s: not used (%.60r)",
+                        site["slug"], name, BASE, links[name])
+            out["rejected_urls"].append(name)
+            links[name] = None
+    out.update(links)
     out.update({
         "grid_id": p.get("gridId"), "grid_x": p.get("gridX"), "grid_y": p.get("gridY"),
         "office": p.get("cwa") or p.get("gridId"),
-        "forecast_url": p.get("forecast"), "hourly_url": p.get("forecastHourly"),
-        "stations_url": p.get("observationStations"),
         "tz": p.get("timeZone") or "UTC",
         "city": rel.get("city"), "state": rel.get("state"),
         "radar_station": p.get("radarStation"),
-        "forecast_zone": _last_segment(zones[0]), "county_zone": _last_segment(zones[1]),
-        "fire_zone": _last_segment(zones[2]),
-        "zone_urls": [z for z in zones if isinstance(z, str) and z],
+        "forecast_zone": _zone_id(zones[0]), "county_zone": _zone_id(zones[1]),
+        "fire_zone": _zone_id(zones[2]),
+        "zone_urls": [z for z in zones if _zone_id(z) and nws_url(z)],
     })
     if out["no_grid"]:
         log.info("%s: NWS has no forecast grid here (zones %s, tz %s)", site["slug"],
@@ -333,7 +416,8 @@ def forecast(cfg, cache, site: dict, meta: Optional[dict]) -> dict:
     if _not_provided(meta):
         return dict(_not_provided_status(), updated=None, periods=[])
     res = _fetch(cfg, cache, "forecast/%s" % _loc(site), (meta or {}).get("forecast_url"),
-                 cfg.forecast_ttl, cfg.forecast_max_stale, _valid_forecast)
+                 cfg.forecast_ttl, cfg.forecast_max_stale, _valid_forecast,
+                 why=_url_why(meta, "forecast_url"))
     out = _status(res)
     out.update({"updated": None, "periods": []})
     if not res["ok"]:
@@ -376,7 +460,8 @@ def hourly(cfg, cache, site: dict, meta: Optional[dict]) -> dict:
     if _not_provided(meta):
         return dict(_not_provided_status(), updated=None, hours=[])
     res = _fetch(cfg, cache, "hourly/%s" % _loc(site), (meta or {}).get("hourly_url"),
-                 cfg.hourly_ttl, cfg.hourly_max_stale, _valid_forecast)
+                 cfg.hourly_ttl, cfg.hourly_max_stale, _valid_forecast,
+                 why=_url_why(meta, "hourly_url"))
     out = _status(res)
     out.update({"updated": None, "hours": []})
     if not res["ok"]:
@@ -466,9 +551,12 @@ def _parse_observation(props: dict) -> dict:
 
 def _unusable(obs: dict, max_age_min: float) -> Optional[str]:
     """Why an observation should be skipped (None = usable). A METAR with no temperature
-    is usually a broken sensor; a report older than ``max_age_min`` is history, not 'now'."""
+    is usually a broken sensor; a report older than ``max_age_min`` is history, not 'now',
+    and one dated more than ``FUTURE_TOLERANCE_MIN`` ahead never ages at all."""
     if obs["timestamp"] is None:
         return "no timestamp"
+    if obs["age_min"] is not None and obs["age_min"] < -FUTURE_TOLERANCE_MIN:
+        return "report dated in the future"
     if obs["age_min"] is None or obs["age_min"] > max_age_min:
         return "report is %s old" % util.fmt_duration_minutes(obs["age_min"])
     if obs["temp_c"] is None:
@@ -488,7 +576,8 @@ def observation(cfg, cache, site: dict, meta: Optional[dict]) -> dict:
         out.update(_not_provided_status())
         return out
     sres = _fetch(cfg, cache, "stations/%s" % _loc(site), (meta or {}).get("stations_url"),
-                  STATIONS_TTL, STATIONS_MAX_STALE, _valid_stations)
+                  STATIONS_TTL, STATIONS_MAX_STALE, _valid_stations,
+                  why=_url_why(meta, "stations_url"))
     if not sres["ok"]:
         out["error"] = "station list unavailable: %s" % sres["error"]
         log.warning("%s: %s", slug, out["error"])
@@ -506,7 +595,13 @@ def observation(cfg, cache, site: dict, meta: Optional[dict]) -> dict:
         if not ores["ok"]:
             reasons.append("%s: %s" % (sid, ores["error"]))
             continue
-        obs = _parse_observation(ores["data"]["properties"])
+        try:
+            obs = _parse_observation(ores["data"]["properties"])
+        except Exception as e:  # noqa: BLE001 — one odd record: try the next station
+            reasons.append("%s: report could not be read" % sid)
+            log.warning("%s: skipping station %s (report could not be read: %s: %s)", slug, sid,
+                        type(e).__name__, e)
+            continue
         why = _unusable(obs, cfg.obs_max_age_min)
         if why:
             reasons.append("%s: %s" % (sid, why))

@@ -204,7 +204,8 @@ class VlbaSiteMap(radar.SiteMap):
                 self._draw_overlay(im)
             except Exception as e:      # noqa: BLE001 - the overlay is an extra
                 log.warning("map overlay failed for %s/%s: %s", self.slug, self.theme, e)
-                self.overlay_note = "rings and flashes not drawn: %s" % e
+                # the note is published (page, status.json, the map's caption): class only
+                self.overlay_note = "rings and flashes not drawn (%s)" % radar._err_name(e)
                 notes = list(notes) + [self.overlay_note]
         super()._decorate(im, radar_res, notes, tz, road_kinds=road_kinds)
         if self.overlay and not self.overlay_note:

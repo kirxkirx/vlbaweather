@@ -24,7 +24,8 @@ draws in reds instead of the chart's greens (``FLOOD_COLORS``), and any per-even
 override from ``cfg.alert_color_overrides`` (``WEATHER_ALERT_COLORS``).
 
 Nothing here raises on network or data problems: fetch results carry the common status
-keys and bad features are skipped with a log line.
+keys, and a feature that cannot be read is kept as an alert that cannot be placed (counted
+in the feed's ``error``; ``site_alerts`` lists it as ``skipped``), never silently dropped.
 """
 from __future__ import annotations
 
@@ -32,7 +33,7 @@ import logging
 import re
 import time
 from datetime import datetime, timezone
-from typing import Dict, Iterable, List, Optional
+from typing import Dict, Iterable, List, Optional, Tuple
 
 from . import geo, http, util
 
@@ -42,6 +43,14 @@ BASE = "https://api.weather.gov"
 
 ZONE_TTL = 365 * 86400              # zone outlines practically never change
 ZONE_MAX_STALE = 10 * 365 * 86400   # ... so a last-good copy is fine for a decade
+# A zone document without a usable outline is asked for again after a day: some marine zones
+# really have none, but one odd reply must not cost a zone its outline for a year.
+ZONE_NULL_TTL = 86400
+# No polygon of a zone outline is wider or taller than this (degrees of longitude, of
+# latitude). Mainland Alaska, a whole state of some thirty zones, measures about 38 by 20;
+# the largest single zones (northern Alaska, the offshore waters) stay under half of that.
+# A larger polygon is a wrong reply, and would put its warnings over every site.
+ZONE_MAX_SPAN_DEG = (40.0, 25.0)
 # Zone outlines not yet on disk are fetched only while at least this share of the run's
 # network budget is left. A first run during a statewide event (hundreds of zones at ~0.4 s
 # each) would otherwise spend the budget on outlines and leave the forecasts and
@@ -284,6 +293,41 @@ def zone_id_from_url(url: str) -> str:
     return _text(url).rstrip("/").rsplit("/", 1)[-1]
 
 
+# A zone id as NWS writes it (UGC): two letters of the state or marine area, C (county) or Z
+# (zone), three digits. Only such an id is compared with a site's zones or put into a URL.
+ZONE_ID_RE = re.compile(r"^[A-Z]{3}[0-9]{3}\Z")
+_ZONE_URL = re.compile(r"^%s/zones/([a-z]{1,20})/([A-Z]{3}[0-9]{3})/?\Z" % re.escape(BASE))
+
+
+def zone_ref(url) -> Optional[Tuple[str, str]]:
+    """('county', 'NMC027') for 'https://api.weather.gov/zones/county/NMC027'; None for
+    anything that is not the address of a zone on api.weather.gov (another host or scheme,
+    a query, a blank, an id of another form): such an address is never fetched."""
+    m = _ZONE_URL.match(url) if isinstance(url, str) else None
+    return (m.group(1), m.group(2)) if m else None
+
+
+def _zone_ids(urls: Iterable[str]) -> List[str]:
+    """The zone ids a list of ``affectedZones`` addresses names, in order, each once. An
+    address whose last part is not a zone id names no zone."""
+    out: List[str] = []
+    for u in urls:
+        zid = zone_id_from_url(u)
+        if ZONE_ID_RE.match(zid) and zid not in out:
+            out.append(zid)
+    return out
+
+
+def _id_text(*values) -> Optional[str]:
+    """The first of ``values`` that is a non-empty string, else None. The id of an alert is
+    used as a set member and a dict key further on: a list or an object there (seen only in
+    a broken reply) would cost a site its verdict; the pages cope with "no id"."""
+    for v in values:
+        if isinstance(v, str) and v.strip():
+            return v
+    return None
+
+
 def _param_values(params, key: str) -> List[str]:
     """String values of one CAP parameter. The API sends every parameter as a list
     (``"tornadoDamageThreat": ["CATASTROPHIC"]``); a bare string is tolerated too."""
@@ -322,12 +366,22 @@ def alert_threat(params) -> Optional[str]:
 
 
 def _polygon_geometry(g) -> Optional[dict]:
-    """Keep a geometry only if it actually contains polygons; a Point or an empty
-    collection is as useless for shading and point tests as ``null`` and should let the
-    zone fallback kick in."""
-    if isinstance(g, dict) and geo.geometry_bbox(g) is not None:
-        return g
+    """Keep a geometry only if it actually contains polygons the point test can read; a
+    Point or an empty collection is as useless for shading and point tests as ``null`` and
+    should let the zone fallback kick in. So is a polygon with coordinates that are not
+    finite numbers (strings, nulls, a ring nested too deep) or with a ring of fewer than 3
+    points: the alert is then placed by its zone list, never dropped. Never raises."""
+    try:
+        if isinstance(g, dict) and geo.geometry_ok(g) and geo.geometry_bbox(g) is not None:
+            return g
+    except Exception as e:  # noqa: BLE001 — an unreadable shape is no shape
+        log.warning("unreadable geometry (%s): treated as none", type(e).__name__)
     return None
+
+
+def _has_shape(g) -> bool:
+    """Whether a raw geometry claims to be an area (so that dropping it is worth a log line)."""
+    return isinstance(g, dict) and g.get("type") in ("Polygon", "MultiPolygon", "GeometryCollection")
 
 
 def normalize(feature: dict) -> dict:
@@ -340,14 +394,18 @@ def normalize(feature: dict) -> dict:
     event = _text(props.get("event")).strip()
     kind = event_kind(event)
     severity = _text(props.get("severity")) or "Unknown"
-    zone_urls = [u for u in (props.get("affectedZones") or []) if isinstance(u, str) and u]
+    zones = props.get("affectedZones")
+    zone_urls = [u for u in (zones if isinstance(zones, list) else []) if isinstance(u, str) and u]
     geometry = _polygon_geometry(feature.get("geometry"))
+    if geometry is None and _has_shape(feature.get("geometry")):
+        log.warning("%s: its polygon cannot be read; placed by its %d zone(s) instead",
+                    event or "alert", len(zone_urls))
     ends = _text_or_none(props.get("ends"))
     expires = _text_or_none(props.get("expires"))
     params = props.get("parameters")
     headlines = _param_values(params, "NWSheadline")
     return {
-        "id": props.get("id") or feature.get("id"),
+        "id": _id_text(props.get("id"), feature.get("id")),
         "event": event,
         "severity": severity,
         "urgency": _text(props.get("urgency")) or "Unknown",
@@ -372,7 +430,7 @@ def normalize(feature: dict) -> dict:
         "expires": expires,
         "end_dt": util.parse_iso(ends) or util.parse_iso(expires),
         "affected_zone_urls": zone_urls,
-        "affected_zone_ids": [zone_id_from_url(u) for u in zone_urls],
+        "affected_zone_ids": _zone_ids(zone_urls),
         "geometry": geometry,
         "geometry_source": "polygon" if geometry is not None else None,
         "bbox": geo.geometry_bbox(geometry),
@@ -440,14 +498,30 @@ def _area_codes(cfg) -> List[str]:
     return list(codes)
 
 
+def _unread_stub(feature) -> dict:
+    """What is kept of a feature ``normalize`` could not read: its event name when that is
+    a string, and nothing else. Whether it is in effect, and where, is unknown, so it must
+    not vanish: with neither polygon nor zones ``site_alerts`` lists it as "skipped" for
+    every site, and a page that vetoes on that product then knows it has no answer."""
+    props = feature.get("properties") if isinstance(feature, dict) else None
+    event = props.get("event") if isinstance(props, dict) else None
+    # normalize of a feature that holds only the event name cannot fail, and gives every
+    # key of a record (no id, no times, no shape, no zones)
+    rec = normalize({"properties": {"event": event if isinstance(event, str) else ""}})
+    rec.update({"id": None, "message_type": "Alert", "status": "Actual", "unread": True})
+    return rec
+
+
 def fetch_active(cfg, cache) -> dict:
     """Active alerts for the states and territories in ``cfg.alert_area_codes``. ttl 0 = ask
     NWS every run; on failure the last good feed is reused for ``cfg.alerts_max_stale``
     (flagged stale) so a hiccup does not silently blank the alerts banner.
     ``cfg.alert_color_overrides`` (from ``WEATHER_ALERT_COLORS``) replaces the colour of the
-    named events, case-insensitively."""
+    named events, case-insensitively. A feature that cannot be read is counted in
+    ``count_unread`` and in ``error`` (the feed stays ok) and kept as a stub, see
+    ``_unread_stub``."""
     out = {"ok": False, "stale": True, "error": None, "age_s": None,
-           "fetched_ts": None, "alerts": [], "count_raw": 0}
+           "fetched_ts": None, "alerts": [], "count_raw": 0, "count_unread": 0}
     try:
         areas = ",".join(_area_codes(cfg))
         url = "%s/alerts/active?area=%s" % (BASE, areas)
@@ -471,11 +545,14 @@ def fetch_active(cfg, cache) -> dict:
     now = util.utcnow()
     overrides = _color_overrides(cfg)
     kept = []
+    unread = 0
     for f in features:
         try:
             rec = normalize(f)
         except Exception as e:  # noqa: BLE001 — one odd feature must not drop the rest
-            log.warning("skipping malformed alert feature: %s", e)
+            log.warning("malformed alert feature, kept as an alert that cannot be placed: %s", e)
+            unread += 1
+            kept.append(_unread_stub(f))
             continue
         if _is_live(rec, now):
             rec["color"] = overrides.get(rec["event"].lower(), rec["color"])
@@ -484,6 +561,10 @@ def fetch_active(cfg, cache) -> dict:
             log.debug("dropping %s (%s/%s, ends %s)", rec.get("event"), rec.get("status"),
                       rec.get("message_type"), rec.get("ends") or rec.get("expires"))
     out["alerts"] = sort_alerts(kept)
+    if unread:
+        out["count_unread"] = unread
+        text = "%d of %d alert(s) in the feed could not be read" % (unread, len(features))
+        out["error"] = "%s; %s" % (out["error"], text) if out["error"] else text
     log.info("alerts: %d active of %d in feed for %s%s", len(kept), len(features),
              areas, " (STALE: %s)" % out["error"] if out["stale"] else "")
     return out
@@ -503,31 +584,112 @@ def _may_fetch_zones() -> bool:
     return not total or left >= ZONE_BUDGET_KEEP * float(total)
 
 
+def _zone_key(kind: str, zone_id: str) -> str:
+    """Cache key of an outline. Forecast and county ids never collide (NMZ226, NMC003) and
+    keep the key the outlines on disk already have; a fire-weather or marine zone can carry
+    the id of a forecast zone with another shape, so those are kept apart by their kind."""
+    if kind in ("forecast", "county"):
+        return "zone/%s" % zone_id
+    return "zone/%s/%s" % (kind, zone_id)
+
+
+def _valid_zone(d, kind: str, zone_id: str) -> bool:
+    """A zone document that names the zone that was asked for: ``properties.id`` is the id,
+    and where the document gives its own address that address ends in the same id. A reply
+    about another zone (or a cached copy of one) is not this zone's outline. The kind in
+    that address is not compared: the cache key already keeps the kinds apart, and a
+    harmless difference in how NWS spells it must not cost every outline its cache."""
+    if not isinstance(d, dict) or "geometry" not in d:
+        return False
+    props = d.get("properties") if isinstance(d.get("properties"), dict) else {}
+    named = False
+    if props.get("id") is not None:
+        if props.get("id") != zone_id:
+            return False
+        named = True
+    for ref in (d.get("id"), props.get("@id")):
+        said = zone_ref(ref)
+        if said is None:
+            continue
+        if said[1] != zone_id:
+            return False
+        named = True
+    return named
+
+
+def _oversized(geom: dict) -> bool:
+    """Whether a polygon of an outline is larger than any zone is (``ZONE_MAX_SPAN_DEG``)."""
+    for rings in geo.iter_polygons(geom):
+        b = geo.ring_bbox(rings[0])
+        if b is None or b[2] - b[0] > ZONE_MAX_SPAN_DEG[0] or b[3] - b[1] > ZONE_MAX_SPAN_DEG[1]:
+            return True
+    return False
+
+
+def _zone_outline(d: dict, zone_id: str, quiet: bool = False) -> Optional[dict]:
+    """The usable outline in a valid zone document, or None: NWS has none for this zone, it
+    cannot be read, or it is implausibly large."""
+    geom = _polygon_geometry(d.get("geometry"))
+    if geom is None:
+        if not quiet:
+            log.debug("zone %s has no polygon geometry", zone_id)
+        return None
+    if _oversized(geom):
+        if not quiet:
+            log.warning("zone %s: outline larger than any zone (over %g by %g degrees), not used",
+                        zone_id, ZONE_MAX_SPAN_DEG[0], ZONE_MAX_SPAN_DEG[1])
+        return None
+    return geom
+
+
 def _zone_geometry(cfg, cache, zone_id: str, url: str, memo: Dict[str, Optional[dict]],
                    may_fetch: bool = True):
     """Outline of one zone, memoised per run and cached on disk practically forever.
     Returns None when the zone cannot be fetched OR when NWS itself has no outline for
     it (some marine zones): both just mean "nothing to shade for this zone". Returns
     ``_DEFERRED`` (not memoised) when the outline is not on disk and ``may_fetch`` is
-    False."""
-    if zone_id in memo:
-        return memo[zone_id]
-    if not may_fetch and cache.get("zone/%s" % zone_id, ZONE_TTL) is None:
-        return _DEFERRED
+    False.
+
+    ``url`` is what the alert names; only the address of a zone on api.weather.gov is
+    fetched (``zone_ref``), and the reply must name that zone (``_valid_zone``). A document
+    without a usable outline is kept for ``ZONE_NULL_TTL`` only, and a copy on disk that
+    names another zone is fetched again at once."""
+    ref = zone_ref(url)
+    if ref is None or ref[1] != zone_id:
+        log.warning("zone %.20r: not the address of a zone on %s, no outline fetched", zone_id, BASE)
+        return None
+    kind = ref[0]
+    key = _zone_key(kind, zone_id)
+    if key in memo:
+        return memo[key]
+    old, _age = cache.get_any(key)
+    if not _valid_zone(old, kind, zone_id):
+        if not may_fetch:
+            return _DEFERRED
+        # nothing usable on disk: ask (-inf, not 0 or -1: no age, not even that of a copy
+        # stamped ahead of the clock, counts as fresh)
+        ttl = float("-inf")
+    elif _zone_outline(old, zone_id, quiet=True) is None:
+        ttl = ZONE_NULL_TTL
+    else:
+        ttl = ZONE_TTL
+    if not may_fetch:
+        # on disk, though perhaps due again: good enough for a run short of budget
+        geom = memo[key] = _zone_outline(old, zone_id)
+        return geom
     geom = None
     try:
-        res = http.cached_json(cfg, cache, "zone/%s" % zone_id, url, ttl=ZONE_TTL,
+        res = http.cached_json(cfg, cache, key, "%s/zones/%s/%s" % (BASE, kind, zone_id), ttl=ttl,
                                max_stale=ZONE_MAX_STALE,
-                               validate=lambda d: isinstance(d, dict) and "geometry" in d)
-        if res.get("ok") and isinstance(res.get("data"), dict):
-            geom = _polygon_geometry(res["data"].get("geometry"))
-            if geom is None:
-                log.debug("zone %s has no polygon geometry", zone_id)
+                               validate=lambda d: _valid_zone(d, kind, zone_id))
+        if res.get("ok") and _valid_zone(res.get("data"), kind, zone_id):
+            geom = _zone_outline(res["data"], zone_id)
         else:
-            log.warning("zone %s unavailable: %s", zone_id, res.get("error"))
+            log.warning("zone %s unavailable: %s", zone_id,
+                        res.get("error") or "the copy on disk names another zone")
     except Exception as e:  # noqa: BLE001
         log.warning("zone %s lookup crashed: %s", zone_id, e)
-    memo[zone_id] = geom
+    memo[key] = geom
     return geom
 
 
@@ -551,10 +713,13 @@ def resolve_geometries(cfg, cache, alerts: Optional[Iterable[dict]]) -> None:
         geoms = []
         missing = False
         for url in urls:
-            zid = zone_id_from_url(url)
-            if not zid:
+            ref = zone_ref(url)
+            if ref is None:
+                # not a zone of api.weather.gov: never fetched; its id still counts for
+                # the zone match (normalize), so the alert is not lost
+                log.debug("%s: zone address %.60r not used for the outline", a.get("event"), url)
                 continue
-            g = _zone_geometry(cfg, cache, zid, url, memo, _may_fetch_zones())
+            g = _zone_geometry(cfg, cache, ref[1], url, memo, _may_fetch_zones())
             if g is _DEFERRED:
                 missing = True
                 break
@@ -599,32 +764,72 @@ def _site_zone_ids(meta) -> set:
     return ids
 
 
+def _event_name(a: dict) -> Optional[str]:
+    ev = a.get("event")
+    return ev.strip() if isinstance(ev, str) and ev.strip() else None
+
+
+def _listed_zone_ids(a: dict) -> set:
+    """The zone ids an alert lists that have the form of one (``ZONE_ID_RE``)."""
+    ids = a.get("affected_zone_ids")
+    return {z for z in (ids if isinstance(ids, (list, tuple)) else ())
+            if isinstance(z, str) and ZONE_ID_RE.match(z)}
+
+
 def site_alerts(alerts: Optional[Iterable[dict]], site, meta, frame) -> dict:
     """Split ``alerts`` for one site into ``at`` and ``candidates`` (not at, but the
     shape's bbox touches the map frame — the renderer decides "near" from what actually
     lands on pixels). AT means: for a polygon-based alert (``geometry_source ==
     "polygon"``) the site is inside the polygon, and nothing else counts (its
     ``affectedZones`` are every county the polygon touches); for a zone-based alert the
-    site's own forecast/county/fire zone is listed, or the site is inside the outline."""
+    site's own forecast/county/fire zone is listed, or the site is inside the outline.
+
+    ``skipped`` lists the event names (None for an alert without one) of the alerts that
+    could not be classified for this site: neither "at" nor "not at" is known for them. That
+    is an alert without a shape that lists no zone, or one without a shape when the site's
+    own zones are unknown, or one whose test failed and whose zone list does not name the
+    site. A caller that acts on "no alert here" must read this list: a skipped alert is
+    not an absent one. Everything done per alert sits inside one guard, so no alert,
+    however malformed, raises for a site."""
     lon, lat = _site_lonlat(site)
     zone_ids = _site_zone_ids(meta)
     frame_bbox = getattr(frame, "bbox", None) if frame is not None else None
     at: List[dict] = []
     near: List[dict] = []
+    skipped: List[Optional[str]] = []
     for a in alerts or []:
         if not isinstance(a, dict):
             continue
         try:
             here = False
-            if a.get("geometry_source") != "polygon":
-                here = bool(zone_ids.intersection(a.get("affected_zone_ids") or []))
-            if not here and a.get("geometry") is not None:
-                here = geo.point_in_geometry(lon, lat, a.get("geometry"))
+            placed = True
+            # the shapes were checked once, in normalize and resolve_geometries (geometry_ok);
+            # a test that still fails ends in the guard below
+            geometry = a.get("geometry")
+            if a.get("geometry_source") != "polygon" or geometry is None:
+                listed = _listed_zone_ids(a)
+                here = bool(zone_ids.intersection(listed))
+                # no shape: only the zone list can place it, and only with both sides known
+                placed = geometry is not None or bool(listed and zone_ids)
+            if not here and geometry is not None:
+                here = geo.point_in_geometry(lon, lat, geometry)
+            if here:
+                at.append(a)
+            elif not placed:
+                skipped.append(_event_name(a))
+            elif geo.bbox_intersects(a.get("bbox"), frame_bbox):
+                near.append(a)
         except Exception as e:  # noqa: BLE001 — bad coordinates in one alert
-            log.warning("point test failed for %s: %s", a.get("id"), e)
-            here = False
-        if here:
-            at.append(a)
-        elif geo.bbox_intersects(a.get("bbox"), frame_bbox):
-            near.append(a)
-    return {"at": sort_alerts(at), "candidates": sort_alerts(near)}
+            log.warning("alert %.80r could not be tested for this site: %s", a.get("id"), e)
+            try:
+                listed_here = bool(zone_ids.intersection(_listed_zone_ids(a)))
+            except Exception:  # noqa: BLE001 — then nothing places it
+                listed_here = False
+            if listed_here:
+                at.append(a)
+            else:
+                skipped.append(_event_name(a))
+    if skipped:
+        log.warning("%d alert(s) could not be placed for this site: %s", len(skipped),
+                    ", ".join(sorted({e or "unnamed" for e in skipped})))
+    return {"at": sort_alerts(at), "candidates": sort_alerts(near), "skipped": skipped}

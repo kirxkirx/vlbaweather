@@ -19,6 +19,13 @@ Why it looks the way it does:
 * Each run fetches the last ``cfg.glm_window_min`` minutes plus ``WINDOW_OVERLAP_S`` of the
   previous run's window: the newest granules of a window are often not published yet when
   the run lists them, and without the overlap no run would ever fetch them.
+* A satellite's window is complete only when what its bucket publishes covers it: the
+  newest granule ends at most ``cfg.glm_max_lag_s`` before the run, no more than
+  ``MAX_GAP_S`` in a row is missing, the listing is whole, and nothing is listed after the
+  run's own time (a slow host clock). Fetching every listed granule is not enough: a
+  lagging or holed feed would otherwise read "no flash in the last 31 min". The next run
+  starts where the span examined in one piece ended, so minutes published late are
+  examined while their flashes can still count.
 * The downloads (about 185 granules per run with both satellites and the 30-minute window,
   45-75 MB: GOES-19's granules run 300-600 KB, GOES-18's about 200 KB; ~25-30 s measured
   2026-10-14) run in a small thread pool with one deadline
@@ -44,12 +51,12 @@ plus a tenth of a second.
 """
 from __future__ import annotations
 
-import bisect
 import concurrent.futures
 import io
 import logging
 import math
 import re
+import threading
 import time
 import urllib.parse
 import urllib.request
@@ -94,14 +101,56 @@ MAX_CATCHUP_S = 900
 # flashes where their views overlap, a fraction of a second and a few km (parallax) apart.
 SAME_FLASH_S = 1.0
 SAME_FLASH_KM = 20.0
+# At most this many kept detections are compared with a new one: real storms put a few
+# flashes per second within the map radius, so the match is found long before; a crafted
+# granule of thousands of same-second flashes costs N times this, not N squared. A match
+# missed this way counts a flash twice, never zero times.
+SAME_FLASH_SCAN = 64
+# Completeness of a satellite's window, from what its bucket lists. Measured 2026-11-12
+# (two hours and the first 1000 keys of a day per bucket): a granule starts every 20 s, a
+# single one is missing two or three times in a thousand (40 s between starts), and a
+# granule is published 5-75 s after its end, so the newest one listed ends 10-95 s before
+# the listing. Unpublished time between two granules (or between the window's start and the
+# first one) longer than MAX_GAP_S, six granules in a row, is a hole: the satellite's
+# window is incomplete. The lag limit for the newest granule is ``cfg.glm_max_lag_s``.
+MAX_GAP_S = 120
+DEFAULT_MAX_LAG_S = 300
+# A listed granule that starts this long after the run's own time cannot exist yet: the
+# host clock is behind (the listings above end 30-60 s before the reply's Date).
+CLOCK_SLACK_S = 60
+# A listing of one hour holds 180 keys; continuation pages are followed up to this many.
+MAX_LIST_PAGES = 5
+# Caps on what one reply or granule can cost. Real granules are 0.17-0.6 MB (measured
+# 2026-10-14 and 2026-11-12) and hold a few hundred flashes (23 and 556 in the two read on
+# 2026-11-12); a page of 1000 listed keys is 0.4 MB. A run holds about 185 granules.
+MAX_BODY_BYTES = 8 * 1024 * 1024
+READ_CHUNK = 64 * 1024
+READ_GRACE_S = 2.0                  # s a body may take beyond the request timeout
+MAX_FLASHES_PER_GRANULE = 100000
+MAX_FLASHES_PER_RUN = 500000
+# A flash's first event may lie before its granule's start (seen: -1.3 s; the packing of
+# ``flash_time_offset_of_first_event`` reaches back 5 s), never after its end.
+FLASH_EARLY_S = 5.0
 _RESULT_KEYS = ("ok", "stale", "error", "age_s", "window_start", "window_end", "flashes",
                 "sats", "deps", "elapsed_s", "skipped", "partial", "newest", "retry", "seen")
 
 _KEY_START = re.compile(r"_s(\d{13})(\d)?")
+_KEY_CREATED = re.compile(r"_c(\d{13,14})")
 _LIST_KEY = re.compile(r"<Key>([^<]+)</Key>")
-_ISO = re.compile(r"(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2}):(\d{2})(?:\.(\d+))?\s*Z?\s*$")
+_LIST_ROOT = re.compile(r"\s*(?:<\?xml[^<>]{0,200}\?>\s*)?<ListBucketResult[\s>]")
+_LIST_TRUNCATED = re.compile(r"<IsTruncated>\s*true\s*</IsTruncated>", re.IGNORECASE)
+_LIST_TOKEN = re.compile(r"<NextContinuationToken>([^<]{1,2048})</NextContinuationToken>")
+# Anchored at both ends and applied to a stripped string of bounded length (_parse_time):
+# no backtracking over runs of blanks.
+_ISO = re.compile(r"(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2}):(\d{2})(?:\.(\d{1,9}))?Z?$")
 _SINCE = re.compile(r"seconds\s+since\s+(.+)$", re.IGNORECASE)
 _BUCKET_ID = re.compile(r"goes[-_]?(\d+)", re.IGNORECASE)
+_TEXT_MAX = 64                      # characters of a time attribute worth reading
+
+# netCDF4-python releases the GIL around netcdf-c / HDF5 calls, which are not thread-safe
+# as packaged: granules parsed with it go one at a time (the downloads stay parallel).
+# h5py serialises its calls with a lock of its own.
+_NETCDF_LOCK = threading.Lock()
 
 
 class _Deadline(Exception):
@@ -187,35 +236,59 @@ def select_keys(keys: Sequence[Any], window_start: datetime, window_end: datetim
                 stride: int = 1) -> List[str]:
     """The keys whose granule starts within ``[window_start, window_end]``, newest first,
     thinned to every ``stride``-th one (the newest is always kept). Keys without a readable
-    ``_s`` field are skipped, duplicates dropped."""
+    ``_s`` field are skipped, duplicates dropped; of two keys with the same start (a granule
+    published again) only the one with the latest ``_c`` creation stamp is kept, so its
+    flashes are not counted twice."""
     try:
         stride = max(1, int(stride))
     except (TypeError, ValueError):
         stride = 1
-    seen = set()
-    rows = []
+    best: Dict[datetime, str] = {}
     for k in keys or ():
         t = key_start(k)
-        if t is None or k in seen:
+        if t is None or not (window_start <= t <= window_end):
             continue
-        seen.add(k)
-        if window_start <= t <= window_end:
-            rows.append((t, k))
-    rows.sort(key=lambda r: (r[0], r[1]), reverse=True)
+        if t not in best or _newer_copy(k, best[t]):
+            best[t] = k
+    rows = sorted(best.items(), reverse=True)
     return [k for _, k in rows][::stride]
+
+
+def _newer_copy(a: str, b: str) -> bool:
+    """Whether key ``a`` is a later publication of the same granule than key ``b`` (its
+    ``_c`` creation stamp is later; the key itself breaks a tie)."""
+    def rank(k: str) -> Tuple[str, str]:
+        m = _KEY_CREATED.search(k)
+        return (m.group(1) if m else "", k)
+    return rank(a) > rank(b)
+
+
+def _listing_page(body: Any) -> Tuple[List[str], Optional[str]]:
+    """Keys of one page of an S3 ``list-type=2`` answer and its continuation token (None when
+    the listing is complete). ValueError when the body is not a bucket listing (an HTML
+    error page, a truncated download), or says it is truncated without a token."""
+    text = (body or b"").decode("utf-8", "replace") if isinstance(body, (bytes, bytearray)) \
+        else str(body or "")
+    if not _LIST_ROOT.match(text):
+        raise ValueError("not an S3 bucket listing (%d bytes)" % len(text))
+    token = None
+    if _LIST_TRUNCATED.search(text):
+        m = _LIST_TOKEN.search(text)
+        if not m:
+            raise ValueError("S3 listing truncated without a continuation token")
+        token = m.group(1)
+    return _LIST_KEY.findall(text), token
 
 
 def parse_listing(body: bytes) -> List[str]:
     """Keys of an S3 ``list-type=2`` answer. ValueError when the body is not a bucket
-    listing at all (an HTML error page, a truncated download): an empty listing of an
-    hour that has no granules yet is valid and gives []."""
-    text = (body or b"").decode("utf-8", "replace") if isinstance(body, (bytes, bytearray)) \
-        else str(body or "")
-    if "ListBucketResult" not in text:
-        raise ValueError("not an S3 bucket listing (%d bytes)" % len(text))
-    if "<IsTruncated>true</IsTruncated>" in text:
-        log.debug("S3 listing truncated at max-keys; the newest granules may be missing")
-    return _LIST_KEY.findall(text)
+    listing at all (an HTML error page, a truncated download), or is only the first page of
+    a longer one (its newest granules would be missing: S3 lists oldest first). An empty
+    listing of an hour that has no granules yet is valid and gives []."""
+    keys, token = _listing_page(body)
+    if token is not None:
+        raise ValueError("S3 listing truncated after %d keys" % len(keys))
+    return keys
 
 
 def hour_prefixes(window_start: datetime, window_end: datetime) -> List[str]:
@@ -233,10 +306,52 @@ def hour_prefixes(window_start: datetime, window_end: datetime) -> List[str]:
 # ---- transport ---------------------------------------------------------------------------
 def _get(url: str, cfg, timeout: float) -> bytes:
     """One anonymous GET (the listing and the granules alike). The only place in this
-    module that touches the network; the tests replace it."""
+    module that touches the network; the tests replace it. ``timeout`` bounds each socket
+    operation, not a reply fed a byte at a time, so the request runs in a daemon thread the
+    worker waits for until ``timeout`` plus ``READ_GRACE_S``: a status line and headers sent
+    a byte at a time cannot hold the worker, nor the interpreter at exit (it waits for the
+    pool's workers, never for a daemon thread). The body is read in chunks against the same
+    limit and refused beyond ``MAX_BODY_BYTES``, so no reply fills the memory."""
+    limit = float(timeout) + READ_GRACE_S
+    stop = time.monotonic() + limit
+    box: Dict[str, Any] = {}
+
+    def work() -> None:
+        try:
+            box["body"] = _get_body(url, cfg, timeout, stop)
+        except BaseException as e:  # noqa: BLE001 - handed to the worker as it is
+            box["error"] = e
+    th = threading.Thread(target=work, name="glm-get", daemon=True)
+    th.start()
+    th.join(limit + 1.0)            # the body loop stops itself at ``stop``; this is the headers'
+    if "error" in box:
+        raise box["error"]
+    if "body" not in box:
+        raise TimeoutError("reply not complete after %.0f s" % limit)
+    return box["body"]
+
+
+def _get_body(url: str, cfg, timeout: float, stop: float) -> bytes:
     req = urllib.request.Request(url, headers={"User-Agent": cfg.user_agent})
     with urllib.request.urlopen(req, timeout=timeout) as r:
-        return r.read()
+        headers = getattr(r, "headers", None)
+        length = headers.get("Content-Length") if headers is not None else None
+        if length and length.strip().isdigit() and int(length) > MAX_BODY_BYTES:
+            raise ValueError("reply of %d bytes refused (cap %d MB)" % (int(length), MAX_BODY_BYTES >> 20))
+        read = getattr(r, "read1", None) or r.read      # read1: whatever has arrived
+        parts: List[bytes] = []
+        size = 0
+        while True:
+            chunk = read(READ_CHUNK)
+            if not chunk:
+                break
+            size += len(chunk)
+            if size > MAX_BODY_BYTES:
+                raise ValueError("reply larger than %d MB refused" % (MAX_BODY_BYTES >> 20))
+            parts.append(chunk)
+            if time.monotonic() > stop:
+                raise TimeoutError("reply not complete after %.0f s" % (float(timeout) + READ_GRACE_S))
+    return b"".join(parts)
 
 
 def _errtext(e: BaseException) -> str:
@@ -257,17 +372,56 @@ def _request_timeout(cfg, deadline_at: float) -> float:
 
 
 def _list_bucket(bucket: str, prefixes: Sequence[str], cfg, deadline_at: float) -> List[str]:
+    """Every key under ``prefixes``, continuation pages followed (``MAX_LIST_PAGES`` per
+    prefix; a listing still truncated after them raises ValueError: its newest keys would
+    be missing)."""
     keys: List[str] = []
     for prefix in prefixes:
-        url = "https://%s.s3.amazonaws.com/?list-type=2&max-keys=1000&prefix=%s" % (
+        base = "https://%s.s3.amazonaws.com/?list-type=2&max-keys=1000&prefix=%s" % (
             bucket, urllib.parse.quote(prefix, safe="/"))
-        keys.extend(parse_listing(_get(url, cfg, _request_timeout(cfg, deadline_at))))
+        url = base
+        for _ in range(MAX_LIST_PAGES):
+            page, token = _listing_page(_get(url, cfg, _request_timeout(cfg, deadline_at)))
+            keys.extend(page)
+            if token is None:
+                break
+            url = base + "&continuation-token=" + urllib.parse.quote(token, safe="")
+        else:
+            raise ValueError("S3 listing still truncated after %d pages (%d keys)" % (MAX_LIST_PAGES, len(keys)))
     return keys
 
 
 def _fetch_granule(bucket: str, key: str, cfg, deadline_at: float) -> dict:
     url = "https://%s.s3.amazonaws.com/%s" % (bucket, urllib.parse.quote(key, safe="/"))
     return parse_granule(_get(url, cfg, _request_timeout(cfg, deadline_at)))
+
+
+class _FlashBudget:
+    """The flashes a run may still hold, shared by the download workers. The parsed granules
+    wait in their futures until every download is in, so the cap of the run is applied
+    where they are parsed: a granule past it keeps only what is left (``capped`` set), and
+    no more than ``MAX_FLASHES_PER_RUN`` flashes are ever held, however many granules a
+    broken or hostile bucket fills to ``MAX_FLASHES_PER_GRANULE``."""
+
+    def __init__(self, n: int):
+        self.left = max(0, int(n))
+        self.lock = threading.Lock()
+
+    def take(self, n: int) -> int:
+        with self.lock:
+            k = min(max(0, int(n)), self.left)
+            self.left -= k
+            return k
+
+
+def _fetch_within(budget: _FlashBudget, bucket: str, key: str, cfg, deadline_at: float) -> dict:
+    """``_fetch_granule`` within the run's flash budget."""
+    g = _fetch_granule(bucket, key, cfg, deadline_at)
+    n = len(g.get("lats") or ())
+    k = budget.take(n)
+    if k < n:
+        g = dict(g, lats=list(g["lats"][:k]), lons=list(g["lons"][:k]), times=list(g["times"][:k]), capped=True)
+    return g
 
 
 # ---- granule parsing (in RAM) ------------------------------------------------------------
@@ -297,10 +451,14 @@ def _scalar(v: Any) -> Optional[float]:
 
 def _parse_time(s: Optional[str]) -> Optional[datetime]:
     """``2026-10-08T15:40:20.0Z`` / ``2026-10-08 15:40:20.000`` -> aware UTC datetime
-    (``datetime.fromisoformat`` of Python 3.9 rejects a one-digit fraction)."""
-    if not s:
+    (``datetime.fromisoformat`` of Python 3.9 rejects a one-digit fraction). A string
+    longer than any such time is no time (and never reaches the pattern)."""
+    if not s or len(s) > 4 * _TEXT_MAX:
         return None
-    m = _ISO.match(s.strip())
+    s = s.strip()
+    if len(s) > _TEXT_MAX:
+        return None
+    m = _ISO.match(s)
     if not m:
         return None
     frac = (m.group(7) or "0")[:6].ljust(6, "0")
@@ -313,7 +471,7 @@ def _parse_time(s: Optional[str]) -> Optional[datetime]:
 
 def _epoch_of(units: Optional[str]) -> Optional[datetime]:
     """The epoch of a ``seconds since <time>`` units attribute."""
-    if not units:
+    if not units or len(units) > 4 * _TEXT_MAX:
         return None
     m = _SINCE.search(units.strip())
     return _parse_time(m.group(1)) if m else None
@@ -339,16 +497,45 @@ def _unpack(raw: Any, attrs: Any) -> Any:
     return out
 
 
+def _check_shapes(shapes: Sequence[Tuple[str, Any]]) -> None:
+    """Refuse flash variables that are not one-dimensional, differ in length or hold more
+    than ``MAX_FLASHES_PER_GRANULE`` flashes, from their declared shapes, before anything is
+    read: a dataset that was declared huge and never written reads back as millions of fill
+    values from a file of a few KB."""
+    n = None
+    for name, shape in shapes:
+        shape = tuple(shape)
+        if len(shape) != 1:
+            raise ValueError("%s is not one-dimensional (shape %s)" % (name, shape))
+        if shape[0] > MAX_FLASHES_PER_GRANULE:
+            raise ValueError("%s declares %d flashes (cap %d)" % (name, shape[0], MAX_FLASHES_PER_GRANULE))
+        if n is not None and shape[0] != n:
+            raise ValueError("the flash variables differ in length (%d vs %d)" % (n, shape[0]))
+        n = shape[0]
+
+
+def _flash_vars(present: Sequence[str], sat: Optional[str], start: Optional[datetime]) -> bool:
+    """Whether the granule has the flash variables. A granule without both is "no flashes"
+    when it carries the GLM file attributes, and not a granule at all otherwise; one with only
+    one of them is broken."""
+    has = [name in present for name in ("flash_lat", "flash_lon")]
+    if all(has):
+        return True
+    if any(has):
+        raise ValueError("only one of flash_lat / flash_lon present")
+    if sat is None and start is None:
+        raise ValueError("no flash_lat / flash_lon variables")
+    return False
+
+
 def _read_h5(buf: bytes) -> Tuple[Optional[str], Optional[datetime], Any, Any, Any, Optional[str]]:
     with h5py.File(io.BytesIO(buf), "r") as f:
         sat = _text(f.attrs.get("platform_ID"))
         start = _parse_time(_text(f.attrs.get("time_coverage_start")))
-        if "flash_lat" not in f or "flash_lon" not in f:
-            # A granule without the flash variables is "no flashes" when it carries the
-            # GLM file attributes, and not a granule at all otherwise.
-            if sat is None and start is None:
-                raise ValueError("no flash_lat / flash_lon variables")
+        if not _flash_vars([k for k in ("flash_lat", "flash_lon") if k in f], sat, start):
             return sat, start, np.zeros(0), np.zeros(0), None, None
+        names = [k for k in ("flash_lat", "flash_lon", "flash_time_offset_of_first_event") if k in f]
+        _check_shapes([(k, f[k].shape) for k in names])
         lats = _unpack(f["flash_lat"][()], f["flash_lat"].attrs)
         lons = _unpack(f["flash_lon"][()], f["flash_lon"].attrs)
         offs = units = None
@@ -361,24 +548,26 @@ def _read_h5(buf: bytes) -> Tuple[Optional[str], Optional[datetime], Any, Any, A
 
 def _read_netcdf(buf: bytes) -> Tuple[Optional[str], Optional[datetime], Any, Any, Any, Optional[str]]:
     """The same with netCDF4, which unpacks ``scale_factor`` / ``add_offset`` /
-    ``_Unsigned`` itself (auto mask-and-scale) and masks fill values."""
-    ds = netCDF4.Dataset("inmem.nc", mode="r", memory=buf)
-    try:
-        sat = _text(getattr(ds, "platform_ID", None))
-        start = _parse_time(_text(getattr(ds, "time_coverage_start", None)))
-        v = ds.variables
-        if "flash_lat" not in v or "flash_lon" not in v:
-            if sat is None and start is None:
-                raise ValueError("no flash_lat / flash_lon variables")
-            return sat, start, np.zeros(0), np.zeros(0), None, None
-        lats = _unpack(v["flash_lat"][:], {})
-        lons = _unpack(v["flash_lon"][:], {})
-        offs = units = None
-        if "flash_time_offset_of_first_event" in v:
-            offs = _unpack(v["flash_time_offset_of_first_event"][:], {})
-            units = _text(getattr(v["flash_time_offset_of_first_event"], "units", None))
-    finally:
-        ds.close()
+    ``_Unsigned`` itself (auto mask-and-scale) and masks fill values. One granule at a
+    time (``_NETCDF_LOCK``)."""
+    with _NETCDF_LOCK:
+        ds = netCDF4.Dataset("inmem.nc", mode="r", memory=buf)
+        try:
+            sat = _text(getattr(ds, "platform_ID", None))
+            start = _parse_time(_text(getattr(ds, "time_coverage_start", None)))
+            v = ds.variables
+            if not _flash_vars([k for k in ("flash_lat", "flash_lon") if k in v], sat, start):
+                return sat, start, np.zeros(0), np.zeros(0), None, None
+            names = [k for k in ("flash_lat", "flash_lon", "flash_time_offset_of_first_event") if k in v]
+            _check_shapes([(k, v[k].shape) for k in names])
+            lats = _unpack(v["flash_lat"][:], {})
+            lons = _unpack(v["flash_lon"][:], {})
+            offs = units = None
+            if "flash_time_offset_of_first_event" in v:
+                offs = _unpack(v["flash_time_offset_of_first_event"][:], {})
+                units = _text(getattr(v["flash_time_offset_of_first_event"], "units", None))
+        finally:
+            ds.close()
     return sat, start, lats, lons, offs, units
 
 
@@ -388,8 +577,14 @@ def _assemble(sat, start, lats, lons, offs, units) -> dict:
     if lats.shape != lons.shape:
         raise ValueError("flash_lat and flash_lon differ in length (%d vs %d)"
                          % (lats.size, lons.size))
-    good = (np.isfinite(lats) & np.isfinite(lons) & (np.abs(lats) <= 90.0)
-            & (np.abs(lons) <= 180.0))
+    good = np.isfinite(lats) & np.isfinite(lons)
+    # A finite position out of range is another convention (longitudes 0..360) or a broken
+    # file, not a fill value: nothing in it can be placed with confidence. Non-finite ones
+    # (masked fill values) are dropped, unless no flash is left.
+    if (good & ((np.abs(lats) > 90.0) | (np.abs(lons) > 180.0))).any():
+        raise ValueError("flash positions out of range (latitude beyond 90 or longitude beyond 180 deg)")
+    if lats.size and not good.any():
+        raise ValueError("none of the %d flash positions is readable" % lats.size)
     epoch = _epoch_of(units) or start
     times: List[Optional[datetime]] = []
     if offs is not None and epoch is not None:
@@ -410,8 +605,11 @@ def parse_granule(buf: bytes) -> dict:
     """A GLM-L2-LCFA granule's bytes -> ``{"sat": "G18"|None, "start": aware UTC datetime
     |None, "lats": [float], "lons": [float], "times": [aware datetime|None]}`` (one entry
     per flash; a flash's time is the granule start plus ``flash_time_offset_of_first_event``,
-    the start alone when the offset is missing). Flashes with a non-finite or out-of-range
-    position are dropped. ValueError when the bytes are not a GLM granule, or when the
+    the start alone when the offset is missing). Flashes with a non-finite position (a fill
+    value) are dropped. ValueError when the bytes are not a GLM granule, when only one of
+    ``flash_lat`` / ``flash_lon`` is present, when a flash variable is not one-dimensional,
+    the variables differ in length or declare more than ``MAX_FLASHES_PER_GRANULE``
+    flashes, when a finite position is out of range or none is readable, or when the
     parsing libraries are missing; ``fetch`` catches it per granule."""
     if not isinstance(buf, (bytes, bytearray, memoryview)):
         raise ValueError("granule must be bytes, not %s" % type(buf).__name__)
@@ -547,6 +745,56 @@ def _pending(retried: Any) -> Dict[str, List[float]]:
     return {str(k): sorted(_retry_set(retried, k)) for k in retried if _retry_set(retried, k)}
 
 
+def _max_lag_s(cfg) -> float:
+    """``cfg.glm_max_lag_s``: how long before the run the newest granule of a complete
+    window may end."""
+    try:
+        v = float(cfg.glm_max_lag_s)
+    except (TypeError, ValueError, AttributeError):
+        return float(DEFAULT_MAX_LAG_S)
+    return v if math.isfinite(v) and v > 0 else float(DEFAULT_MAX_LAG_S)
+
+
+def _span_words(seconds: float) -> str:
+    """``95`` -> ``"95 s"``, ``1500`` -> ``"25 min"``."""
+    return "%.0f s" % seconds if seconds < 90 else "%.0f min" % (seconds / 60.0)
+
+
+def _hhmm(ts: float) -> str:
+    return datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%H:%M")
+
+
+def _coverage(starts: Sequence[float], lo: float, end: float,
+              max_lag: float) -> Tuple[List[str], Optional[float], Optional[float]]:
+    """How the granules a bucket publishes for one satellite (``starts``: their start
+    times, epoch s) cover its window ``[lo, end]``: (what is missing, in plain words; the
+    start of the newest granule reached from ``lo`` without a hole; the end of that span,
+    at most ``end``). A hole is more than ``MAX_GAP_S`` of unpublished time between two
+    granules or before the first; a lag is a newest granule that ends more than
+    ``max_lag`` before ``end``. ([], None, None) when nothing starts in the window (the
+    caller says so in its own words)."""
+    ts = sorted({float(s) for s in starts if lo <= s <= end})
+    if not ts:
+        return [], None, None
+    problems = []
+    holes = []
+    reached = None
+    covered_to = lo
+    for s in ts:
+        if s - covered_to > MAX_GAP_S:
+            holes.append((covered_to, s))
+        elif not holes:
+            reached = s
+        covered_to = max(covered_to, s + GRANULE_S)
+    if holes:
+        problems.append("%s of the window not published (from %s UTC)"
+                        % (_span_words(sum(b - a for a, b in holes)), _hhmm(holes[0][0])))
+    lag = end - (ts[-1] + GRANULE_S)
+    if lag > max_lag:
+        problems.append("newest granule %s old" % _span_words(lag))
+    return problems, reached, (min(end, reached + GRANULE_S) if reached is not None else None)
+
+
 def _fetch(cfg, now: Optional[datetime], since: Any = None, retried: Any = None, seen: Any = None) -> dict:
     res = _base_result(cfg, now)
     satellites = _satellites(cfg)
@@ -575,11 +823,15 @@ def _fetch(cfg, now: Optional[datetime], since: Any = None, retried: Any = None,
     for sid, bucket, sub_lon in satellites:
         sats[sid] = _sat_entry(bucket, sub_lon)
         order.append(sid)
-        # just after the newest granule the last run examined, when that is older than the
-        # usual window (a late or a missed run): nothing in between goes unexamined
+        # just after the newest granule the last run examined in one piece, when that is
+        # older than the usual window (a late or a missed run, a feed that lagged or had a
+        # hole then): nothing in between goes unexamined. Without that marker (a first run,
+        # a lost state file) the whole reach: flashes up to the hold old still count.
         lo[sid] = res["window_start"]
         t = _since(since, sid)
-        if t is not None and t < lo[sid]:
+        if t is None:
+            lo[sid] = min(lo[sid], reach)
+        elif t < lo[sid]:
             lo[sid] = max(t + timedelta(milliseconds=100), min(lo[sid], reach))
         # no granule starts in the future or before 1970: junk (a hand edit) is dropped
         again[sid] = {x for x in _retry_set(retried, sid) if 0 < x <= end.timestamp() + 3600}
@@ -589,9 +841,9 @@ def _fetch(cfg, now: Optional[datetime], since: Any = None, retried: Any = None,
         given_up[sid] = len({x for x in old if x > past_hold})
     starts = [lo[sid] for sid in order] + [datetime.fromtimestamp(min(again[sid]), tz=timezone.utc)
                                            for sid in order if again[sid]]
-    # the window the page names is the span every satellite examined in one piece; a granule
-    # fetched again from before it adds no minutes to it
-    res["window_start"] = min(lo.values()) if lo else res["window_start"]
+    # the window the page names is the span every satellite examined in one piece (the
+    # latest of their starts); a granule fetched again from before it adds no minutes to it
+    res["window_start"] = max(lo.values()) if lo else res["window_start"]
     prefixes = hour_prefixes(min(starts) if starts else res["window_start"], end)
     res["sats"] = sats
 
@@ -624,6 +876,9 @@ def _fetch(cfg, now: Optional[datetime], since: Any = None, retried: Any = None,
         tasks: List[Tuple[str, str, bool, Any]] = []
         selected: Dict[str, List[str]] = {}
         retry_keys: Dict[str, List[str]] = {}
+        gaps: Dict[str, List[str]] = {}         # why a listed satellite's window is incomplete
+        marker: Dict[str, Optional[float]] = {}     # newest granule reached without a hole
+        max_lag = _max_lag_s(cfg)
         for sid in order:
             if sid not in keys:
                 # not listed: what was to be fetched again, and what was examined, stays so
@@ -634,11 +889,16 @@ def _fetch(cfg, now: Optional[datetime], since: Any = None, retried: Any = None,
                 continue
             sats[sid]["listed"] = len(keys[sid])
             selected[sid] = select_keys(keys[sid], lo[sid], end, getattr(cfg, "glm_stride", 1))
-            by_start = {}
+            by_start: Dict[float, str] = {}
+            listed_starts = []
             for k in keys[sid]:
                 t = key_start(k)
-                if t is not None and round(t.timestamp(), 1) in again[sid]:
-                    by_start.setdefault(round(t.timestamp(), 1), k)
+                if t is None:
+                    continue
+                listed_starts.append(t.timestamp())
+                x = round(t.timestamp(), 1)
+                if x in again[sid] and (x not in by_start or _newer_copy(k, by_start[x])):
+                    by_start[x] = k
             retry_keys[sid] = sorted(by_start.values(), key=lambda k: key_start(k), reverse=True)
             given_up[sid] += sum(1 for x in again[sid] if x not in by_start and x > past_hold)    # gone
             first = set(retry_keys[sid])
@@ -646,15 +906,31 @@ def _fetch(cfg, now: Optional[datetime], since: Any = None, retried: Any = None,
             sats[sid]["selected"] = len(selected[sid]) + len(retry_keys[sid])
             if not sats[sid]["selected"]:
                 sats[sid]["error"] = "no granules in the window (%d listed)" % len(keys[sid])
+            # does what the bucket publishes cover the window? (the granules the last run
+            # examined count, whether listed now or not)
+            gaps[sid], marker[sid], span_end = _coverage(
+                listed_starts + sorted(examined[sid]), lo[sid].timestamp(), end.timestamp(), max_lag)
+            sats[sid]["span_start"] = lo[sid].timestamp()
+            sats[sid]["span_end"] = span_end
+            ahead = max(listed_starts, default=0.0) - end.timestamp()
+            if ahead > CLOCK_SLACK_S:
+                # a granule that starts after the run's own time cannot have been published:
+                # the host clock is behind, and every window it computes lies in the past
+                gaps[sid].insert(0, "granules listed up to %s after this run's time: the host clock is "
+                                    "behind" % _span_words(ahead))
+                log.error("GLM %s: the bucket lists granules up to %.0f s after the host's time: "
+                          "the host clock is behind; check its time synchronisation (NTP)", sid, ahead)
+        budget = _FlashBudget(MAX_FLASHES_PER_RUN)
         for group, is_retry in ((retry_keys, True), (selected, False)):
             for i in range(max((len(v) for v in group.values()), default=0)):
                 for sid in order:
                     if sid in group and i < len(group[sid]):
                         key = group[sid][i]
-                        tasks.append((sid, key, is_retry, pool.submit(_fetch_granule, sats[sid]["bucket"], key,
-                                                                      cfg, deadline_at)))
+                        tasks.append((sid, key, is_retry, pool.submit(_fetch_within, budget, sats[sid]["bucket"],
+                                                                      key, cfg, deadline_at)))
         done, _ = _wait([t[3] for t in tasks], deadline_at)
         first_error: Dict[str, str] = {}
+        capped: Dict[str, bool] = {}
         for sid, key, is_retry, fut in tasks:
             entry = sats[sid]
             sent = True
@@ -666,6 +942,7 @@ def _fetch(cfg, now: Optional[datetime], since: Any = None, retried: Any = None,
                     g = fut.result()
                     err = None
                 except _Deadline:
+                    sent = False                # started after the deadline: never asked for
                     err = "deadline reached"
                 except Exception as e:  # noqa: BLE001 - one bad granule never ends the run
                     err = _errtext(e)
@@ -684,32 +961,50 @@ def _fetch(cfg, now: Optional[datetime], since: Any = None, retried: Any = None,
                 entry["failed"] += 1
                 first_error.setdefault(sid, err)
                 if is_retry and sent:
-                    entry["dropped"] = entry.get("dropped", 0) + 1      # its second failure
-                    res["seen"].setdefault(sid, set()).add(ts)
+                    # its second failure: not tried again, and not "seen" either, so that a
+                    # run whose window still holds it and fails it again is incomplete too
+                    entry["dropped"] = entry.get("dropped", 0) + 1
                 elif ts is not None:
                     res["retry"].setdefault(sid, []).append(ts)
                 continue
             entry["fetched"] += 1
             if ts is not None:
                 res["seen"].setdefault(sid, set()).add(ts)
-            fallback = g.get("start") or started or res["window_end"]
+            fallback = started or g.get("start") or res["window_end"]
             if g.get("sat") and not sid.startswith(g["sat"]):
                 log.debug("GLM %s: granule %s says platform %s", sid, key, g["sat"])
-            n = 0
+            n = moved = 0
+            if g.get("capped"):
+                capped[sid] = True
             for lat, lon, t in zip(g["lats"], g["lons"], g["times"]):
-                res["flashes"].append({"lat": lat, "lon": lon, "sat": sid, "t": t or fallback})
+                if len(res["flashes"]) >= MAX_FLASHES_PER_RUN:
+                    capped[sid] = True
+                    break
+                t = t if isinstance(t, datetime) else fallback
+                if started is not None and not (started - timedelta(seconds=FLASH_EARLY_S) <= t
+                                                <= started + timedelta(seconds=GRANULE_S + 1)):
+                    # the file's own epoch disagrees with its key: the flash happened within
+                    # the granule all the same; its end is the latest it can have been, so
+                    # the hold that runs from it never ends early
+                    t = started + timedelta(seconds=GRANULE_S)
+                    moved += 1
+                res["flashes"].append({"lat": lat, "lon": lon, "sat": sid, "t": t})
                 n += 1
+            if moved:
+                log.warning("GLM %s: %d flash time(s) of %s outside the granule's own 20 s; dated by its key",
+                            sid, moved, key.rsplit("/", 1)[-1])
             entry["flashes"] += n
     finally:
         pool.shutdown(wait=False, cancel_futures=True)
     res["seen"] = {sid: sorted(v) for sid, v in res["seen"].items()}
-    # the marker moves to the newest granule of the window: every one up to it was examined,
-    # is to be fetched again (``retry``) or was given up (the run is partial then)
+    # the marker moves to the newest granule of the window reached without a hole in what
+    # the bucket publishes: every one up to it was examined, is to be fetched again
+    # (``retry``) or was given up (the run is partial then). Behind a hole, or the minutes
+    # not published yet, the next run starts there and fetches what was published late.
     for sid in order:
-        newest = [key_start(k) for k in selected.get(sid, [])]
-        newest = [t.timestamp() for t in newest if t is not None]
-        if newest and max(newest) > (res["newest"].get(sid) or 0.0):
-            res["newest"][sid] = max(newest)
+        newest = marker.get(sid)
+        if newest is not None and newest > (res["newest"].get(sid) or 0.0):
+            res["newest"][sid] = newest
 
     # 3. the verdict on the run
     problems = []
@@ -724,6 +1019,11 @@ def _fetch(cfg, now: Optional[datetime], since: Any = None, retried: Any = None,
                 entry["failed"], entry["selected"] + given_up[sid], first_error.get(sid, "?"),
                 "; %d of them for the second run in a row, not tried again" % entry["dropped"]
                 if entry.get("dropped") else "")
+        extra = list(gaps.get(sid) or [])
+        if capped.get(sid):
+            extra.append("more than %d flashes this run: the rest not read" % MAX_FLASHES_PER_RUN)
+        if extra:
+            entry["error"] = "; ".join(([entry["error"]] if entry["error"] else []) + extra)
         entry["ok"] = entry["error"] is None and entry["fetched"] > 0
         if not entry["ok"]:
             problems.append("%s: %s" % (sid, entry["error"] or "nothing fetched"))
@@ -759,17 +1059,27 @@ def fetch(cfg, now: Optional[datetime] = None, since: Any = None, retried: Any =
          "flashes": [{"lat", "lon", "sat": "G19", "t": aware datetime}, ...],
          "sats": {"G19": {"bucket", "sub_lon", "ok", "error", "listed", "selected",
                           "fetched", "failed", "flashes", ["dropped"], ["refetch_failed"],
-                          ["past_hold_failed"]},
+                          ["past_hold_failed"], ["span_start", "span_end": the span the
+                          satellite's published granules cover in one piece, epoch s; the
+                          end None when nothing does]},
                   ...},
          "deps": bool, "elapsed_s": float, "skipped": str|None, "partial": bool,
-         "newest": {satellite id: start of the newest granule of the window, epoch s}
-                   (carried over from ``since`` for a satellite not listed),
+         "newest": {satellite id: start of the newest granule of the window reached without
+                   a hole, epoch s} (carried over from ``since`` for a satellite not listed or
+                   with a hole at the start of its window),
          "retry": {satellite id: [starts of the granules to fetch again, epoch s]},
-         "seen": {satellite id: [starts of the granules examined or given up, epoch s]}}
+         "seen": {satellite id: [starts of the granules examined, epoch s]}}
 
     ``ok`` when at least one satellite was listed and gave at least one parsed granule;
     ``partial`` when any satellite failed (listing, no granules, a granule that did not
-    arrive or parse), with ``error`` naming what failed even when ``ok``. Nothing is
+    arrive or parse) or its window is incomplete (the newest granule ends more than
+    ``cfg.glm_max_lag_s`` before the run, more than ``MAX_GAP_S`` in a row not published,
+    a listing still truncated after ``MAX_LIST_PAGES`` pages, granules listed after the
+    run's time, more than ``MAX_FLASHES_PER_RUN`` flashes), with ``error`` naming what
+    failed even when ``ok``; such a satellite is not ``ok``. Without a ``since`` for a
+    satellite (a first run, a lost state file) its window reaches back ``max_catchup_s``.
+    A flash dated outside its granule's own 20 s (by the file's epoch) takes the
+    granule's end. Nothing is
     attempted (``skipped`` says why, ``error`` repeats it) when the layer is disabled, no
     satellite is configured, the parsing libraries are missing or the run budget is below
     10 s. The listing covers the current hour and, when the window crosses it, the previous
@@ -816,32 +1126,48 @@ def _one_per_flash(rows: List[tuple]) -> List[tuple]:
     other satellite). The nearest detection is always kept, so the count is at least 1
     whenever any detection lies in the ring; two real flashes close in time and place, each
     seen by one satellite only, can still be counted once (the accepted price of matching by
-    proximity). A detection without a time is always kept. The result is in distance order."""
+    proximity). A detection without a time is always kept. The result is in distance order.
+
+    The kept detections are filed per satellite in one-second buckets of time, and at most
+    ``SAME_FLASH_SCAN`` of the other satellites' candidates are looked at per detection: the
+    cost is linear in the rows, however many detections share a second (a match missed that
+    way counts a flash twice, never zero times). Of the candidates that match, the earliest
+    absorbs the detection."""
     kept: List[tuple] = []
+    times: List[float] = []                     # per kept detection: its time (or nan)
     absorbed: List[set] = []                    # per kept detection: satellites it absorbed
-    times: List[float] = []                     # kept detections with a time, sorted ...
-    where: List[int] = []                       # ... and their places in ``kept``
+    filed: Dict[Tuple[Any, int], List[int]] = {}    # (satellite, second) -> places in ``kept``
+    sats: List[Any] = []
     for r in sorted(rows, key=lambda row: row[0]):
         t = r[3].timestamp() if isinstance(r[3], datetime) else None
+        if t is not None and not math.isfinite(t):
+            t = None
+        if r[4] not in sats:
+            sats.append(r[4])
         if t is not None:
-            i = bisect.bisect_left(times, t - SAME_FLASH_S)
+            sec = int(math.floor(t / SAME_FLASH_S))
             match = None
-            while i < len(times) and times[i] <= t + SAME_FLASH_S:
-                k = where[i]
-                if kept[k][4] != r[4] and r[4] not in absorbed[k] \
-                        and geo.haversine_km(r[1], r[2], kept[k][1], kept[k][2]) <= SAME_FLASH_KM:
-                    match = k
-                    break
-                i += 1
+            scanned = 0
+            for other in sats:
+                if other == r[4]:
+                    continue
+                for b in (sec - 1, sec, sec + 1):
+                    for k in filed.get((other, b), ()):
+                        if scanned >= SAME_FLASH_SCAN:
+                            break
+                        scanned += 1
+                        if r[4] not in absorbed[k] and abs(times[k] - t) <= SAME_FLASH_S \
+                                and (match is None or times[k] < times[match]) \
+                                and geo.haversine_km(r[1], r[2], kept[k][1], kept[k][2]) <= SAME_FLASH_KM:
+                            match = k
             if match is not None:
                 absorbed[match].add(r[4])
                 continue
         kept.append(r)
+        times.append(t if t is not None else math.nan)
         absorbed.append(set())
         if t is not None:
-            j = bisect.bisect(times, t)
-            times.insert(j, t)
-            where.insert(j, len(kept) - 1)
+            filed.setdefault((r[4], int(math.floor(t / SAME_FLASH_S))), []).append(len(kept) - 1)
     return kept
 
 
@@ -853,7 +1179,27 @@ def _empty_view(cfg) -> dict:
     return {"covered": False, "sats": [], "available": False, "partial": False, "error": None,
             "count_window": 0, "count_by_sat": {}, "last_in_ring_t": None, "nearest_km": None,
             "nearest_bearing": None, "nearest_t": None, "nearest_sat": None, "flashes_on_map": [],
-            "window_min": window_min}
+            "window_min": window_min, "span_start": None, "span_end": None, "window_end": None}
+
+
+def _span(sats: dict, sids: Sequence[str]) -> Optional[Tuple[datetime, datetime]]:
+    """(start, end) of the span all of ``sids`` examined: the latest of their ``span_start``
+    and the earliest of their ``span_end`` (epoch s, as ``fetch`` gives them), or None when
+    one of them does not say (a result of an older version) or none is given."""
+    starts, ends = [], []
+    for sid in sids:
+        a, b = _finite(sats[sid].get("span_start")), _finite(sats[sid].get("span_end"))
+        if a is None or b is None:
+            return None
+        starts.append(a)
+        ends.append(b)
+    if not starts or max(starts) >= min(ends):
+        return None
+    try:
+        return (datetime.fromtimestamp(max(starts), tz=timezone.utc),
+                datetime.fromtimestamp(min(ends), tz=timezone.utc))
+    except (OverflowError, OSError, ValueError):
+        return None
 
 
 def _site_view(out: dict, res: Any, site: dict, cfg, map_radius_km: float) -> dict:
@@ -886,7 +1232,11 @@ def _site_view(out: dict, res: Any, site: dict, cfg, map_radius_km: float) -> di
         else:
             problems.append("%s: %s" % (sid, entry.get("error") or "nothing fetched"))
     # Every covering satellite sees the whole site, so one satellite's complete window is a
-    # complete answer; the others' problems only make the view partial.
+    # complete answer; the others' problems only make the view partial. No margin inside
+    # cfg.glm_max_arc_deg for this: the closest case, Brewster from GOES-East, lies 61.56 deg
+    # out and its 50-km ring reaches 62.01, while GLM records flashes at 61 deg (GOES-18,
+    # 2026-11-12) and nothing only at 64.9 (the GBT): the edge is not known to 0.01 deg, and
+    # the limit itself was set from that measurement (audit #100, left as it is).
     out["available"] = complete
     out["partial"] = bool(problems) and got_data
     out["error"] = "; ".join(problems) if problems else None
@@ -907,9 +1257,16 @@ def _site_view(out: dict, res: Any, site: dict, cfg, map_radius_km: float) -> di
     near = _one_per_flash([r for r in rows if r[0] <= max(float(map_radius_km), ring_km)])
     out["count_window"] = sum(1 for r in near if r[0] <= ring_km)
     in_ring_t = [r[3] for r in near if r[0] <= ring_km and isinstance(r[3], datetime)]
-    # the minutes the view speaks for: the span examined in one piece, back to the oldest
+    # the minutes the view speaks for: the span every covering satellite with a complete
+    # window examined in one piece (the latest start, the earliest end), back to the oldest
     # flash it counts (one from a granule fetched again may be older than that span)
     w0, w1 = res.get("window_start"), res.get("window_end")
+    if isinstance(w1, datetime):
+        out["window_end"] = w1
+    span = _span(sats, [sid for sid in covering if isinstance(sats.get(sid), dict) and sats[sid].get("ok")])
+    if span is not None and isinstance(w1, datetime):
+        w0 = span[0]
+        out["span_start"], out["span_end"] = span[0], min(span[1], w1)
     if isinstance(w0, datetime) and isinstance(w1, datetime) and w1 > w0:
         w0 = min([w0] + [t for t in in_ring_t if t < w0])
         out["window_min"] = int(round((w1 - w0).total_seconds() / 60.0))
@@ -936,8 +1293,11 @@ def site_view(res: Any, site: dict, cfg, now: Optional[datetime] = None,
          flash counted in the ring | None,
          "nearest_km": float|None, "nearest_bearing": "NW"|None, "nearest_t": aware datetime
          |None, "nearest_sat": "G19"|None, "flashes_on_map": [(lat, lon), ...] within
-         ``map_radius_km`` (the 2000 nearest at most), "window_min": minutes the fetch
-         window spans (``cfg.glm_window_min`` plus the overlap, rounded)}
+         ``map_radius_km`` (the 2000 nearest at most), "window_min": minutes from the start
+         of the span examined to the run (``cfg.glm_window_min`` plus the overlap, rounded,
+         as a rule), "span_start", "span_end": aware datetimes of the span every covering
+         satellite with a complete window examined in one piece | None, "window_end": the
+         fetch's time (aware datetime) | None}
 
     Only the covering satellites' flashes count. ``available`` = covered, the result ok
     and at least one covering satellite delivered its whole window (each covering satellite
@@ -953,7 +1313,7 @@ def site_view(res: Any, site: dict, cfg, now: Optional[datetime] = None,
         log.warning("GLM site view failed for %s: %s: %s", (site or {}).get("slug") if
                     isinstance(site, dict) else site, type(e).__name__, e)
         out.update(available=False, partial=False, count_window=0, count_by_sat={}, last_in_ring_t=None,
-                   nearest_km=None,
+                   nearest_km=None, span_start=None, span_end=None, window_end=None,
                    nearest_bearing=None, nearest_t=None, nearest_sat=None, flashes_on_map=[],
                    error="bad GLM result: %s: %s" % (type(e).__name__, _errtext(e)))
         return out
