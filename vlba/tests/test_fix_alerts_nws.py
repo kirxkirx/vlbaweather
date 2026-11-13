@@ -153,6 +153,23 @@ def test_the_liveness_filter(cfg, cache, fake_http):
     assert sorted(_events(feed["alerts"])) == ["Blizzard Warning", "High Wind Warning", "Ice Storm Warning"]
 
 
+def test_a_warning_that_cannot_be_confirmed_gone_does_not_hang_on_beyond_a_day(cfg, cache, fake_http):
+    """While NWS does not answer, the last good feed stands in, and its warnings can be
+    confirmed neither in effect nor gone. That copy is used at most WEATHER_ALERTS_MAX_STALE,
+    which the settings bound to a day: past it the alerts read "unknown", not "in effect"."""
+    from weather import config as wc
+    assert wc.MAX_ALERTS_STALE_S == 86400
+    cfg.alerts_max_stale = wc.MAX_ALERTS_STALE_S             # the longest reuse the settings allow
+    doc = {"type": "FeatureCollection", "features": [_feature("w", "High Wind Warning")]}
+    fake_http.fail("/alerts/active")
+    cache.put("alerts", doc, ts=time.time() - wc.MAX_ALERTS_STALE_S + 600)
+    feed = alerts.fetch_active(cfg, cache)
+    assert feed["ok"] and feed["stale"] and _events(feed["alerts"]) == ["High Wind Warning"]
+    cache.put("alerts", doc, ts=time.time() - wc.MAX_ALERTS_STALE_S - 600)
+    feed = alerts.fetch_active(cfg, cache)
+    assert not feed["ok"] and feed["alerts"] == []
+
+
 @pytest.mark.parametrize("zone", PT_ZONES)
 def test_a_zone_alert_without_outline_is_at_the_site_through_each_zone_kind(zone):
     split = _split([_feature("z", "High Wind Warning", zones=["https://api.weather.gov/zones/x/" + zone])])

@@ -151,6 +151,7 @@ def test_cache_lock_or_state_in_the_output_directory_is_refused(monkeypatch, tmp
     {"WEATHER_HTTP_TIMEOUT": "-1"}, {"WEATHER_HTTP_TIMEOUT": "121"},
     {"WEATHER_RADAR_MAX_BACK": "-3"}, {"WEATHER_RADAR_MAX_BACK": "31"},
     {"WEATHER_ALERTS_MAX_STALE": "-1"}, {"WEATHER_ALERTS_MAX_STALE": "999999999"},
+    {"WEATHER_ALERTS_MAX_STALE": "86401"},                         # a day at most: see below
     {"WEATHER_FORECAST_TTL": "-5"}, {"WEATHER_OBS_MAX_STALE": "604801"}, {"WEATHER_RADAR_MAX_STALE": "-1"},
     {"WEATHER_POINTS_TTL": "99999999999"},
     {"WEATHER_MAP_MILES": "1000", "WEATHER_TILE_ZOOM": "12"},       # 61500 tiles per map
@@ -164,7 +165,7 @@ def test_out_of_range_numbers_are_startup_errors(monkeypatch, tmp_path, env):
 def test_the_bounds_admit_generous_values(monkeypatch, tmp_path):
     c = _cfg(monkeypatch, tmp_path, VLBA_VETO_ONSET_LEAD="604800", VLBA_NWS_STALE_MIN="10080",
              WEATHER_RUN_BUDGET="3600", WEATHER_HTTP_RETRIES="0", WEATHER_HTTP_TIMEOUT="1.5",
-             WEATHER_RADAR_MAX_BACK="0", WEATHER_ALERTS_MAX_STALE="604800", VLBA_GLM_TIMEOUT="3600",
+             WEATHER_RADAR_MAX_BACK="0", WEATHER_ALERTS_MAX_STALE="86400", VLBA_GLM_TIMEOUT="3600",
              WEATHER_MAP_MILES="100", WEATHER_TILE_ZOOM="11")
     assert (c.veto_onset_lead_s, c.run_budget_s, c.http_retries, c.http_timeout) == (604800, 3600, 0, 1.5)
     assert _cfg(monkeypatch, tmp_path, WEATHER_HTTP_RETRIES="5", WEATHER_HTTP_TIMEOUT="120").http_retries == 5

@@ -337,6 +337,9 @@ MAX_HTTP_TIMEOUT_S = 120        # s per request (default 25; the GLM layer caps 
 MAX_HTTP_RETRIES = 5            # default 2; each retry of a dead host costs a timeout
 MAX_RUN_BUDGET_S = 3600         # s: an hour, twice the VLBA page's 30-minute run interval
 MAX_AGE_S = 7 * 86400           # s: the TTLs and MAX_STALE limits (defaults 600..7200)
+# s: the last good alert feed is reused at most a day. Its warnings cannot be confirmed
+# gone while NWS does not answer, and none may hang on for longer than this (default 2400).
+MAX_ALERTS_STALE_S = 86400
 MAX_POINTS_AGE_S = 366 * 86400  # s: /points metadata (defaults 7 and 60 days)
 MAX_RADAR_BACK = 30             # 2-minute frames: an hour (default 10); one HEAD request each
 # Basemap tiles per map (one theme): the default 100-mile map at zoom 9 takes 16 at most for
@@ -660,9 +663,9 @@ class Config:
                             ("WEATHER_HOURLY_MAX_STALE", self.hourly_max_stale),
                             ("WEATHER_OBS_TTL", self.obs_ttl),
                             ("WEATHER_OBS_MAX_STALE", self.obs_max_stale),
-                            ("WEATHER_ALERTS_MAX_STALE", self.alerts_max_stale),
                             ("WEATHER_RADAR_MAX_STALE", self.radar_max_stale)):
             whole(name, value, 0, MAX_AGE_S, " of seconds")
+        whole("WEATHER_ALERTS_MAX_STALE", self.alerts_max_stale, 0, MAX_ALERTS_STALE_S, " of seconds")
         whole("obs_max_age_min", self.obs_max_age_min, 1, MAX_AGE_S // 60, " of minutes")
         whole("WEATHER_RADAR_MAX_BACK", self.radar_max_back, 0, MAX_RADAR_BACK, " of 2-minute frames")
 
